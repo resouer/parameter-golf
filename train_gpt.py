@@ -103,15 +103,17 @@ class Hyperparameters:
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
-    # Post-quant AdamW TTT on the dequantized eval model.
+    # Post-quant LoRA-only TTT on the dequantized eval model.
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
-    ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
-    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
-    ttt_cosine_decay = bool(int(os.environ.get("TTT_COSINE_DECAY", "1")))
+    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 4))
+    ttt_lora_alpha = float(os.environ.get("TTT_LORA_ALPHA", 8.0))
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.01))
+    ttt_lora_layers = os.environ.get("TTT_LORA_LAYERS", "9,10")
+    ttt_lora_targets = os.environ.get("TTT_LORA_TARGETS", "attn_proj")
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -979,6 +981,12 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.post_quant_lora_scale = 0.0
+        self.post_quant_lora_layers: list[int] = []
+        self.post_quant_lora_layer_set: set[int] = set()
+        self.post_quant_lora_targets: set[str] = set()
+        self.post_quant_lora_a = nn.ParameterDict()
+        self.post_quant_lora_b = nn.ParameterDict()
         self.mtp_heads = nn.ModuleList(
             [CastedLinear(model_dim, vocab_size, bias=False) for _ in range(mtp_num_heads)]
         )
@@ -1020,6 +1028,49 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+    def _post_quant_lora_key(self, target: str, layer_idx: int) -> str:
+        return f"{target}_l{layer_idx:02d}"
+    def enable_post_quant_lora(self, layers: str, rank: int, alpha: float, targets: str = "attn_proj") -> None:
+        if rank <= 0:
+            raise ValueError(f"ttt_lora_rank must be positive, got {rank}")
+        target_names = {t.strip() for t in targets.split(",") if t.strip()}
+        supported_targets = {"attn_proj"}
+        if not target_names or not target_names.issubset(supported_targets):
+            raise ValueError(f"unsupported TTT_LORA_TARGETS={targets!r}; supported={sorted(supported_targets)}")
+        layer_ids = sorted({int(x) for x in layers.split(",") if x.strip()})
+        if not layer_ids:
+            raise ValueError("TTT_LORA_LAYERS must contain at least one layer index")
+        bad_layers = [idx for idx in layer_ids if idx < 0 or idx >= self.num_layers]
+        if bad_layers:
+            raise ValueError(f"TTT_LORA_LAYERS out of range for num_layers={self.num_layers}: {bad_layers}")
+        self.post_quant_lora_scale = alpha / rank
+        self.post_quant_lora_layers = layer_ids
+        self.post_quant_lora_layer_set = set(layer_ids)
+        self.post_quant_lora_targets = target_names
+        self.post_quant_lora_a = nn.ParameterDict()
+        self.post_quant_lora_b = nn.ParameterDict()
+        device = self.qo_bank.device
+        in_dim = self.qo_bank.shape[-1]
+        out_dim = self.qo_bank.shape[-2]
+        if "attn_proj" in target_names:
+            for layer_idx in layer_ids:
+                key = self._post_quant_lora_key("attn_proj", layer_idx)
+                a = nn.Parameter(torch.empty(rank, in_dim, device=device, dtype=torch.float32))
+                b = nn.Parameter(torch.zeros(out_dim, rank, device=device, dtype=torch.float32))
+                nn.init.kaiming_uniform_(a, a=math.sqrt(5))
+                self.post_quant_lora_a[key] = a
+                self.post_quant_lora_b[key] = b
+    def get_post_quant_lora_parameters(self) -> list[nn.Parameter]:
+        return list(self.post_quant_lora_a.values()) + list(self.post_quant_lora_b.values())
+    def _apply_post_quant_lora(self, weight: Tensor, target: str, layer_idx: int) -> Tensor:
+        if target not in self.post_quant_lora_targets or layer_idx not in self.post_quant_lora_layer_set:
+            return weight
+        key = self._post_quant_lora_key(target, layer_idx)
+        if key not in self.post_quant_lora_a or key not in self.post_quant_lora_b:
+            return weight
+        a = self.post_quant_lora_a[key].to(dtype=weight.dtype)
+        b = self.post_quant_lora_b[key].to(dtype=weight.dtype)
+        return weight + torch.matmul(b, a) * self.post_quant_lora_scale
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         n = self.num_layers
         x = self.tok_emb(input_ids)
@@ -1033,9 +1084,10 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
+            out_w = self._apply_post_quant_lora(self.qo_bank[n + i], "attn_proj", i)
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                out_w, self.mlp_up_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -1045,9 +1097,10 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
+            out_w = self._apply_post_quant_lora(self.qo_bank[n + bi], "attn_proj", bi)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                out_w, self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -1091,9 +1144,10 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
+            out_w = self._apply_post_quant_lora(self.qo_bank[n + i], "attn_proj", i)
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                out_w, self.mlp_up_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -1103,9 +1157,10 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
+            out_w = self._apply_post_quant_lora(self.qo_bank[n + bi], "attn_proj", bi)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                out_w, self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1188,9 +1243,9 @@ def eval_val_sliding(
 
 
 
-def eval_val_sliding_ttt_adamw(
+def eval_val_sliding_ttt_lora(
     args: Hyperparameters,
-    base_model: nn.Module,
+    base_model: GPT,
     rank: int,
     world_size: int,
     device: torch.device,
@@ -1202,7 +1257,7 @@ def eval_val_sliding_ttt_adamw(
     batch_seqs: int = 32,
     log0=print,
 ) -> tuple[float, float]:
-    """Legal score-first TTT on the dequantized post-GPTQ eval model using AdamW."""
+    """Legal score-first TTT on the dequantized post-GPTQ eval model using LoRA-only updates."""
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     ttt_chunk = args.ttt_chunk_tokens
@@ -1223,36 +1278,31 @@ def eval_val_sliding_ttt_adamw(
         chunk_windows[chunk_idx].append(ws)
 
     log0(
-        f"post_quant_ttt:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
+        f"post_quant_lora_ttt:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
         f"total_windows={len(window_starts)} stride={stride} "
-        f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} "
-        f"freeze_blocks={args.ttt_freeze_blocks}"
+        f"ttt_lora_lr={args.ttt_lora_lr} ttt_epochs={args.ttt_epochs} "
+        f"rank={args.ttt_lora_rank} alpha={args.ttt_lora_alpha} "
+        f"layers={args.ttt_lora_layers} targets={args.ttt_lora_targets}"
     )
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
-    ttt_params = []
-    for name, param in base_model.named_parameters():
-        freeze = False
-        for block_idx in frozen_block_ids:
-            if f"blocks.{block_idx}." in name:
-                freeze = True
-                break
-        if freeze:
-            param.requires_grad_(False)
-        else:
-            param.requires_grad_(True)
-            ttt_params.append(param)
+    for param in base_model.parameters():
+        param.requires_grad_(False)
+    ttt_params = base_model.get_post_quant_lora_parameters()
+    if not ttt_params:
+        raise RuntimeError("post-quant LoRA TTT requested but no adapters were enabled")
+    for param in ttt_params:
+        param.requires_grad_(True)
 
     log0(
-        f"post_quant_ttt:params unfrozen={sum(p.numel() for p in ttt_params)} "
+        f"post_quant_lora_ttt:params unfrozen={sum(p.numel() for p in ttt_params)} "
         f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}"
     )
 
-    optimizer = torch.optim.AdamW(ttt_params, lr=args.ttt_lr, weight_decay=0.0)
+    optimizer = torch.optim.Adam(ttt_params, lr=args.ttt_lora_lr)
     t0 = time.perf_counter()
 
     for chunk_idx in range(num_chunks):
@@ -1307,12 +1357,6 @@ def eval_val_sliding_ttt_adamw(
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
-                if args.ttt_cosine_decay:
-                    cos_lr = args.ttt_lr * 0.5 * (
-                        1.0 + math.cos(math.pi * chunk_idx / max(num_chunks - 1, 1))
-                    )
-                    for pg in optimizer.param_groups:
-                        pg["lr"] = cos_lr
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
@@ -1347,7 +1391,7 @@ def eval_val_sliding_ttt_adamw(
                 else 0.0
             )
             log0(
-                f"  post_quant_ttt:chunk [{chunk_idx + 1}/{num_chunks}] "
+                f"  post_quant_lora_ttt:chunk [{chunk_idx + 1}/{num_chunks}] "
                 f"bpb={running_bpb:.6f} time={elapsed:.1f}s"
             )
 
@@ -1363,7 +1407,7 @@ def eval_val_sliding_ttt_adamw(
         param.requires_grad_(True)
     base_model.eval()
     log0(
-        f"post_quant_ttt:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
+        f"post_quant_lora_ttt:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
         f"elapsed={time.perf_counter() - t0:.1f}s"
     )
     return val_loss, val_bpb
@@ -2447,7 +2491,13 @@ def main() -> None:
     if args.ttt_enabled:
         torch.cuda.synchronize()
         t_post_quant = time.perf_counter()
-        ttt_loss, ttt_bpb = eval_val_sliding_ttt_adamw(
+        eval_model.enable_post_quant_lora(
+            layers=args.ttt_lora_layers,
+            rank=args.ttt_lora_rank,
+            alpha=args.ttt_lora_alpha,
+            targets=args.ttt_lora_targets,
+        )
+        ttt_loss, ttt_bpb = eval_val_sliding_ttt_lora(
             args,
             eval_model,
             rank,
@@ -2462,11 +2512,11 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         log0(
-            f"legal_post_quant_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
+            f"legal_post_quant_lora_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
             f"eval_time:{1000.0 * (time.perf_counter() - t_post_quant):.0f}ms"
         )
-        log0(f"legal_post_quant_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
-        log0(f"TIMING:post_quant_ttt={time.perf_counter() - t_post_quant:.1f}s")
+        log0(f"legal_post_quant_lora_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+        log0(f"TIMING:post_quant_lora_ttt={time.perf_counter() - t_post_quant:.1f}s")
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
