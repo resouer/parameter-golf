@@ -381,6 +381,24 @@ PACKED_MEMORY_HELPER_STRIP_ENV_KEYS = (
     "NODE_RANK",
 )
 
+PACKED_MEMORY_NCCL_DEBUG_ENV_KEYS = (
+    "TORCH_DISTRIBUTED_DEBUG",
+    "TORCH_NCCL_TRACE_BUFFER_SIZE",
+    "TORCH_NCCL_DUMP_ON_TIMEOUT",
+    "TORCH_NCCL_DESYNC_DEBUG",
+    "TORCH_NCCL_ASYNC_ERROR_HANDLING",
+    "NCCL_DEBUG",
+    "NCCL_DEBUG_SUBSYS",
+)
+
+
+def log_packed_memory_nccl_debug_env(log0, distributed: bool, world_size: int, grad_accum_steps: int) -> None:
+    snapshot = " ".join(f"{key}={os.environ.get(key, '<unset>')}" for key in PACKED_MEMORY_NCCL_DEBUG_ENV_KEYS)
+    log0(
+        "packed_memory_nccl_debug:"
+        f"distributed={distributed} world_size:{world_size} grad_accum_steps:{grad_accum_steps} {snapshot}"
+    )
+
 
 def build_packed_memory_helper_env(model_path: str, artifact_path: str) -> dict[str, str]:
     env = os.environ.copy()
@@ -1361,6 +1379,7 @@ def main() -> None:
         console=False,
     )
     log0("=" * 100, console=False)
+    log_packed_memory_nccl_debug_env(log0, distributed, world_size, grad_accum_steps)
 
     # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -1724,6 +1743,7 @@ def main() -> None:
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
+    log0("packed_memory_final_eval:before_shared_int8_roundtrip_exact")
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
@@ -1738,6 +1758,7 @@ def main() -> None:
         is_boundary_token_lut,
     )
     torch.cuda.synchronize()
+    log0("packed_memory_final_eval:after_shared_int8_roundtrip_exact")
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
@@ -1745,8 +1766,12 @@ def main() -> None:
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     if args.packed_memory_enabled and args.packed_memory_final_eval_mode == "subprocess":
         if distributed:
+            log0("packed_memory_final_eval:before_subprocess_barrier")
             dist.barrier()
+            log0("packed_memory_final_eval:after_subprocess_barrier")
+            log0("packed_memory_final_eval:before_subprocess_destroy")
             dist.destroy_process_group()
+            log0("packed_memory_final_eval:after_subprocess_destroy")
         if not master_process:
             return
         log0("packed_memory_final_eval:spawning_subprocess_helper")
