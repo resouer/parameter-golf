@@ -83,8 +83,8 @@ class Hyperparameters:
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
-    # #1019 lineage default: wider BigramHash, slightly narrower projection.
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
+    # Phase-3 public-#1060 envelope: slightly smaller BigramHash on the #64 trunk.
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2816))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
     trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default, risky)
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
@@ -102,6 +102,9 @@ class Hyperparameters:
     mousse_alpha = float(os.environ.get("MOUSSE_ALPHA", 0.125))  # spectral tempering exponent
     mousse_beta_pc = float(os.environ.get("MOUSSE_BETA_PC", 0.01))  # EMA rate for covariance
     mousse_T = int(os.environ.get("MOUSSE_T", 10))  # eigendecomposition interval
+    # Public-#1060 quantizer envelope on top of the verified #64 stack.
+    use_gptq = bool(int(os.environ.get("USE_GPTQ", "1")))
+    gptq_reserve_ms = float(os.environ.get("GPTQ_RESERVE_MS", "14000"))
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
@@ -2061,6 +2064,9 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    if args.use_gptq and max_wallclock_ms is not None:
+        max_wallclock_ms -= args.gptq_reserve_ms
+        log0(f"gptq:reserving {args.gptq_reserve_ms:.0f}ms from training budget, effective={max_wallclock_ms:.0f}ms")
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
             return 1.0
@@ -2260,45 +2266,50 @@ def main() -> None:
     if args.ttt_enabled:
         raise ValueError("TTT_ENABLED=1 is forbidden on the bounded #1019 lineage lane")
     log0(f"TIMING:pre_quant_ttt=0.0s enabled={args.ttt_enabled}")
-    # Full GPTQ: collect Hessians via a temporary non-banked model
-    t_gptq_start = time.perf_counter()
-    log0(f"gptq:building non-banked model for Hessian collection...")
-    hessian_model = _HessianGPT(
-        vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings, logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
-        ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-    ).to(device).bfloat16()
-    for m in hessian_model.modules():
-        if isinstance(m, CastedLinear):
-            m.float()
-    restore_low_dim_params_to_fp32(hessian_model)
-    # Load unbanked weights into the non-banked model
-    hessian_model.load_state_dict(
-        {k: v.to(device) for k, v in unbanked_sd.items() if k in hessian_model.state_dict()},
-        strict=False,
-    )
-    # Autoregressive self-generated calibration (no external data)
-    log0("gptq:generating autoregressive calibration data (64 seqs x 2048 tokens, temp=0.8)...")
-    base_model.load_state_dict(export_sd, strict=False)
-    t_gen = time.perf_counter()
-    ar_tokens = generate_autoregressive_calib(
-        base_model, device, num_seqs=64, seq_len=args.train_seq_len,
-        vocab_size=args.vocab_size, temperature=0.8, batch_size=8, seed=args.seed,
-    )
-    log0(f"gptq:generated {len(ar_tokens)} sequences in {time.perf_counter()-t_gen:.1f}s")
-    log0("gptq:collecting hessians from autoregressive data...")
-    hessians = collect_hessians_from_tokens(hessian_model, ar_tokens, device)
-    log0(f"gptq:collected hessians for {len(hessians)} layers (AR self-gen)")
-    del ar_tokens
-    del hessian_model
-    torch.cuda.empty_cache()
+    hessians = None
+    if args.use_gptq:
+        # Full GPTQ: collect Hessians via a temporary non-banked model
+        t_gptq_start = time.perf_counter()
+        log0(f"gptq:building non-banked model for Hessian collection...")
+        hessian_model = _HessianGPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+            xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
+            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+        ).to(device).bfloat16()
+        for m in hessian_model.modules():
+            if isinstance(m, CastedLinear):
+                m.float()
+        restore_low_dim_params_to_fp32(hessian_model)
+        # Load unbanked weights into the non-banked model
+        hessian_model.load_state_dict(
+            {k: v.to(device) for k, v in unbanked_sd.items() if k in hessian_model.state_dict()},
+            strict=False,
+        )
+        # Autoregressive self-generated calibration (no external data)
+        log0("gptq:generating autoregressive calibration data (64 seqs x 2048 tokens, temp=0.8)...")
+        base_model.load_state_dict(export_sd, strict=False)
+        t_gen = time.perf_counter()
+        ar_tokens = generate_autoregressive_calib(
+            base_model, device, num_seqs=64, seq_len=args.train_seq_len,
+            vocab_size=args.vocab_size, temperature=0.8, batch_size=8, seed=args.seed,
+        )
+        log0(f"gptq:generated {len(ar_tokens)} sequences in {time.perf_counter()-t_gen:.1f}s")
+        log0("gptq:collecting hessians from autoregressive data...")
+        hessians = collect_hessians_from_tokens(hessian_model, ar_tokens, device)
+        log0(f"gptq:collected hessians for {len(hessians)} layers (AR self-gen)")
+        del ar_tokens
+        del hessian_model
+        torch.cuda.empty_cache()
+        t_gptq_end = time.perf_counter()
+        log0(f"TIMING:ar_selfgen_gptq={t_gptq_end - t_gptq_start:.1f}s")
+    else:
+        log0("gptq:disabled; falling back to per-row int6 quantization")
+        log0("TIMING:ar_selfgen_gptq=0.0s enabled=False")
     quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"}, hessians=hessians)
-    t_gptq_end = time.perf_counter()
-    log0(f"TIMING:ar_selfgen_gptq={t_gptq_end - t_gptq_start:.1f}s")
     # Bounded phase-1 uses exact decimal-cap post-quant pruning only.
     target_total_bytes = int(os.environ.get("TARGET_TOTAL_BYTES", "16000000"))
     code_bytes_est = len(code.encode("utf-8"))
