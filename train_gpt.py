@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+import gc
 import glob
 import io
 import math
@@ -1650,15 +1651,24 @@ def main() -> None:
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     if distributed:
+        # Fence all ranks after the shared exact-int8 eval, then release the
+        # DDP/compiled wrapper before the long rank0-only packed-memory tail.
+        dist.barrier()
+        del model
+        del compiled_model
+        gc.collect()
         dist.destroy_process_group()
+        if not master_process:
+            return
 
     # The packed-memory exact eval is intentionally rank0-only and can take
-    # much longer than the short NCCL heartbeat window. Tear down DDP first so
-    # non-master ranks can exit cleanly instead of hanging in a late collective.
+    # much longer than the short NCCL heartbeat window. At this point all
+    # non-master ranks have already exited and the DDP/NCCL state is gone.
     if args.packed_memory_enabled and master_process:
         if packed_memory_artifact is None:
             packed_memory_artifact = load_packed_memory_artifact(packed_memory_artifact_path)
-        log0("packed_memory_final_eval:rank0_only_after_ddp_teardown")
+        torch.cuda.empty_cache()
+        log0("packed_memory_final_eval:rank0_only_after_worker_exit")
         torch.cuda.synchronize()
         t_pmeval = time.perf_counter()
         pm_val_loss, pm_val_bpb = eval_val_packed_memory(
