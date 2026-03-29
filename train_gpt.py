@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+import gc
 import glob
 import io
 import math
@@ -94,6 +95,10 @@ class Hyperparameters:
         0,
     )
     packed_memory_eval_batch_seqs = int(os.environ.get("PACKED_MEMORY_EVAL_BATCH_SEQS", 4))
+    packed_memory_final_eval_mode = os.environ.get("PACKED_MEMORY_FINAL_EVAL_MODE", "inline")
+    packed_memory_final_eval_only = bool(int(os.environ.get("PACKED_MEMORY_FINAL_EVAL_ONLY", "0")))
+    packed_memory_final_model_path = os.environ.get("PACKED_MEMORY_FINAL_MODEL_PATH", "final_model.int8.ptz")
+    packed_memory_artifact_path = os.environ.get("PACKED_MEMORY_ARTIFACT_PATH", "packed_memory_artifact.npz")
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -361,6 +366,35 @@ class RuntimePackedMemory:
 def estimate_packed_memory_artifact_nbytes(args: Hyperparameters) -> int:
     per_context_bytes = 16 + 4 + 2 + 4 + args.packed_memory_topk * (2 + 2)
     return sum(cap * per_context_bytes for cap in args.packed_memory_context_caps)
+
+
+PACKED_MEMORY_HELPER_STRIP_ENV_KEYS = (
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "GROUP_RANK",
+    "ROLE_RANK",
+    "ROLE_WORLD_SIZE",
+    "NODE_RANK",
+)
+
+
+def build_packed_memory_helper_env(model_path: str, artifact_path: str) -> dict[str, str]:
+    env = os.environ.copy()
+    for key in PACKED_MEMORY_HELPER_STRIP_ENV_KEYS:
+        env.pop(key, None)
+    for key in list(env):
+        if key.startswith("TORCHELASTIC_"):
+            env.pop(key, None)
+    env["CUDA_VISIBLE_DEVICES"] = os.environ.get("PACKED_MEMORY_HELPER_CUDA_VISIBLE_DEVICES", "0")
+    env["PACKED_MEMORY_FINAL_EVAL_ONLY"] = "1"
+    env["PACKED_MEMORY_FINAL_EVAL_MODE"] = "inline"
+    env["PACKED_MEMORY_FINAL_MODEL_PATH"] = os.path.abspath(model_path)
+    env["PACKED_MEMORY_ARTIFACT_PATH"] = os.path.abspath(artifact_path)
+    return env
 
 
 def packed_memory_normalization_self_test() -> float:
@@ -770,6 +804,40 @@ def eval_val_packed_memory(
     tokens_per_byte = val_token_count / max(val_byte_count, 1.0)
     base_model.train()
     return float(val_loss), float(bits_per_token * tokens_per_byte)
+
+
+def log_packed_memory_final_eval(
+    args: Hyperparameters,
+    base_model: GPT,
+    device: torch.device,
+    val_tokens: Tensor,
+    artifact: PackedMemoryArtifact,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    log0,
+    marker: str,
+) -> None:
+    torch.cuda.empty_cache()
+    log0(marker)
+    torch.cuda.synchronize()
+    t_pmeval = time.perf_counter()
+    pm_val_loss, pm_val_bpb = eval_val_packed_memory(
+        args,
+        base_model,
+        device,
+        val_tokens,
+        artifact,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+    )
+    torch.cuda.synchronize()
+    log0(
+        f"final_int8_packed_memory val_loss:{pm_val_loss:.4f} val_bpb:{pm_val_bpb:.4f} "
+        f"eval_time:{1000.0 * (time.perf_counter() - t_pmeval):.0f}ms"
+    )
+    log0(f"final_int8_packed_memory_exact val_loss:{pm_val_loss:.8f} val_bpb:{pm_val_bpb:.8f}")
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1233,7 +1301,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if not args.packed_memory_final_eval_only:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1360,7 +1429,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if not args.packed_memory_final_eval_only else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1428,6 +1497,30 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+
+    if args.packed_memory_final_eval_only:
+        if distributed:
+            raise ValueError("PACKED_MEMORY_FINAL_EVAL_ONLY must run without distributed env")
+        if not args.packed_memory_enabled:
+            raise ValueError("PACKED_MEMORY_FINAL_EVAL_ONLY requires PACKED_MEMORY_ENABLED=1")
+        with open(args.packed_memory_final_model_path, "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        packed_memory_artifact = load_packed_memory_artifact(args.packed_memory_artifact_path)
+        log_packed_memory_final_eval(
+            args,
+            base_model,
+            device,
+            val_tokens.cpu(),
+            packed_memory_artifact,
+            base_bytes_lut.cpu(),
+            has_leading_space_lut.cpu(),
+            is_boundary_token_lut.cpu(),
+            log0,
+            "packed_memory_final_eval:subprocess_helper",
+        )
+        return
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1599,12 +1692,13 @@ def main() -> None:
     quant_raw = quant_buf.getvalue()
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
-    packed_memory_artifact_path = "packed_memory_artifact.npz"
+    quantized_model_path = args.packed_memory_final_model_path
+    packed_memory_artifact_path = args.packed_memory_artifact_path
     packed_memory_artifact = None
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open(quantized_model_path, "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize(quantized_model_path)
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
@@ -1625,7 +1719,7 @@ def main() -> None:
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(quantized_model_path, "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
@@ -1649,19 +1743,29 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.packed_memory_enabled and args.packed_memory_final_eval_mode == "subprocess":
+        if distributed:
+            dist.barrier()
+            dist.destroy_process_group()
+        if not master_process:
+            return
+        log0("packed_memory_final_eval:spawning_subprocess_helper")
+        helper_env = build_packed_memory_helper_env(quantized_model_path, packed_memory_artifact_path)
+        del model
+        del compiled_model
+        del base_model
+        gc.collect()
+        torch.cuda.empty_cache()
+        subprocess.run(["python3", str(Path(__file__).resolve())], env=helper_env, check=True)
+        return
     if distributed:
         dist.destroy_process_group()
 
-    # The packed-memory exact eval is intentionally rank0-only and can take
-    # much longer than the short NCCL heartbeat window. Tear down DDP first so
-    # non-master ranks can exit cleanly instead of hanging in a late collective.
+    # Inline packed-memory exact eval remains available for non-subprocess lanes.
     if args.packed_memory_enabled and master_process:
         if packed_memory_artifact is None:
             packed_memory_artifact = load_packed_memory_artifact(packed_memory_artifact_path)
-        log0("packed_memory_final_eval:rank0_only_after_ddp_teardown")
-        torch.cuda.synchronize()
-        t_pmeval = time.perf_counter()
-        pm_val_loss, pm_val_bpb = eval_val_packed_memory(
+        log_packed_memory_final_eval(
             args,
             base_model,
             device,
@@ -1670,13 +1774,9 @@ def main() -> None:
             base_bytes_lut.cpu(),
             has_leading_space_lut.cpu(),
             is_boundary_token_lut.cpu(),
+            log0,
+            "packed_memory_final_eval:rank0_only_after_ddp_teardown",
         )
-        torch.cuda.synchronize()
-        log0(
-            f"final_int8_packed_memory val_loss:{pm_val_loss:.4f} val_bpb:{pm_val_bpb:.4f} "
-            f"eval_time:{1000.0 * (time.perf_counter() - t_pmeval):.0f}ms"
-        )
-        log0(f"final_int8_packed_memory_exact val_loss:{pm_val_loss:.8f} val_bpb:{pm_val_bpb:.8f}")
 
 
 if __name__ == "__main__":
