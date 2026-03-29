@@ -1566,38 +1566,34 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-    if args.packed_memory_enabled:
-        if distributed:
-            dist.barrier()
-        if master_process:
-            if packed_memory_artifact is None:
-                packed_memory_artifact = load_packed_memory_artifact(packed_memory_artifact_path)
-            torch.cuda.synchronize()
-            t_pmeval = time.perf_counter()
-            pm_val_loss, pm_val_bpb = eval_val_packed_memory(
-                args,
-                base_model,
-                device,
-                val_tokens.cpu(),
-                packed_memory_artifact,
-                base_bytes_lut.cpu(),
-                has_leading_space_lut.cpu(),
-                is_boundary_token_lut.cpu(),
-            )
-            torch.cuda.synchronize()
-            log0(
-                f"final_int8_packed_memory val_loss:{pm_val_loss:.4f} val_bpb:{pm_val_bpb:.4f} "
-                f"eval_time:{1000.0 * (time.perf_counter() - t_pmeval):.0f}ms"
-            )
-            log0(f"final_int8_packed_memory_exact val_loss:{pm_val_loss:.8f} val_bpb:{pm_val_bpb:.8f}")
-            packed_metrics = torch.tensor([pm_val_loss, pm_val_bpb], dtype=torch.float64, device=device)
-        else:
-            packed_metrics = torch.zeros((2,), dtype=torch.float64, device=device)
-        if distributed:
-            dist.broadcast(packed_metrics, src=0)
-
     if distributed:
         dist.destroy_process_group()
+
+    # The packed-memory exact eval is intentionally rank0-only and can take
+    # much longer than the short NCCL heartbeat window. Tear down DDP first so
+    # non-master ranks can exit cleanly instead of hanging in a late collective.
+    if args.packed_memory_enabled and master_process:
+        if packed_memory_artifact is None:
+            packed_memory_artifact = load_packed_memory_artifact(packed_memory_artifact_path)
+        log0("packed_memory_final_eval:rank0_only_after_ddp_teardown")
+        torch.cuda.synchronize()
+        t_pmeval = time.perf_counter()
+        pm_val_loss, pm_val_bpb = eval_val_packed_memory(
+            args,
+            base_model,
+            device,
+            val_tokens.cpu(),
+            packed_memory_artifact,
+            base_bytes_lut.cpu(),
+            has_leading_space_lut.cpu(),
+            is_boundary_token_lut.cpu(),
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_packed_memory val_loss:{pm_val_loss:.4f} val_bpb:{pm_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_pmeval):.0f}ms"
+        )
+        log0(f"final_int8_packed_memory_exact val_loss:{pm_val_loss:.8f} val_bpb:{pm_val_bpb:.8f}")
 
 
 if __name__ == "__main__":
