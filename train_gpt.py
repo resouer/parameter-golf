@@ -572,45 +572,182 @@ def load_data_shard(file: Path) -> Tensor:
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
-class TokenStream:
-    def __init__(self, pattern: str):
-        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
-        if not self.files:
-            raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.file_idx = 0
-        self.tokens = load_data_shard(self.files[0])
-        self.pos = 0
-    def _advance_file(self) -> None:
-        self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.tokens = load_data_shard(self.files[self.file_idx])
-        self.pos = 0
-    def take(self, n: int) -> Tensor:
-        chunks: list[Tensor] = []
-        remaining = n
-        while remaining > 0:
-            avail = self.tokens.numel() - self.pos
-            if avail <= 0:
-                self._advance_file()
-                continue
-            k = min(remaining, avail)
-            chunks.append(self.tokens[self.pos : self.pos + k])
-            self.pos += k
-            remaining -= k
-        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+_SHARD_HEADER_BYTES = 256 * np.dtype("<i4").itemsize
+_SHARD_NTOKENS_CACHE: dict[str, int] = {}
+_MMAP_CACHE: dict[str, np.memmap] = {}
+
+
+def _read_num_tokens(file: Path) -> int:
+    key = str(file)
+    cached = _SHARD_NTOKENS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    header = np.fromfile(file, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Unexpected shard header for {file}")
+    n = int(header[2])
+    _SHARD_NTOKENS_CACHE[key] = n
+    return n
+
+
+def _get_shard_memmap(file: Path) -> np.memmap:
+    key = str(file)
+    mm = _MMAP_CACHE.get(key)
+    if mm is not None:
+        return mm
+    n = _read_num_tokens(file)
+    mm = np.memmap(file, mode="r", dtype="<u2", offset=_SHARD_HEADER_BYTES, shape=(n,))
+    _MMAP_CACHE[key] = mm
+    return mm
+
+
 class DistributedTokenLoader:
+    """Coprime-stride + multi-shard loader (phase-2 #1060 delta). No daemon thread / prefetch."""
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        self.mode_tag = "coprime_multi_shard_phase2_no_prefetch"
+        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not self.files:
+            raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        self._num_tokens = np.array([_read_num_tokens(f) for f in self.files], dtype=np.int64)
+        seed = 0
+        for f in self.files:
+            for b in str(f).encode():
+                seed = ((seed ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        self._rng = np.random.Generator(np.random.PCG64(seed))
+        self._cfg: tuple[int, int, int, int] | None = None
+        self._eligible_shards: np.ndarray | None = None
+        self._base_block_counts: np.ndarray | None = None
+        n = len(self.files)
+        self._cursor_phase = np.zeros(n, dtype=np.int64)
+        self._cursor_block_count = np.zeros(n, dtype=np.int64)
+        self._cursor_next = np.zeros(n, dtype=np.int64)
+        self._cursor_start = np.zeros(n, dtype=np.int64)
+        self._cursor_stride = np.ones(n, dtype=np.int64)
+        self._cursor_init = np.zeros(n, dtype=np.bool_)
+        self._batches_built = 0
+
+    def _pick_coprime_stride(self, n: int) -> int:
+        if n <= 1:
+            return 1
+        while True:
+            s = int(self._rng.integers(1, n))
+            if math.gcd(s, n) == 1:
+                return s
+
+    def _reset_cursor(self, si: int, seq_len: int) -> None:
+        nt = int(self._num_tokens[si])
+        max_phase = min(seq_len - 1, max(0, nt - seq_len - 1))
+        phase = int(self._rng.integers(max_phase + 1)) if max_phase > 0 else 0
+        bc = (nt - 1 - phase) // seq_len
+        self._cursor_phase[si] = phase
+        self._cursor_block_count[si] = bc
+        self._cursor_next[si] = 0
+        self._cursor_start[si] = int(self._rng.integers(bc)) if bc > 1 else 0
+        self._cursor_stride[si] = self._pick_coprime_stride(bc)
+        self._cursor_init[si] = True
+
+    def _ensure_cursor(self, si: int, seq_len: int) -> None:
+        if not self._cursor_init[si] or self._cursor_next[si] >= self._cursor_block_count[si]:
+            self._reset_cursor(si, seq_len)
+
+    def _take_from_shard(self, si: int, seq_len: int, count: int, out: list[tuple[int, int]]) -> None:
+        rem = count
+        while rem > 0:
+            self._ensure_cursor(si, seq_len)
+            bc = int(self._cursor_block_count[si])
+            ni = int(self._cursor_next[si])
+            take = min(rem, bc - ni)
+            phase = int(self._cursor_phase[si])
+            start = int(self._cursor_start[si])
+            stride = int(self._cursor_stride[si])
+            for j in range(take):
+                bi = (start + (ni + j) * stride) % bc
+                out.append((si, phase + bi * seq_len))
+            self._cursor_next[si] = ni + take
+            rem -= take
+
+    def _init_pipeline(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> None:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
-        per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
-        start = self.rank * per_rank_span
-        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
-        x = local[:-1].reshape(-1, seq_len)
-        y = local[1:].reshape(-1, seq_len)
+        num_seqs = local_tokens // seq_len
+        global_num_seqs = num_seqs * self.world_size
+        self._cfg = (local_tokens, seq_len, num_seqs, global_num_seqs)
+        bbc = (self._num_tokens - 1) // seq_len
+        eligible = bbc > 0
+        self._eligible_shards = np.nonzero(eligible)[0].astype(np.int64)
+        self._base_block_counts = bbc[self._eligible_shards].astype(np.int64)
+
+    def _sample_global_windows(self) -> list[tuple[int, int]]:
+        assert self._cfg is not None and self._eligible_shards is not None
+        _, seq_len, _, gns = self._cfg
+        ec = int(self._eligible_shards.size)
+        progress = min(self._batches_built / 1800.0, 1.0)
+        remaining = np.empty(ec, dtype=np.float64)
+        for i, si in enumerate(self._eligible_shards.tolist()):
+            if self._cursor_init[si]:
+                r = int(self._cursor_block_count[si]) - int(self._cursor_next[si])
+                remaining[i] = float(max(r, 1))
+            else:
+                remaining[i] = float(self._base_block_counts[i])
+        alpha = 0.90 - 0.40 * progress
+        weights = np.power(remaining, alpha)
+        ws = float(weights.sum())
+        if not np.isfinite(ws) or ws <= 0.0:
+            weights = np.ones(ec, dtype=np.float64)
+            ws = float(weights.sum())
+        probs = weights / ws
+        low = min(max(8, self.world_size), ec, gns)
+        high = min(max(32, self.world_size * 8), ec, gns)
+        mix = max(1, min(int(round(low + progress * (high - low))), ec, gns))
+        cp = self._rng.choice(ec, size=mix, replace=False, p=probs)
+        cs = self._eligible_shards[cp]
+        cpr = probs[cp].copy()
+        cpr /= cpr.sum()
+        counts = np.ones(mix, dtype=np.int64)
+        extra = gns - mix
+        if extra > 0:
+            counts += self._rng.multinomial(extra, cpr).astype(np.int64)
+        perm = self._rng.permutation(mix)
+        cs, counts = cs[perm], counts[perm]
+        buckets: list[list[tuple[int, int]]] = []
+        for si, cnt in zip(cs.tolist(), counts.tolist()):
+            b: list[tuple[int, int]] = []
+            self._take_from_shard(int(si), seq_len, int(cnt), b)
+            if b:
+                if len(b) > 1:
+                    bp = self._rng.permutation(len(b))
+                    b = [b[int(k)] for k in bp.tolist()]
+                buckets.append(b)
+        windows: list[tuple[int, int]] = []
+        active = [i for i, bk in enumerate(buckets) if bk]
+        while active:
+            order = self._rng.permutation(len(active))
+            new_active: list[int] = []
+            for oi in order.tolist():
+                bi = active[oi]
+                if buckets[bi]:
+                    windows.append(buckets[bi].pop())
+                if buckets[bi]:
+                    new_active.append(bi)
+            active = new_active
+        return windows
+
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        if self._cfg is None:
+            self._init_pipeline(global_tokens, seq_len, grad_accum_steps)
+        _, _, num_seqs, gns = self._cfg
+        gw = self._sample_global_windows()
+        local_w = gw[self.rank::self.world_size]
+        x = torch.empty((num_seqs, seq_len), dtype=torch.int64)
+        y = torch.empty((num_seqs, seq_len), dtype=torch.int64)
+        for slot, (si, pos) in enumerate(local_w):
+            mm = _get_shard_memmap(self.files[si])
+            window = torch.as_tensor(np.array(mm[pos:pos + seq_len + 1], dtype=np.int64))
+            x[slot] = window[:-1]
+            y[slot] = window[1:]
+        self._batches_built += 1
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 # --- Transformer modules ---
@@ -1919,6 +2056,7 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     log0(f"mousse:enabled={args.mousse_enabled} alpha={args.mousse_alpha} beta_pc={args.mousse_beta_pc} T={args.mousse_T}")
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    log0(f"train_loader:mode:{train_loader.mode_tag}")
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
@@ -1959,6 +2097,7 @@ def main() -> None:
             opt.load_state_dict(state)
         zero_grad_all()
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        log0(f"train_loader:mode:{train_loader.mode_tag}")
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
     from collections import deque
