@@ -2374,8 +2374,17 @@ def main() -> None:
     # NOVEL: Selective ±1 pruning by reconstruction error
     # Sort ±1 quantized values by their reconstruction error (scale²),
     # prune least-impactful first until artifact fits target size.
-    target_mb = float(os.environ.get("TARGET_MB", "15.9"))
+    target_total_bytes_env = os.environ.get("TARGET_TOTAL_BYTES")
+    target_mb_env = os.environ.get("TARGET_MB")
+    if target_total_bytes_env is not None:
+        target_total_bytes = int(target_total_bytes_env)
+    elif target_mb_env is not None:
+        target_total_bytes = int(float(target_mb_env) * 1024 * 1024)
+    else:
+        target_total_bytes = 16_000_000
     code_bytes_est = len(code.encode("utf-8"))
+    target_model_bytes = max(target_total_bytes - code_bytes_est, 0)
+    giveback_source = "selective_prune_low_error_pm1"
     ones_info = []  # (tensor_key, flat_idx, error)
     for name, info in quant_meta.items():
         if not (isinstance(info, dict) and info.get("type") == "int6"): continue
@@ -2396,28 +2405,53 @@ def main() -> None:
             tmp = {k: v.clone() for k, v in quant_result.items()}
             for i in range(min(n, len(ones_info))):
                 tmp[ones_info[i][0]].view(-1)[ones_info[i][1]] = 0
-            buf = io.BytesIO(); torch.save({"w": tmp, "m": quant_meta}, buf)
-            return len(lzma.compress(buf.getvalue(), preset=9)) + code_bytes_est, tmp
-        no_sz, _ = _try_prune(0)
-        target_bytes = int(target_mb * 1024 * 1024)
-        log0(f"selective_prune: {len(ones_info)} ±1 candidates, unpruned={no_sz/(1024*1024):.2f}MB target={target_mb}MB")
-        if no_sz <= target_bytes:
-            log0("selective_prune: already fits, no pruning needed")
+            buf = io.BytesIO()
+            torch.save({"w": tmp, "m": quant_meta}, buf)
+            model_bytes = len(lzma.compress(buf.getvalue(), preset=9))
+            total_bytes = model_bytes + code_bytes_est
+            return model_bytes, total_bytes, tmp
+        no_model_bytes, no_total_bytes, _ = _try_prune(0)
+        giveback_needed_bytes = max(no_total_bytes - target_total_bytes, 0)
+        log0(
+            f"mixed_export_size_budget total_cap_bytes={target_total_bytes} "
+            f"code_bytes={code_bytes_est} target_model_bytes={target_model_bytes} "
+            f"unpruned_model_bytes={no_model_bytes} unpruned_total_bytes={no_total_bytes} "
+            f"giveback_needed_bytes={giveback_needed_bytes} giveback_source={giveback_source}"
+        )
+        log0(
+            f"selective_prune: {len(ones_info)} ±1 candidates "
+            f"unpruned_total_bytes={no_total_bytes} target_total_bytes={target_total_bytes}"
+        )
+        if no_total_bytes <= target_total_bytes:
+            log0(
+                f"selective_prune: already fits, no pruning needed "
+                f"headroom_bytes={target_total_bytes - no_total_bytes}"
+            )
         else:
-            full_sz, _ = _try_prune(len(ones_info))
-            log0(f"selective_prune: full ±1 prune={full_sz/(1024*1024):.2f}MB")
-            if full_sz > target_bytes:
+            full_model_bytes, full_total_bytes, _ = _try_prune(len(ones_info))
+            log0(
+                f"selective_prune: full_prune_model_bytes={full_model_bytes} "
+                f"full_prune_total_bytes={full_total_bytes}"
+            )
+            if full_total_bytes > target_total_bytes:
                 log0("selective_prune: even full prune not enough, applying all")
-                _, quant_result = _try_prune(len(ones_info))
+                _, _, quant_result = _try_prune(len(ones_info))
             else:
                 lo, hi = 0, len(ones_info)
                 while lo < hi:
                     mid = (lo + hi) // 2
-                    sz, _ = _try_prune(mid)
-                    if sz <= target_bytes: hi = mid
-                    else: lo = mid + 1
-                log0(f"selective_prune: pruning {lo}/{len(ones_info)} ±1 values ({100*lo/len(ones_info):.1f}%) to fit {target_mb}MB")
-                _, quant_result = _try_prune(lo)
+                    _, total_bytes, _ = _try_prune(mid)
+                    if total_bytes <= target_total_bytes:
+                        hi = mid
+                    else:
+                        lo = mid + 1
+                pruned_model_bytes, pruned_total_bytes, quant_result = _try_prune(lo)
+                log0(
+                    f"selective_prune: pruning {lo}/{len(ones_info)} ±1 values "
+                    f"({100*lo/len(ones_info):.1f}%) saved_bytes={no_total_bytes - pruned_total_bytes} "
+                    f"final_model_bytes={pruned_model_bytes} final_total_bytes={pruned_total_bytes} "
+                    f"target_total_bytes={target_total_bytes}"
+                )
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
