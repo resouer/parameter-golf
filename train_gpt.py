@@ -97,6 +97,7 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))  # VRL with sigmoid gates (off by default, risky)
+    asqu_enabled = bool(int(os.environ.get("ASQU", "0")))
     # Keep Mousse off by default on the bounded #1019 lineage lane.
     mousse_enabled = bool(int(os.environ.get("MOUSSE", "0")))
     mousse_alpha = float(os.environ.get("MOUSSE_ALPHA", 0.125))  # spectral tempering exponent
@@ -447,7 +448,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,asqu",
     ).split(",")
     if pattern
 )
@@ -967,13 +968,21 @@ class ValueEmbedding(nn.Module):
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
 
+def asqu_activation(x: Tensor, beta: Tensor) -> Tensor:
+    x_sq = x.square()
+    beta_cast = beta.to(dtype=x.dtype)
+    while beta_cast.ndim < x_sq.ndim:
+        beta_cast = beta_cast.unsqueeze(0)
+    return torch.where(x > 0, x_sq, x_sq * beta_cast)
+
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         # No CastedLinear -- weights come from banks
-    def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
-        x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
-        return F.linear(x.square(), down_w.to(x.dtype))
+    def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor, asqu_beta: Tensor | None = None) -> Tensor:
+        pre = F.linear(x, up_w.to(x.dtype))
+        act = asqu_activation(pre, asqu_beta) if asqu_beta is not None else F.leaky_relu(pre, negative_slope=0.5).square()
+        return F.linear(act, down_w.to(x.dtype))
 
 class Block(nn.Module):
     def __init__(
@@ -1006,12 +1015,12 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None, asqu_beta: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w, asqu_beta=asqu_beta)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
@@ -1044,6 +1053,7 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        asqu_enabled: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -1071,6 +1081,7 @@ class GPT(nn.Module):
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
         self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        self.asqu_beta_bank = nn.Parameter(torch.full((num_layers, mlp_dim), 0.25, dtype=torch.float32)) if asqu_enabled else None
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -1166,7 +1177,8 @@ class GPT(nn.Module):
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0,
+                asqu_beta=self.asqu_beta_bank[i] if self.asqu_beta_bank is not None else None)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -1178,7 +1190,8 @@ class GPT(nn.Module):
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0,
+                asqu_beta=self.asqu_beta_bank[bi] if self.asqu_beta_bank is not None else None)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1224,7 +1237,8 @@ class GPT(nn.Module):
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0,
+                asqu_beta=self.asqu_beta_bank[i] if self.asqu_beta_bank is not None else None)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -1236,7 +1250,8 @@ class GPT(nn.Module):
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0,
+                asqu_beta=self.asqu_beta_bank[bi] if self.asqu_beta_bank is not None else None)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1500,6 +1515,9 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tens
         elif name == "mlp_down_bank":
             for i in range(n):
                 out[f"blocks.{i}.mlp.proj.weight"] = tensor[i]
+        elif name == "asqu_beta_bank":
+            for i in range(n):
+                out[f"blocks.{i}.mlp.asqu_beta"] = tensor[i]
         else:
             out[name] = tensor
     return out
@@ -1513,6 +1531,7 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
     kv_slices = [None] * (2 * n)
     up_slices = [None] * n
     down_slices = [None] * n
+    asqu_slices = [None] * n if "asqu_beta_bank" in template_sd else None
     consumed = set()
     for i in range(n):
         qk = f"blocks.{i}.attn.c_q.weight"
@@ -1539,10 +1558,16 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
         if dk in sd:
             down_slices[i] = sd[dk]
             consumed.add(dk)
+        ak = f"blocks.{i}.mlp.asqu_beta"
+        if asqu_slices is not None and ak in sd:
+            asqu_slices[i] = sd[ak]
+            consumed.add(ak)
     out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_sd["qo_bank"].dtype)
     out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_sd["kv_bank"].dtype)
     out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=template_sd["mlp_up_bank"].dtype)
     out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=template_sd["mlp_down_bank"].dtype)
+    if asqu_slices is not None and all(s is not None for s in asqu_slices):
+        out["asqu_beta_bank"] = torch.stack(asqu_slices).to(dtype=template_sd["asqu_beta_bank"].dtype)
     for name, tensor in sd.items():
         if name not in consumed:
             out[name] = tensor
@@ -1608,20 +1633,23 @@ class _HessianAttn(nn.Module):
 
 class _HessianMLP(nn.Module):
     """Non-banked MLP with CastedLinear layers for Hessian hooks."""
-    def __init__(self, dim, mlp_mult):
+    def __init__(self, dim, mlp_mult, asqu_enabled: bool = False):
         super().__init__()
         self.fc = CastedLinear(dim, int(mlp_mult * dim), bias=False)
         self.proj = CastedLinear(int(mlp_mult * dim), dim, bias=False)
+        self.asqu_beta = nn.Parameter(torch.full((int(mlp_mult * dim),), 0.25, dtype=torch.float32)) if asqu_enabled else None
     def forward(self, x):
-        return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
+        pre = self.fc(x)
+        act = asqu_activation(pre, self.asqu_beta) if self.asqu_beta is not None else F.leaky_relu(pre, negative_slope=0.5).square()
+        return self.proj(act)
 
 class _HessianBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False):
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False, asqu_enabled: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = _HessianAttn(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = _HessianMLP(dim, mlp_mult)
+        self.mlp = _HessianMLP(dim, mlp_mult, asqu_enabled=asqu_enabled)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -1640,7 +1668,8 @@ class _HessianGPT(nn.Module):
                  mlp_mult, tie_embeddings, logit_softcap, rope_base, qk_gain_init,
                  bigram_vocab_size=0, bigram_dim=128, xsa_last_n=0,
                  rope_dims=0, ln_scale=False,
-                 ve_enabled=False, ve_dim=128, ve_layers="9,10"):
+                 ve_enabled=False, ve_dim=128, ve_layers="9,10",
+                 asqu_enabled: bool = False):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -1654,7 +1683,7 @@ class _HessianGPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                          layer_idx=i, ln_scale=ln_scale)
+                          layer_idx=i, ln_scale=ln_scale, asqu_enabled=asqu_enabled)
             for i in range(num_layers)
         ])
         if rope_dims > 0:
@@ -1941,6 +1970,7 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        asqu_enabled=args.asqu_enabled,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1971,6 +2001,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    if base_model.asqu_beta_bank is not None:
+        scalar_params.append(base_model.asqu_beta_bank)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
@@ -2054,6 +2086,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"asqu:enabled={args.asqu_enabled}")
     log0(f"mousse:enabled={args.mousse_enabled} alpha={args.mousse_alpha} beta_pc={args.mousse_beta_pc} T={args.mousse_T}")
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     log0(f"train_loader:mode:{train_loader.mode_tag}")
@@ -2271,6 +2304,7 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+        asqu_enabled=args.asqu_enabled,
     ).to(device).bfloat16()
     for m in hessian_model.modules():
         if isinstance(m, CastedLinear):
