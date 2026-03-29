@@ -1672,6 +1672,31 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
+    final_eval_model: nn.Module = model
+    final_eval_rank = rank
+    final_eval_world_size = world_size
+    final_eval_grad_accum_steps = grad_accum_steps
+    if args.packed_memory_enabled and args.packed_memory_final_eval_mode == "subprocess" and distributed:
+        log0("packed_memory_final_eval:before_early_rank_exit_barrier")
+        dist.barrier()
+        log0("packed_memory_final_eval:after_early_rank_exit_barrier")
+        log0("packed_memory_final_eval:before_early_rank_exit_destroy")
+        dist.destroy_process_group()
+        log0("packed_memory_final_eval:after_early_rank_exit_destroy")
+        if not master_process:
+            log0("packed_memory_final_eval:non_master_exit_before_finalize")
+            return
+        final_eval_model = base_model
+        final_eval_rank = 0
+        final_eval_world_size = 1
+        final_eval_grad_accum_steps = grad_accum_steps * world_size
+        log0("packed_memory_final_eval:rank0_only_finalize_after_early_cut")
+        del model
+        del compiled_model
+        gc.collect()
+        torch.cuda.empty_cache()
+        distributed = False
+
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
@@ -1727,11 +1752,11 @@ def main() -> None:
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        model,
-        rank,
-        world_size,
+        final_eval_model,
+        final_eval_rank,
+        final_eval_world_size,
         device,
-        grad_accum_steps,
+        final_eval_grad_accum_steps,
         val_tokens,
         base_bytes_lut,
         has_leading_space_lut,
@@ -1744,15 +1769,14 @@ def main() -> None:
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     if args.packed_memory_enabled and args.packed_memory_final_eval_mode == "subprocess":
-        if distributed:
-            dist.barrier()
-            dist.destroy_process_group()
-        if not master_process:
-            return
         log0("packed_memory_final_eval:spawning_subprocess_helper")
         helper_env = build_packed_memory_helper_env(quantized_model_path, packed_memory_artifact_path)
-        del model
-        del compiled_model
+        if final_eval_model is not base_model:
+            del final_eval_model
+        if "model" in locals():
+            del model
+        if "compiled_model" in locals():
+            del compiled_model
         del base_model
         gc.collect()
         torch.cuda.empty_cache()
