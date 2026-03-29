@@ -1772,12 +1772,25 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hess
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
     ) + 1
-    late_k_layers = set(range(num_layers_total - 2, num_layers_total))
+    fp16_embed_export = bool(int(os.environ.get("EXPORT_FP16_EMBED", "0")))
+    fp16_late_k_layers = int(os.environ.get("EXPORT_FP16_LATE_K_LAYERS", "0"))
+    late_k_layers = set(range(max(0, num_layers_total - fp16_late_k_layers), num_layers_total))
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         cat = _classify_param(name)
+        is_fp16_embed = fp16_embed_export and name == "tok_emb.weight"
+        is_fp16_late_k = (
+            fp16_late_k_layers > 0
+            and name.endswith("attn.c_k.weight")
+            and name.startswith("blocks.")
+            and int(name.split(".")[1]) in late_k_layers
+        )
+        if is_fp16_embed or is_fp16_late_k:
+            result[name] = t.to(torch.float16)
+            meta[name] = "passthrough_fp16"
+            continue
         if not t.is_floating_point() or t.numel() <= 65536:
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough"
@@ -2289,6 +2302,12 @@ def main() -> None:
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
+    fp16_embed_export = bool(int(os.environ.get("EXPORT_FP16_EMBED", "0")))
+    fp16_late_k_layers = int(os.environ.get("EXPORT_FP16_LATE_K_LAYERS", "0"))
+    log0(
+        f"mixed_export_policy fp16_embed={int(fp16_embed_export)} "
+        f"fp16_late_k_layers={fp16_late_k_layers}"
+    )
 
     # --- Pre-quant AdamW TTT (before GPTQ) ---
     t_ttt_start = time.perf_counter()
@@ -2375,6 +2394,9 @@ def main() -> None:
     del hessian_model
     torch.cuda.empty_cache()
     quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"}, hessians=hessians)
+    fp16_passthrough = [name for name, info in quant_meta.items() if info == "passthrough_fp16"]
+    if fp16_passthrough:
+        log0(f"mixed_export_fp16_tensors:{','.join(sorted(fp16_passthrough))}")
     t_gptq_end = time.perf_counter()
     log0(f"TIMING:ar_selfgen_gptq={t_gptq_end - t_gptq_start:.1f}s")
     # Selective ±1 pruning by reconstruction error.
