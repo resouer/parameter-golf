@@ -240,7 +240,7 @@ class PackedOrderTable:
     ctx_keys: np.ndarray
     ctx_offsets: np.ndarray
     ctx_lengths: np.ndarray
-    ctx_totals: np.ndarray
+    ctx_kept_totals: np.ndarray
     entry_tokens: np.ndarray
     entry_counts: np.ndarray
 
@@ -250,7 +250,7 @@ class PackedOrderTable:
             return 0, 0
         start = int(self.ctx_offsets[idx])
         length = int(self.ctx_lengths[idx])
-        total = int(self.ctx_totals[idx])
+        total = int(self.ctx_kept_totals[idx])
         for entry_idx in range(start, start + length):
             if int(self.entry_tokens[entry_idx]) == int(target_id):
                 return int(self.entry_counts[entry_idx]), total
@@ -261,7 +261,7 @@ class PackedOrderTable:
             int(self.ctx_keys.nbytes)
             + int(self.ctx_offsets.nbytes)
             + int(self.ctx_lengths.nbytes)
-            + int(self.ctx_totals.nbytes)
+            + int(self.ctx_kept_totals.nbytes)
             + int(self.entry_tokens.nbytes)
             + int(self.entry_counts.nbytes)
         )
@@ -287,28 +287,32 @@ class RuntimePackedMemory:
         self.orders = orders
         self.topk = topk
         self.max_contexts_per_order = max_contexts_per_order
-        self.ctx_totals = {order: {} for order in orders}
+        self.ctx_kept_totals = {order: {} for order in orders}
         self.ctx_counts = {order: {} for order in orders}
 
     def lookup(self, order: int, ctx_key: int, target_id: int) -> tuple[int, int]:
-        total = int(self.ctx_totals[order].get(ctx_key, 0))
+        total = int(self.ctx_kept_totals[order].get(ctx_key, 0))
         count = int(self.ctx_counts[order].get((ctx_key, int(target_id)), 0))
         return count, total
 
     def update(self, order: int, ctx_key: int, target_id: int) -> None:
-        totals = self.ctx_totals[order]
+        totals = self.ctx_kept_totals[order]
         if ctx_key not in totals and len(totals) >= self.max_contexts_per_order:
             return
-        totals[ctx_key] = min(int(totals.get(ctx_key, 0)) + 1, 2**32 - 1)
         counts = self.ctx_counts[order]
         pair = (ctx_key, int(target_id))
         new_count = min(int(counts.get(pair, 0)) + 1, 65535)
         counts[pair] = new_count
-        if new_count == 1:
+        bucket_pairs = [k for k in counts if k[0] == ctx_key]
+        if len(bucket_pairs) > self.topk:
+            worst = min(bucket_pairs, key=lambda key: (counts[key], -key[1]))
+            counts.pop(worst, None)
             bucket_pairs = [k for k in counts if k[0] == ctx_key]
-            if len(bucket_pairs) > self.topk:
-                worst = min(bucket_pairs, key=lambda key: (counts[key], -key[1]))
-                counts.pop(worst, None)
+        kept_total = min(sum(int(counts[key]) for key in bucket_pairs), 2**32 - 1)
+        if kept_total > 0:
+            totals[ctx_key] = kept_total
+        else:
+            totals.pop(ctx_key, None)
 
     def estimated_nbytes(self) -> int:
         per_context_bytes = 8 + 4 + self.topk * (2 + 2)
@@ -348,6 +352,33 @@ def packed_memory_lookup_self_test() -> bool:
     )
 
 
+def packed_memory_truncation_mass_self_test() -> bool:
+    alpha = 4.0
+    prior = np.full((4,), 0.25, dtype=np.float64)
+    tokens = np.array([7, 8, 0, 7, 8, 0, 7, 8, 0, 7, 8, 1, 7, 8, 1, 7, 8, 2], dtype=np.uint16)
+    table = build_packed_order_table(tokens, order=3, topk=2, min_count=1, max_contexts=16)
+    ctx_key = pack_context_tokens(np.array([7, 8], dtype=np.uint16))
+    static_counts = np.array([table.lookup(ctx_key, token_id)[0] for token_id in range(4)], dtype=np.float64)
+    static_total = float(table.lookup(ctx_key, 0)[1])
+    static_posterior = (static_counts + alpha * prior) / (static_total + alpha)
+
+    runtime = RuntimePackedMemory((3,), topk=2, max_contexts_per_order=8)
+    for token_id in [0, 0, 0, 1, 1, 2]:
+        runtime.update(3, ctx_key, token_id)
+    runtime_counts = np.array([runtime.lookup(3, ctx_key, token_id)[0] for token_id in range(4)], dtype=np.float64)
+    runtime_total = float(runtime.lookup(3, ctx_key, 0)[1])
+    runtime_posterior = (runtime_counts + alpha * prior) / (runtime_total + alpha)
+
+    return (
+        static_total == 5.0
+        and runtime_total == 5.0
+        and abs(float(static_counts.sum()) - static_total) < 1e-12
+        and abs(float(runtime_counts.sum()) - runtime_total) < 1e-12
+        and abs(float(static_posterior.sum()) - 1.0) < 1e-12
+        and abs(float(runtime_posterior.sum()) - 1.0) < 1e-12
+    )
+
+
 def build_packed_order_table(
     tokens: np.ndarray,
     order: int,
@@ -367,7 +398,7 @@ def build_packed_order_table(
             ctx_keys=np.empty((0,), dtype=np.uint64),
             ctx_offsets=np.empty((0,), dtype=np.uint32),
             ctx_lengths=np.empty((0,), dtype=np.uint16),
-            ctx_totals=np.empty((0,), dtype=np.uint32),
+            ctx_kept_totals=np.empty((0,), dtype=np.uint32),
             entry_tokens=np.empty((0,), dtype=np.uint16),
             entry_counts=np.empty((0,), dtype=np.uint16),
         )
@@ -396,7 +427,7 @@ def build_packed_order_table(
     ctx_keys_arr = np.empty((len(kept_contexts),), dtype=np.uint64)
     ctx_offsets_arr = np.empty((len(kept_contexts),), dtype=np.uint32)
     ctx_lengths_arr = np.empty((len(kept_contexts),), dtype=np.uint16)
-    ctx_totals_arr = np.empty((len(kept_contexts),), dtype=np.uint32)
+    ctx_kept_totals_arr = np.empty((len(kept_contexts),), dtype=np.uint32)
     entry_tokens: list[int] = []
     entry_counts: list[int] = []
     offset = 0
@@ -404,7 +435,7 @@ def build_packed_order_table(
         ctx_keys_arr[keep_idx] = np.uint64(ctx_key)
         ctx_offsets_arr[keep_idx] = np.uint32(offset)
         ctx_lengths_arr[keep_idx] = np.uint16(len(counts))
-        ctx_totals_arr[keep_idx] = np.uint32(ctx_total)
+        ctx_kept_totals_arr[keep_idx] = np.uint32(sum(count for _, count in counts))
         for token_id, count in counts:
             entry_tokens.append(int(token_id))
             entry_counts.append(int(count))
@@ -415,7 +446,7 @@ def build_packed_order_table(
         ctx_keys=ctx_keys_arr,
         ctx_offsets=ctx_offsets_arr,
         ctx_lengths=ctx_lengths_arr,
-        ctx_totals=ctx_totals_arr,
+        ctx_kept_totals=ctx_kept_totals_arr,
         entry_tokens=np.asarray(entry_tokens, dtype=np.uint16),
         entry_counts=np.asarray(entry_counts, dtype=np.uint16),
     )
@@ -465,7 +496,7 @@ def save_packed_memory_artifact(artifact: PackedMemoryArtifact, path: str) -> No
         payload[f"{prefix}_ctx_keys"] = table.ctx_keys
         payload[f"{prefix}_ctx_offsets"] = table.ctx_offsets
         payload[f"{prefix}_ctx_lengths"] = table.ctx_lengths
-        payload[f"{prefix}_ctx_totals"] = table.ctx_totals
+        payload[f"{prefix}_ctx_kept_totals"] = table.ctx_kept_totals
         payload[f"{prefix}_entry_tokens"] = table.entry_tokens
         payload[f"{prefix}_entry_counts"] = table.entry_counts
     with open(path, "wb") as f:
@@ -488,7 +519,7 @@ def load_packed_memory_artifact(path: str) -> PackedMemoryArtifact:
                     ctx_keys=data[f"{prefix}_ctx_keys"],
                     ctx_offsets=data[f"{prefix}_ctx_offsets"],
                     ctx_lengths=data[f"{prefix}_ctx_lengths"],
-                    ctx_totals=data[f"{prefix}_ctx_totals"],
+                    ctx_kept_totals=data[f"{prefix}_ctx_kept_totals"],
                     entry_tokens=data[f"{prefix}_entry_tokens"],
                     entry_counts=data[f"{prefix}_entry_counts"],
                 )
@@ -1221,7 +1252,8 @@ def main() -> None:
         log0(
             f"packed_memory:artifact_bound_bytes:{estimate_packed_memory_artifact_nbytes(args)} "
             f"runtime_bound_bytes:{runtime_bound} norm_self_test_err:{packed_memory_normalization_self_test():.3e} "
-            f"lookup_self_test:{packed_memory_lookup_self_test()}"
+            f"lookup_self_test:{packed_memory_lookup_self_test()} "
+            f"truncation_mass_self_test:{packed_memory_truncation_mass_self_test()}"
         )
 
     # -----------------------------
