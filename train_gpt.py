@@ -37,6 +37,26 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
+
+def parse_int_tuple(raw: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in raw.split(",") if x.strip())
+
+
+def parse_float_tuple(raw: str) -> tuple[float, ...]:
+    return tuple(float(x) for x in raw.split(",") if x.strip())
+
+
+def parse_per_order_int_env(name: str, length: int, default_value: int) -> tuple[int, ...]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return (default_value,) * length
+    values = parse_int_tuple(raw)
+    if len(values) == 1 and length > 1:
+        return values * length
+    if len(values) != length:
+        raise ValueError(f"{name} must have length 1 or match PACKED_MEMORY_ORDERS ({length}), got {len(values)}")
+    return values
+
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -51,21 +71,28 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     packed_memory_enabled = bool(int(os.environ.get("PACKED_MEMORY_ENABLED", "0")))
-    packed_memory_orders = tuple(
-        int(x)
-        for x in os.environ.get("PACKED_MEMORY_ORDERS", "2,3,4,5,6").split(",")
-        if x.strip()
-    )
-    packed_memory_concentrations = tuple(
-        float(x)
-        for x in os.environ.get("PACKED_MEMORY_CONCENTRATIONS", "50,20,10,6,4").split(",")
-        if x.strip()
-    )
+    packed_memory_orders = parse_int_tuple(os.environ.get("PACKED_MEMORY_ORDERS", "2,3,4,5,6"))
+    packed_memory_concentrations = parse_float_tuple(os.environ.get("PACKED_MEMORY_CONCENTRATIONS", "50,20,10,6,4"))
     packed_memory_build_tokens = int(os.environ.get("PACKED_MEMORY_BUILD_TOKENS", 5_000_000))
     packed_memory_topk = int(os.environ.get("PACKED_MEMORY_TOPK", 4))
     packed_memory_min_count = int(os.environ.get("PACKED_MEMORY_MIN_COUNT", 2))
     packed_memory_max_contexts_per_order = int(os.environ.get("PACKED_MEMORY_MAX_CONTEXTS_PER_ORDER", 65_536))
     packed_memory_runtime_contexts_per_order = int(os.environ.get("PACKED_MEMORY_RUNTIME_CONTEXTS_PER_ORDER", 16_384))
+    packed_memory_context_caps = parse_per_order_int_env(
+        "PACKED_MEMORY_CONTEXT_CAPS",
+        len(packed_memory_orders),
+        packed_memory_max_contexts_per_order,
+    )
+    packed_memory_runtime_context_caps = parse_per_order_int_env(
+        "PACKED_MEMORY_RUNTIME_CONTEXT_CAPS",
+        len(packed_memory_orders),
+        packed_memory_runtime_contexts_per_order,
+    )
+    packed_memory_min_kept_totals = parse_per_order_int_env(
+        "PACKED_MEMORY_MIN_KEPT_TOTALS",
+        len(packed_memory_orders),
+        0,
+    )
     packed_memory_eval_batch_seqs = int(os.environ.get("PACKED_MEMORY_EVAL_BATCH_SEQS", 4))
 
     # Training length.
@@ -224,29 +251,40 @@ def build_sentencepiece_luts(
 
 TOKEN_BITS = 10
 TOKEN_MASK = (1 << TOKEN_BITS) - 1
+U64_MASK = (1 << 64) - 1
 PACKED_MEMORY_MAGIC = "packed_causal_memory_v1"
 
 
-def pack_context_tokens(tokens: np.ndarray) -> int:
-    key = 0
+def pack_context_tokens(tokens: np.ndarray) -> tuple[int, int]:
+    key_hi = 0
+    key_lo = 0
     for token in tokens:
-        key = (key << TOKEN_BITS) | (int(token) & TOKEN_MASK)
-    return key
+        carry = key_lo >> (64 - TOKEN_BITS)
+        key_hi = ((key_hi << TOKEN_BITS) | carry) & U64_MASK
+        key_lo = ((key_lo << TOKEN_BITS) | (int(token) & TOKEN_MASK)) & U64_MASK
+    return key_hi, key_lo
 
 
 @dataclass
 class PackedOrderTable:
     order: int
-    ctx_keys: np.ndarray
+    ctx_keys_hi: np.ndarray
+    ctx_keys_lo: np.ndarray
     ctx_offsets: np.ndarray
     ctx_lengths: np.ndarray
     ctx_kept_totals: np.ndarray
     entry_tokens: np.ndarray
     entry_counts: np.ndarray
 
-    def lookup(self, ctx_key: int, target_id: int) -> tuple[int, int]:
-        idx = int(np.searchsorted(self.ctx_keys, np.uint64(ctx_key)))
-        if idx >= int(self.ctx_keys.size) or int(self.ctx_keys[idx]) != int(ctx_key):
+    def lookup(self, ctx_key: tuple[int, int], target_id: int) -> tuple[int, int]:
+        ctx_key_hi, ctx_key_lo = ctx_key
+        left = int(np.searchsorted(self.ctx_keys_hi, np.uint64(ctx_key_hi), side="left"))
+        right = int(np.searchsorted(self.ctx_keys_hi, np.uint64(ctx_key_hi), side="right"))
+        if left >= right:
+            return 0, 0
+        rel = int(np.searchsorted(self.ctx_keys_lo[left:right], np.uint64(ctx_key_lo)))
+        idx = left + rel
+        if idx >= right or int(self.ctx_keys_lo[idx]) != int(ctx_key_lo):
             return 0, 0
         start = int(self.ctx_offsets[idx])
         length = int(self.ctx_lengths[idx])
@@ -258,7 +296,8 @@ class PackedOrderTable:
 
     def serialized_nbytes(self) -> int:
         return (
-            int(self.ctx_keys.nbytes)
+            int(self.ctx_keys_hi.nbytes)
+            + int(self.ctx_keys_lo.nbytes)
             + int(self.ctx_offsets.nbytes)
             + int(self.ctx_lengths.nbytes)
             + int(self.ctx_kept_totals.nbytes)
@@ -274,30 +313,30 @@ class PackedMemoryArtifact:
     build_tokens: int
     topk: int
     min_count: int
-    max_contexts_per_order: int
+    context_caps: tuple[int, ...]
     tables: tuple[PackedOrderTable, ...]
 
     def serialized_nbytes(self) -> int:
-        meta_bytes = 8 * len(self.orders) + 8 * len(self.concentrations) + 24
+        meta_bytes = 8 * len(self.orders) + 8 * len(self.concentrations) + 4 * len(self.context_caps) + 24
         return meta_bytes + sum(table.serialized_nbytes() for table in self.tables)
 
 
 class RuntimePackedMemory:
-    def __init__(self, orders: tuple[int, ...], topk: int, max_contexts_per_order: int):
+    def __init__(self, orders: tuple[int, ...], topk: int, context_caps: tuple[int, ...]):
         self.orders = orders
         self.topk = topk
-        self.max_contexts_per_order = max_contexts_per_order
+        self.context_caps = dict(zip(orders, context_caps, strict=True))
         self.ctx_kept_totals = {order: {} for order in orders}
         self.ctx_counts = {order: {} for order in orders}
 
-    def lookup(self, order: int, ctx_key: int, target_id: int) -> tuple[int, int]:
+    def lookup(self, order: int, ctx_key: tuple[int, int], target_id: int) -> tuple[int, int]:
         total = int(self.ctx_kept_totals[order].get(ctx_key, 0))
         count = int(self.ctx_counts[order].get((ctx_key, int(target_id)), 0))
         return count, total
 
-    def update(self, order: int, ctx_key: int, target_id: int) -> None:
+    def update(self, order: int, ctx_key: tuple[int, int], target_id: int) -> None:
         totals = self.ctx_kept_totals[order]
-        if ctx_key not in totals and len(totals) >= self.max_contexts_per_order:
+        if ctx_key not in totals and len(totals) >= self.context_caps[order]:
             return
         counts = self.ctx_counts[order]
         pair = (ctx_key, int(target_id))
@@ -315,13 +354,13 @@ class RuntimePackedMemory:
             totals.pop(ctx_key, None)
 
     def estimated_nbytes(self) -> int:
-        per_context_bytes = 8 + 4 + self.topk * (2 + 2)
-        return len(self.orders) * self.max_contexts_per_order * per_context_bytes
+        per_context_bytes = 16 + 4 + self.topk * (2 + 2)
+        return sum(self.context_caps[order] * per_context_bytes for order in self.orders)
 
 
 def estimate_packed_memory_artifact_nbytes(args: Hyperparameters) -> int:
-    per_context_bytes = 8 + 4 + 2 + 4 + args.packed_memory_topk * (2 + 2)
-    return len(args.packed_memory_orders) * args.packed_memory_max_contexts_per_order * per_context_bytes
+    per_context_bytes = 16 + 4 + 2 + 4 + args.packed_memory_topk * (2 + 2)
+    return sum(cap * per_context_bytes for cap in args.packed_memory_context_caps)
 
 
 def packed_memory_normalization_self_test() -> float:
@@ -352,6 +391,16 @@ def packed_memory_lookup_self_test() -> bool:
     )
 
 
+def packed_memory_wide_key_self_test() -> bool:
+    prefix = np.array([10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], dtype=np.uint16)
+    tokens = np.concatenate((prefix, np.array([7], dtype=np.uint16), prefix, np.array([9], dtype=np.uint16)))
+    table = build_packed_order_table(tokens, order=12, topk=2, min_count=1, max_contexts=16)
+    ctx_key = pack_context_tokens(prefix)
+    seen_count, seen_total = table.lookup(ctx_key, 7)
+    miss_count, miss_total = table.lookup(ctx_key, 8)
+    return seen_count == 1 and seen_total == 2 and miss_count == 0 and miss_total == 2
+
+
 def packed_memory_truncation_mass_self_test() -> bool:
     alpha = 4.0
     prior = np.full((4,), 0.25, dtype=np.float64)
@@ -362,7 +411,7 @@ def packed_memory_truncation_mass_self_test() -> bool:
     static_total = float(table.lookup(ctx_key, 0)[1])
     static_posterior = (static_counts + alpha * prior) / (static_total + alpha)
 
-    runtime = RuntimePackedMemory((3,), topk=2, max_contexts_per_order=8)
+    runtime = RuntimePackedMemory((3,), topk=2, context_caps=(8,))
     for token_id in [0, 0, 0, 1, 1, 2]:
         runtime.update(3, ctx_key, token_id)
     runtime_counts = np.array([runtime.lookup(3, ctx_key, token_id)[0] for token_id in range(4)], dtype=np.float64)
@@ -388,14 +437,15 @@ def build_packed_order_table(
 ) -> PackedOrderTable:
     if order < 2:
         raise ValueError(f"Packed-memory order must be >= 2, got {order}")
-    if (order - 1) * TOKEN_BITS > 64:
-        raise ValueError(f"Packed-memory order {order} exceeds 64-bit exact context packing")
-    ctx_totals: dict[int, int] = {}
-    ctx_counts: dict[int, dict[int, int]] = {}
+    if (order - 1) * TOKEN_BITS > 128:
+        raise ValueError(f"Packed-memory order {order} exceeds 128-bit exact context packing")
+    ctx_totals: dict[tuple[int, int], int] = {}
+    ctx_counts: dict[tuple[int, int], dict[int, int]] = {}
     if tokens.size <= order - 1:
         return PackedOrderTable(
             order=order,
-            ctx_keys=np.empty((0,), dtype=np.uint64),
+            ctx_keys_hi=np.empty((0,), dtype=np.uint64),
+            ctx_keys_lo=np.empty((0,), dtype=np.uint64),
             ctx_offsets=np.empty((0,), dtype=np.uint32),
             ctx_lengths=np.empty((0,), dtype=np.uint16),
             ctx_kept_totals=np.empty((0,), dtype=np.uint32),
@@ -421,18 +471,20 @@ def build_packed_order_table(
             continue
         counts.sort(key=lambda item: (-item[1], item[0]))
         counts = counts[:topk]
-        kept_contexts.append((int(ctx_key), int(ctx_totals[ctx_key]), counts))
+        kept_contexts.append((int(ctx_key[0]), int(ctx_key[1]), counts))
 
-    kept_contexts.sort(key=lambda item: item[0])
-    ctx_keys_arr = np.empty((len(kept_contexts),), dtype=np.uint64)
+    kept_contexts.sort(key=lambda item: (item[0], item[1]))
+    ctx_keys_hi_arr = np.empty((len(kept_contexts),), dtype=np.uint64)
+    ctx_keys_lo_arr = np.empty((len(kept_contexts),), dtype=np.uint64)
     ctx_offsets_arr = np.empty((len(kept_contexts),), dtype=np.uint32)
     ctx_lengths_arr = np.empty((len(kept_contexts),), dtype=np.uint16)
     ctx_kept_totals_arr = np.empty((len(kept_contexts),), dtype=np.uint32)
     entry_tokens: list[int] = []
     entry_counts: list[int] = []
     offset = 0
-    for keep_idx, (ctx_key, ctx_total, counts) in enumerate(kept_contexts):
-        ctx_keys_arr[keep_idx] = np.uint64(ctx_key)
+    for keep_idx, (ctx_key_hi, ctx_key_lo, counts) in enumerate(kept_contexts):
+        ctx_keys_hi_arr[keep_idx] = np.uint64(ctx_key_hi)
+        ctx_keys_lo_arr[keep_idx] = np.uint64(ctx_key_lo)
         ctx_offsets_arr[keep_idx] = np.uint32(offset)
         ctx_lengths_arr[keep_idx] = np.uint16(len(counts))
         ctx_kept_totals_arr[keep_idx] = np.uint32(sum(count for _, count in counts))
@@ -443,7 +495,8 @@ def build_packed_order_table(
 
     return PackedOrderTable(
         order=order,
-        ctx_keys=ctx_keys_arr,
+        ctx_keys_hi=ctx_keys_hi_arr,
+        ctx_keys_lo=ctx_keys_lo_arr,
         ctx_offsets=ctx_offsets_arr,
         ctx_lengths=ctx_lengths_arr,
         ctx_kept_totals=ctx_kept_totals_arr,
@@ -455,19 +508,21 @@ def build_packed_order_table(
 def build_packed_memory_artifact(args: Hyperparameters, log0) -> PackedMemoryArtifact:
     if len(args.packed_memory_orders) != len(args.packed_memory_concentrations):
         raise ValueError("PACKED_MEMORY_ORDERS and PACKED_MEMORY_CONCENTRATIONS must have the same length")
+    if len(args.packed_memory_orders) != len(args.packed_memory_context_caps):
+        raise ValueError("PACKED_MEMORY_CONTEXT_CAPS must match PACKED_MEMORY_ORDERS")
     tokens = TokenStream(args.train_files).take(args.packed_memory_build_tokens).cpu().numpy().astype(np.uint16, copy=False)
     tables = []
-    for order in args.packed_memory_orders:
+    for order, context_cap in zip(args.packed_memory_orders, args.packed_memory_context_caps, strict=True):
         table = build_packed_order_table(
             tokens,
             order=order,
             topk=args.packed_memory_topk,
             min_count=args.packed_memory_min_count,
-            max_contexts=args.packed_memory_max_contexts_per_order,
+            max_contexts=context_cap,
         )
         log0(
-            f"packed_memory:order={order} contexts:{int(table.ctx_keys.size)} "
-            f"entries:{int(table.entry_tokens.size)} bytes:{table.serialized_nbytes()}"
+            f"packed_memory:order={order} contexts:{int(table.ctx_keys_hi.size)} "
+            f"entries:{int(table.entry_tokens.size)} cap:{context_cap} bytes:{table.serialized_nbytes()}"
         )
         tables.append(table)
     return PackedMemoryArtifact(
@@ -476,7 +531,7 @@ def build_packed_memory_artifact(args: Hyperparameters, log0) -> PackedMemoryArt
         build_tokens=args.packed_memory_build_tokens,
         topk=args.packed_memory_topk,
         min_count=args.packed_memory_min_count,
-        max_contexts_per_order=args.packed_memory_max_contexts_per_order,
+        context_caps=args.packed_memory_context_caps,
         tables=tuple(tables),
     )
 
@@ -489,11 +544,12 @@ def save_packed_memory_artifact(artifact: PackedMemoryArtifact, path: str) -> No
         "build_tokens": np.asarray([artifact.build_tokens], dtype=np.int64),
         "topk": np.asarray([artifact.topk], dtype=np.int16),
         "min_count": np.asarray([artifact.min_count], dtype=np.int16),
-        "max_contexts_per_order": np.asarray([artifact.max_contexts_per_order], dtype=np.int32),
+        "context_caps": np.asarray(artifact.context_caps, dtype=np.int32),
     }
     for table in artifact.tables:
         prefix = f"order_{table.order}"
-        payload[f"{prefix}_ctx_keys"] = table.ctx_keys
+        payload[f"{prefix}_ctx_keys_hi"] = table.ctx_keys_hi
+        payload[f"{prefix}_ctx_keys_lo"] = table.ctx_keys_lo
         payload[f"{prefix}_ctx_offsets"] = table.ctx_offsets
         payload[f"{prefix}_ctx_lengths"] = table.ctx_lengths
         payload[f"{prefix}_ctx_kept_totals"] = table.ctx_kept_totals
@@ -510,13 +566,24 @@ def load_packed_memory_artifact(path: str) -> PackedMemoryArtifact:
             raise ValueError(f"Unexpected packed-memory artifact magic: {magic}")
         orders = tuple(int(x) for x in data["orders"].tolist())
         concentrations = tuple(float(x) for x in data["concentrations"].tolist())
+        if "context_caps" in data:
+            context_caps = tuple(int(x) for x in data["context_caps"].tolist())
+        else:
+            context_caps = (int(data["max_contexts_per_order"][0]),) * len(orders)
         tables = []
         for order in orders:
             prefix = f"order_{order}"
+            if f"{prefix}_ctx_keys_hi" in data:
+                ctx_keys_hi = data[f"{prefix}_ctx_keys_hi"]
+                ctx_keys_lo = data[f"{prefix}_ctx_keys_lo"]
+            else:
+                ctx_keys_hi = np.zeros_like(data[f"{prefix}_ctx_keys"], dtype=np.uint64)
+                ctx_keys_lo = data[f"{prefix}_ctx_keys"].astype(np.uint64, copy=False)
             tables.append(
                 PackedOrderTable(
                     order=order,
-                    ctx_keys=data[f"{prefix}_ctx_keys"],
+                    ctx_keys_hi=ctx_keys_hi,
+                    ctx_keys_lo=ctx_keys_lo,
                     ctx_offsets=data[f"{prefix}_ctx_offsets"],
                     ctx_lengths=data[f"{prefix}_ctx_lengths"],
                     ctx_kept_totals=data[f"{prefix}_ctx_kept_totals"],
@@ -530,7 +597,7 @@ def load_packed_memory_artifact(path: str) -> PackedMemoryArtifact:
             build_tokens=int(data["build_tokens"][0]),
             topk=int(data["topk"][0]),
             min_count=int(data["min_count"][0]),
-            max_contexts_per_order=int(data["max_contexts_per_order"][0]),
+            context_caps=context_caps,
             tables=tuple(tables),
         )
 
@@ -621,11 +688,15 @@ def eval_val_packed_memory(
 ) -> tuple[float, float]:
     if args.packed_memory_eval_batch_seqs <= 0:
         raise ValueError("PACKED_MEMORY_EVAL_BATCH_SEQS must be positive")
+    if len(artifact.orders) != len(args.packed_memory_runtime_context_caps):
+        raise ValueError("PACKED_MEMORY_RUNTIME_CONTEXT_CAPS must match PACKED_MEMORY_ORDERS")
+    if len(artifact.orders) != len(args.packed_memory_min_kept_totals):
+        raise ValueError("PACKED_MEMORY_MIN_KEPT_TOTALS must match PACKED_MEMORY_ORDERS")
     val_tokens_cpu = val_tokens.to(dtype=torch.int64, device="cpu", copy=True).numpy()
     runtime_memory = RuntimePackedMemory(
         artifact.orders,
         topk=artifact.topk,
-        max_contexts_per_order=args.packed_memory_runtime_contexts_per_order,
+        context_caps=args.packed_memory_runtime_context_caps,
     )
     val_loss_sum = 0.0
     val_token_count = 0
@@ -659,7 +730,13 @@ def eval_val_packed_memory(
             for local_idx, target_id in enumerate(target_ids.tolist()):
                 target_pos = chunk_start + local_idx + 1
                 posterior = float(prior_true[local_idx])
-                for table, alpha in zip(artifact.tables, artifact.concentrations, strict=True):
+                selected_posterior = posterior
+                for table, alpha, min_kept_total in zip(
+                    artifact.tables,
+                    artifact.concentrations,
+                    args.packed_memory_min_kept_totals,
+                    strict=True,
+                ):
                     ctx_tokens = val_tokens_cpu[target_pos - table.order + 1 : target_pos]
                     if ctx_tokens.size != table.order - 1:
                         continue
@@ -670,6 +747,9 @@ def eval_val_packed_memory(
                     if total_count <= 0:
                         continue
                     posterior = (static_count + runtime_count + alpha * posterior) / (total_count + alpha)
+                    if total_count >= min_kept_total:
+                        selected_posterior = posterior
+                posterior = selected_posterior
                 posterior = max(min(posterior, 1.0), 1e-12)
                 val_loss_sum += -math.log(posterior)
                 val_token_count += 1
@@ -1242,18 +1322,21 @@ def main() -> None:
         runtime_bound = RuntimePackedMemory(
             args.packed_memory_orders,
             topk=args.packed_memory_topk,
-            max_contexts_per_order=args.packed_memory_runtime_contexts_per_order,
+            context_caps=args.packed_memory_runtime_context_caps,
         ).estimated_nbytes()
         log0(
             f"packed_memory:enabled orders:{args.packed_memory_orders} "
             f"concentrations:{args.packed_memory_concentrations} build_tokens:{args.packed_memory_build_tokens} "
-            f"topk:{args.packed_memory_topk} min_count:{args.packed_memory_min_count}"
+            f"topk:{args.packed_memory_topk} min_count:{args.packed_memory_min_count} "
+            f"context_caps:{args.packed_memory_context_caps} runtime_caps:{args.packed_memory_runtime_context_caps} "
+            f"min_kept_totals:{args.packed_memory_min_kept_totals}"
         )
         log0(
             f"packed_memory:artifact_bound_bytes:{estimate_packed_memory_artifact_nbytes(args)} "
             f"runtime_bound_bytes:{runtime_bound} norm_self_test_err:{packed_memory_normalization_self_test():.3e} "
             f"lookup_self_test:{packed_memory_lookup_self_test()} "
-            f"truncation_mass_self_test:{packed_memory_truncation_mass_self_test()}"
+            f"truncation_mass_self_test:{packed_memory_truncation_mass_self_test()} "
+            f"wide_key_self_test:{packed_memory_wide_key_self_test()}"
         )
 
     # -----------------------------
@@ -1536,7 +1619,7 @@ def main() -> None:
             log0(
                 f"packed_memory_artifact bytes:{packed_memory_bytes} "
                 f"estimated_bound:{estimate_packed_memory_artifact_nbytes(args)} "
-                f"runtime_bound:{RuntimePackedMemory(args.packed_memory_orders, args.packed_memory_topk, args.packed_memory_runtime_contexts_per_order).estimated_nbytes()}"
+                f"runtime_bound:{RuntimePackedMemory(args.packed_memory_orders, args.packed_memory_topk, args.packed_memory_runtime_context_caps).estimated_nbytes()}"
             )
             log0(f"Total submission size int8+packed_memory: {quant_file_bytes + packed_memory_bytes + code_bytes} bytes")
 
