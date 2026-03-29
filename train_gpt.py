@@ -7,6 +7,7 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 import glob
 import io
 import math
@@ -49,6 +50,23 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    packed_memory_enabled = bool(int(os.environ.get("PACKED_MEMORY_ENABLED", "0")))
+    packed_memory_orders = tuple(
+        int(x)
+        for x in os.environ.get("PACKED_MEMORY_ORDERS", "2,3,4,5,6").split(",")
+        if x.strip()
+    )
+    packed_memory_concentrations = tuple(
+        float(x)
+        for x in os.environ.get("PACKED_MEMORY_CONCENTRATIONS", "50,20,10,6,4").split(",")
+        if x.strip()
+    )
+    packed_memory_build_tokens = int(os.environ.get("PACKED_MEMORY_BUILD_TOKENS", 5_000_000))
+    packed_memory_topk = int(os.environ.get("PACKED_MEMORY_TOPK", 4))
+    packed_memory_min_count = int(os.environ.get("PACKED_MEMORY_MIN_COUNT", 2))
+    packed_memory_max_contexts_per_order = int(os.environ.get("PACKED_MEMORY_MAX_CONTEXTS_PER_ORDER", 65_536))
+    packed_memory_runtime_contexts_per_order = int(os.environ.get("PACKED_MEMORY_RUNTIME_CONTEXTS_PER_ORDER", 16_384))
+    packed_memory_eval_batch_seqs = int(os.environ.get("PACKED_MEMORY_EVAL_BATCH_SEQS", 4))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -204,6 +222,288 @@ def build_sentencepiece_luts(
     )
 
 
+TOKEN_BITS = 10
+TOKEN_MASK = (1 << TOKEN_BITS) - 1
+PACKED_MEMORY_MAGIC = "packed_causal_memory_v1"
+
+
+def pack_context_tokens(tokens: np.ndarray) -> int:
+    key = 0
+    for token in tokens:
+        key = (key << TOKEN_BITS) | (int(token) & TOKEN_MASK)
+    return key
+
+
+@dataclass
+class PackedOrderTable:
+    order: int
+    ctx_keys: np.ndarray
+    ctx_offsets: np.ndarray
+    ctx_lengths: np.ndarray
+    ctx_totals: np.ndarray
+    entry_tokens: np.ndarray
+    entry_counts: np.ndarray
+
+    def lookup(self, ctx_key: int, target_id: int) -> tuple[int, int]:
+        idx = int(np.searchsorted(self.ctx_keys, np.uint64(ctx_key)))
+        if idx >= int(self.ctx_keys.size) or int(self.ctx_keys[idx]) != int(ctx_key):
+            return 0, 0
+        start = int(self.ctx_offsets[idx])
+        length = int(self.ctx_lengths[idx])
+        total = int(self.ctx_totals[idx])
+        for entry_idx in range(start, start + length):
+            if int(self.entry_tokens[entry_idx]) == int(target_id):
+                return int(self.entry_counts[entry_idx]), total
+        return 0, total
+
+    def serialized_nbytes(self) -> int:
+        return (
+            int(self.ctx_keys.nbytes)
+            + int(self.ctx_offsets.nbytes)
+            + int(self.ctx_lengths.nbytes)
+            + int(self.ctx_totals.nbytes)
+            + int(self.entry_tokens.nbytes)
+            + int(self.entry_counts.nbytes)
+        )
+
+
+@dataclass
+class PackedMemoryArtifact:
+    orders: tuple[int, ...]
+    concentrations: tuple[float, ...]
+    build_tokens: int
+    topk: int
+    min_count: int
+    max_contexts_per_order: int
+    tables: tuple[PackedOrderTable, ...]
+
+    def serialized_nbytes(self) -> int:
+        meta_bytes = 8 * len(self.orders) + 8 * len(self.concentrations) + 24
+        return meta_bytes + sum(table.serialized_nbytes() for table in self.tables)
+
+
+class RuntimePackedMemory:
+    def __init__(self, orders: tuple[int, ...], topk: int, max_contexts_per_order: int):
+        self.orders = orders
+        self.topk = topk
+        self.max_contexts_per_order = max_contexts_per_order
+        self.ctx_totals = {order: {} for order in orders}
+        self.ctx_counts = {order: {} for order in orders}
+
+    def lookup(self, order: int, ctx_key: int, target_id: int) -> tuple[int, int]:
+        total = int(self.ctx_totals[order].get(ctx_key, 0))
+        count = int(self.ctx_counts[order].get((ctx_key, int(target_id)), 0))
+        return count, total
+
+    def update(self, order: int, ctx_key: int, target_id: int) -> None:
+        totals = self.ctx_totals[order]
+        if ctx_key not in totals and len(totals) >= self.max_contexts_per_order:
+            return
+        totals[ctx_key] = min(int(totals.get(ctx_key, 0)) + 1, 2**32 - 1)
+        counts = self.ctx_counts[order]
+        pair = (ctx_key, int(target_id))
+        new_count = min(int(counts.get(pair, 0)) + 1, 65535)
+        counts[pair] = new_count
+        if new_count == 1:
+            bucket_pairs = [k for k in counts if k[0] == ctx_key]
+            if len(bucket_pairs) > self.topk:
+                worst = min(bucket_pairs, key=lambda key: (counts[key], -key[1]))
+                counts.pop(worst, None)
+
+    def estimated_nbytes(self) -> int:
+        per_context_bytes = 8 + 4 + self.topk * (2 + 2)
+        return len(self.orders) * self.max_contexts_per_order * per_context_bytes
+
+
+def estimate_packed_memory_artifact_nbytes(args: Hyperparameters) -> int:
+    per_context_bytes = 8 + 4 + 2 + 4 + args.packed_memory_topk * (2 + 2)
+    return len(args.packed_memory_orders) * args.packed_memory_max_contexts_per_order * per_context_bytes
+
+
+def packed_memory_normalization_self_test() -> float:
+    prior = np.array([0.60, 0.25, 0.10, 0.05], dtype=np.float64)
+    counts = {0: 3, 2: 1}
+    alpha = 5.0
+    posterior = prior * alpha
+    for token_id, count in counts.items():
+        posterior[token_id] += count
+    posterior /= alpha + sum(counts.values())
+    return float(abs(float(posterior.sum()) - 1.0))
+
+
+def packed_memory_lookup_self_test() -> bool:
+    tokens = np.array([7, 8, 9, 7, 8, 9, 7, 8, 5], dtype=np.uint16)
+    table = build_packed_order_table(tokens, order=3, topk=2, min_count=1, max_contexts=16)
+    ctx_key = pack_context_tokens(np.array([7, 8], dtype=np.uint16))
+    seen_count, seen_total = table.lookup(ctx_key, 9)
+    miss_count, miss_total = table.lookup(ctx_key, 4)
+    missing_ctx_count, missing_ctx_total = table.lookup(pack_context_tokens(np.array([8, 7], dtype=np.uint16)), 9)
+    return (
+        seen_count == 2
+        and seen_total == 3
+        and miss_count == 0
+        and miss_total == 3
+        and missing_ctx_count == 0
+        and missing_ctx_total == 0
+    )
+
+
+def build_packed_order_table(
+    tokens: np.ndarray,
+    order: int,
+    topk: int,
+    min_count: int,
+    max_contexts: int,
+) -> PackedOrderTable:
+    if order < 2:
+        raise ValueError(f"Packed-memory order must be >= 2, got {order}")
+    if (order - 1) * TOKEN_BITS > 64:
+        raise ValueError(f"Packed-memory order {order} exceeds 64-bit exact context packing")
+    ctx_totals: dict[int, int] = {}
+    ctx_counts: dict[int, dict[int, int]] = {}
+    if tokens.size <= order - 1:
+        return PackedOrderTable(
+            order=order,
+            ctx_keys=np.empty((0,), dtype=np.uint64),
+            ctx_offsets=np.empty((0,), dtype=np.uint32),
+            ctx_lengths=np.empty((0,), dtype=np.uint16),
+            ctx_totals=np.empty((0,), dtype=np.uint32),
+            entry_tokens=np.empty((0,), dtype=np.uint16),
+            entry_counts=np.empty((0,), dtype=np.uint16),
+        )
+    for idx in range(order - 1, int(tokens.size)):
+        ctx_key = pack_context_tokens(tokens[idx - order + 1 : idx])
+        target_id = int(tokens[idx])
+        ctx_totals[ctx_key] = min(ctx_totals.get(ctx_key, 0) + 1, 2**32 - 1)
+        bucket = ctx_counts.setdefault(ctx_key, {})
+        bucket[target_id] = min(bucket.get(target_id, 0) + 1, 65535)
+
+    ctx_keys_sorted = sorted(ctx_totals, key=lambda key: ctx_totals[key], reverse=True)[:max_contexts]
+    kept_contexts: list[tuple[int, int, list[tuple[int, int]]]] = []
+    for ctx_key in ctx_keys_sorted:
+        counts = [
+            (token_id, count)
+            for token_id, count in ctx_counts[ctx_key].items()
+            if count >= min_count
+        ]
+        if not counts:
+            continue
+        counts.sort(key=lambda item: (-item[1], item[0]))
+        counts = counts[:topk]
+        kept_contexts.append((int(ctx_key), int(ctx_totals[ctx_key]), counts))
+
+    kept_contexts.sort(key=lambda item: item[0])
+    ctx_keys_arr = np.empty((len(kept_contexts),), dtype=np.uint64)
+    ctx_offsets_arr = np.empty((len(kept_contexts),), dtype=np.uint32)
+    ctx_lengths_arr = np.empty((len(kept_contexts),), dtype=np.uint16)
+    ctx_totals_arr = np.empty((len(kept_contexts),), dtype=np.uint32)
+    entry_tokens: list[int] = []
+    entry_counts: list[int] = []
+    offset = 0
+    for keep_idx, (ctx_key, ctx_total, counts) in enumerate(kept_contexts):
+        ctx_keys_arr[keep_idx] = np.uint64(ctx_key)
+        ctx_offsets_arr[keep_idx] = np.uint32(offset)
+        ctx_lengths_arr[keep_idx] = np.uint16(len(counts))
+        ctx_totals_arr[keep_idx] = np.uint32(ctx_total)
+        for token_id, count in counts:
+            entry_tokens.append(int(token_id))
+            entry_counts.append(int(count))
+        offset += len(counts)
+
+    return PackedOrderTable(
+        order=order,
+        ctx_keys=ctx_keys_arr,
+        ctx_offsets=ctx_offsets_arr,
+        ctx_lengths=ctx_lengths_arr,
+        ctx_totals=ctx_totals_arr,
+        entry_tokens=np.asarray(entry_tokens, dtype=np.uint16),
+        entry_counts=np.asarray(entry_counts, dtype=np.uint16),
+    )
+
+
+def build_packed_memory_artifact(args: Hyperparameters, log0) -> PackedMemoryArtifact:
+    if len(args.packed_memory_orders) != len(args.packed_memory_concentrations):
+        raise ValueError("PACKED_MEMORY_ORDERS and PACKED_MEMORY_CONCENTRATIONS must have the same length")
+    tokens = TokenStream(args.train_files).take(args.packed_memory_build_tokens).cpu().numpy().astype(np.uint16, copy=False)
+    tables = []
+    for order in args.packed_memory_orders:
+        table = build_packed_order_table(
+            tokens,
+            order=order,
+            topk=args.packed_memory_topk,
+            min_count=args.packed_memory_min_count,
+            max_contexts=args.packed_memory_max_contexts_per_order,
+        )
+        log0(
+            f"packed_memory:order={order} contexts:{int(table.ctx_keys.size)} "
+            f"entries:{int(table.entry_tokens.size)} bytes:{table.serialized_nbytes()}"
+        )
+        tables.append(table)
+    return PackedMemoryArtifact(
+        orders=args.packed_memory_orders,
+        concentrations=args.packed_memory_concentrations,
+        build_tokens=args.packed_memory_build_tokens,
+        topk=args.packed_memory_topk,
+        min_count=args.packed_memory_min_count,
+        max_contexts_per_order=args.packed_memory_max_contexts_per_order,
+        tables=tuple(tables),
+    )
+
+
+def save_packed_memory_artifact(artifact: PackedMemoryArtifact, path: str) -> None:
+    payload: dict[str, np.ndarray] = {
+        "magic": np.array([PACKED_MEMORY_MAGIC]),
+        "orders": np.asarray(artifact.orders, dtype=np.int16),
+        "concentrations": np.asarray(artifact.concentrations, dtype=np.float32),
+        "build_tokens": np.asarray([artifact.build_tokens], dtype=np.int64),
+        "topk": np.asarray([artifact.topk], dtype=np.int16),
+        "min_count": np.asarray([artifact.min_count], dtype=np.int16),
+        "max_contexts_per_order": np.asarray([artifact.max_contexts_per_order], dtype=np.int32),
+    }
+    for table in artifact.tables:
+        prefix = f"order_{table.order}"
+        payload[f"{prefix}_ctx_keys"] = table.ctx_keys
+        payload[f"{prefix}_ctx_offsets"] = table.ctx_offsets
+        payload[f"{prefix}_ctx_lengths"] = table.ctx_lengths
+        payload[f"{prefix}_ctx_totals"] = table.ctx_totals
+        payload[f"{prefix}_entry_tokens"] = table.entry_tokens
+        payload[f"{prefix}_entry_counts"] = table.entry_counts
+    with open(path, "wb") as f:
+        np.savez_compressed(f, **payload)
+
+
+def load_packed_memory_artifact(path: str) -> PackedMemoryArtifact:
+    with np.load(path, allow_pickle=False) as data:
+        magic = str(data["magic"][0])
+        if magic != PACKED_MEMORY_MAGIC:
+            raise ValueError(f"Unexpected packed-memory artifact magic: {magic}")
+        orders = tuple(int(x) for x in data["orders"].tolist())
+        concentrations = tuple(float(x) for x in data["concentrations"].tolist())
+        tables = []
+        for order in orders:
+            prefix = f"order_{order}"
+            tables.append(
+                PackedOrderTable(
+                    order=order,
+                    ctx_keys=data[f"{prefix}_ctx_keys"],
+                    ctx_offsets=data[f"{prefix}_ctx_offsets"],
+                    ctx_lengths=data[f"{prefix}_ctx_lengths"],
+                    ctx_totals=data[f"{prefix}_ctx_totals"],
+                    entry_tokens=data[f"{prefix}_entry_tokens"],
+                    entry_counts=data[f"{prefix}_entry_counts"],
+                )
+            )
+        return PackedMemoryArtifact(
+            orders=orders,
+            concentrations=concentrations,
+            build_tokens=int(data["build_tokens"][0]),
+            topk=int(data["topk"][0]),
+            min_count=int(data["min_count"][0]),
+            max_contexts_per_order=int(data["max_contexts_per_order"][0]),
+            tables=tuple(tables),
+        )
+
+
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
@@ -276,6 +576,89 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_packed_memory(
+    args: Hyperparameters,
+    base_model: GPT,
+    device: torch.device,
+    val_tokens: Tensor,
+    artifact: PackedMemoryArtifact,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    if args.packed_memory_eval_batch_seqs <= 0:
+        raise ValueError("PACKED_MEMORY_EVAL_BATCH_SEQS must be positive")
+    val_tokens_cpu = val_tokens.to(dtype=torch.int64, device="cpu", copy=True).numpy()
+    runtime_memory = RuntimePackedMemory(
+        artifact.orders,
+        topk=artifact.topk,
+        max_contexts_per_order=args.packed_memory_runtime_contexts_per_order,
+    )
+    val_loss_sum = 0.0
+    val_token_count = 0
+    val_byte_count = 0.0
+    base_model.eval()
+    with torch.inference_mode():
+        seq_len = args.train_seq_len
+        batch_span = seq_len * args.packed_memory_eval_batch_seqs
+        for chunk_start in range(0, val_tokens_cpu.size - 1, batch_span):
+            remaining = val_tokens_cpu.size - 1 - chunk_start
+            usable = min(batch_span, remaining)
+            usable = (usable // seq_len) * seq_len
+            if usable <= 0:
+                break
+            batch_tokens = val_tokens_cpu[chunk_start : chunk_start + usable + 1]
+            x = torch.from_numpy(batch_tokens[:-1].copy()).reshape(-1, seq_len).to(device=device)
+            y = torch.from_numpy(batch_tokens[1:].copy()).reshape(-1, seq_len).to(device=device)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = base_model.forward_logits(x)
+            prior_true = (
+                F.softmax(logits.float(), dim=-1)
+                .gather(-1, y.unsqueeze(-1))
+                .squeeze(-1)
+                .reshape(-1)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            target_ids = y.reshape(-1).detach().cpu().numpy()
+            prev_ids = x.reshape(-1).detach().cpu().numpy()
+            for local_idx, target_id in enumerate(target_ids.tolist()):
+                target_pos = chunk_start + local_idx + 1
+                posterior = float(prior_true[local_idx])
+                for table, alpha in zip(artifact.tables, artifact.concentrations, strict=True):
+                    ctx_tokens = val_tokens_cpu[target_pos - table.order + 1 : target_pos]
+                    if ctx_tokens.size != table.order - 1:
+                        continue
+                    ctx_key = pack_context_tokens(ctx_tokens.astype(np.uint16, copy=False))
+                    static_count, static_total = table.lookup(ctx_key, target_id)
+                    runtime_count, runtime_total = runtime_memory.lookup(table.order, ctx_key, target_id)
+                    total_count = static_total + runtime_total
+                    if total_count <= 0:
+                        continue
+                    posterior = (static_count + runtime_count + alpha * posterior) / (total_count + alpha)
+                posterior = max(min(posterior, 1.0), 1e-12)
+                val_loss_sum += -math.log(posterior)
+                val_token_count += 1
+                token_bytes = int(base_bytes_lut[int(target_id)].item())
+                token_bytes += int(
+                    bool(has_leading_space_lut[int(target_id)].item())
+                    and not bool(is_boundary_token_lut[int(prev_ids[local_idx])].item())
+                )
+                val_byte_count += float(token_bytes)
+                for order in artifact.orders:
+                    ctx_tokens = val_tokens_cpu[target_pos - order + 1 : target_pos]
+                    if ctx_tokens.size != order - 1:
+                        continue
+                    ctx_key = pack_context_tokens(ctx_tokens.astype(np.uint16, copy=False))
+                    runtime_memory.update(order, ctx_key, target_id)
+    val_loss = val_loss_sum / max(val_token_count, 1)
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = val_token_count / max(val_byte_count, 1.0)
+    base_model.train()
+    return float(val_loss), float(bits_per_token * tokens_per_byte)
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -697,7 +1080,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -713,14 +1096,20 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap).reshape(
+            input_ids.size(0), input_ids.size(1), -1
+        )
+        return logits
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        targets = target_ids.reshape(-1)
+        logits = self.forward_logits(input_ids).reshape(-1, self.tok_emb.num_embeddings)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -818,6 +1207,22 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if args.packed_memory_enabled:
+        runtime_bound = RuntimePackedMemory(
+            args.packed_memory_orders,
+            topk=args.packed_memory_topk,
+            max_contexts_per_order=args.packed_memory_runtime_contexts_per_order,
+        ).estimated_nbytes()
+        log0(
+            f"packed_memory:enabled orders:{args.packed_memory_orders} "
+            f"concentrations:{args.packed_memory_concentrations} build_tokens:{args.packed_memory_build_tokens} "
+            f"topk:{args.packed_memory_topk} min_count:{args.packed_memory_min_count}"
+        )
+        log0(
+            f"packed_memory:artifact_bound_bytes:{estimate_packed_memory_artifact_nbytes(args)} "
+            f"runtime_bound_bytes:{runtime_bound} norm_self_test_err:{packed_memory_normalization_self_test():.3e} "
+            f"lookup_self_test:{packed_memory_lookup_self_test()}"
+        )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -1079,6 +1484,8 @@ def main() -> None:
     quant_raw = quant_buf.getvalue()
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
+    packed_memory_artifact_path = "packed_memory_artifact.npz"
+    packed_memory_artifact = None
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
@@ -1090,6 +1497,16 @@ def main() -> None:
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        if args.packed_memory_enabled:
+            packed_memory_artifact = build_packed_memory_artifact(args, log0)
+            save_packed_memory_artifact(packed_memory_artifact, packed_memory_artifact_path)
+            packed_memory_bytes = os.path.getsize(packed_memory_artifact_path)
+            log0(
+                f"packed_memory_artifact bytes:{packed_memory_bytes} "
+                f"estimated_bound:{estimate_packed_memory_artifact_nbytes(args)} "
+                f"runtime_bound:{RuntimePackedMemory(args.packed_memory_orders, args.packed_memory_topk, args.packed_memory_runtime_contexts_per_order).estimated_nbytes()}"
+            )
+            log0(f"Total submission size int8+packed_memory: {quant_file_bytes + packed_memory_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
@@ -1117,6 +1534,35 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.packed_memory_enabled:
+        if distributed:
+            dist.barrier()
+        if master_process:
+            if packed_memory_artifact is None:
+                packed_memory_artifact = load_packed_memory_artifact(packed_memory_artifact_path)
+            torch.cuda.synchronize()
+            t_pmeval = time.perf_counter()
+            pm_val_loss, pm_val_bpb = eval_val_packed_memory(
+                args,
+                base_model,
+                device,
+                val_tokens.cpu(),
+                packed_memory_artifact,
+                base_bytes_lut.cpu(),
+                has_leading_space_lut.cpu(),
+                is_boundary_token_lut.cpu(),
+            )
+            torch.cuda.synchronize()
+            log0(
+                f"final_int8_packed_memory val_loss:{pm_val_loss:.4f} val_bpb:{pm_val_bpb:.4f} "
+                f"eval_time:{1000.0 * (time.perf_counter() - t_pmeval):.0f}ms"
+            )
+            log0(f"final_int8_packed_memory_exact val_loss:{pm_val_loss:.8f} val_bpb:{pm_val_bpb:.8f}")
+            packed_metrics = torch.tensor([pm_val_loss, pm_val_bpb], dtype=torch.float64, device=device)
+        else:
+            packed_metrics = torch.zeros((2,), dtype=torch.float64, device=device)
+        if distributed:
+            dist.broadcast(packed_metrics, src=0)
 
     if distributed:
         dist.destroy_process_group()
