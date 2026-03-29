@@ -1989,6 +1989,10 @@ def main() -> None:
         scalar_params.append(base_model.ve_shared.scale)
         for s in base_model.ve_layer_scales:
             scalar_params.append(s)
+    # MTP heads are training-only auxiliaries and should ride the replicated Adam path,
+    # while export/eval continue to exclude them from the serialized artifact.
+    for mtp_head in base_model.mtp_heads:
+        scalar_params.append(mtp_head.weight)
     optimizer_tok = torch.optim.AdamW(
         tok_params,
         betas=(args.beta1, args.beta2),
