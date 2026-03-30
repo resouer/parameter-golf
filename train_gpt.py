@@ -97,6 +97,15 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))  # VRL with sigmoid gates (off by default, risky)
+    use_ngram_mixer = bool(int(os.environ.get("USE_NGRAM_MIXER", "0")))
+    ngram_order = int(os.environ.get("NGRAM_ORDER", 10))
+    ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", 2))
+    ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", 4_194_304))
+    ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", 1))
+    alpha_base = float(os.environ.get("ALPHA_BASE", 0.20))
+    alpha_range = float(os.environ.get("ALPHA_RANGE", 0.55))
+    alpha_center = float(os.environ.get("ALPHA_CENTER", 3.0))
+    ngram_batch_seqs = int(os.environ.get("NGRAM_BATCH_SEQS", 128))
     # Keep Mousse off by default on the bounded #1019 lineage lane.
     mousse_enabled = bool(int(os.environ.get("MOUSSE", "0")))
     mousse_alpha = float(os.environ.get("MOUSSE_ALPHA", 0.125))  # spectral tempering exponent
@@ -440,6 +449,211 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+NGRAM_PRIMES = np.array(
+    [
+        np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929),
+        np.uint64(131071), np.uint64(65537), np.uint64(104729), np.uint64(49157),
+        np.uint64(98317), np.uint64(196613), np.uint64(393241), np.uint64(786433),
+    ],
+    dtype=np.uint64,
+)
+
+
+class StrictCausalBackoffMixer:
+    """Minimal strict-legal causal backoff mixer.
+
+    This keeps the first Family B implementation narrow:
+    - full-vocab normalized target probability via count(context,target)/count(context)
+    - score-then-update only
+    - entropy-driven alpha with no hindsight or extra adaptation layers
+    """
+
+    def __init__(
+        self,
+        num_buckets: int,
+        max_order: int,
+        min_order: int,
+        min_count: int,
+        alpha_base: float,
+        alpha_range: float,
+        alpha_center: float,
+    ) -> None:
+        if num_buckets <= 0 or (num_buckets & (num_buckets - 1)) != 0:
+            raise ValueError(f"NGRAM_BUCKETS must be a positive power of two, got {num_buckets}")
+        if min_order < 2 or max_order < min_order:
+            raise ValueError(f"Invalid n-gram order range: min={min_order} max={max_order}")
+        self.max_order = max_order
+        self.min_order = min_order
+        self.min_count = min_count
+        self.alpha_base = alpha_base
+        self.alpha_range = alpha_range
+        self.alpha_center = alpha_center
+        self.mask = np.uint64(num_buckets - 1)
+        n_orders = max_order - min_order + 1
+        self.ctx_tables = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(n_orders)]
+        self.full_tables = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(n_orders)]
+
+    def mix_target_probs(
+        self,
+        val_np: np.ndarray,
+        global_targets: np.ndarray,
+        neural_target_probs: np.ndarray,
+        entropy: np.ndarray,
+    ) -> np.ndarray:
+        mixed = neural_target_probs.copy()
+        mixed_mask = np.zeros(len(global_targets), dtype=bool)
+        for order in range(self.max_order, self.min_order - 1, -1):
+            oi = order - self.min_order
+            ctx_width = order - 1
+            valid = (global_targets >= ctx_width) & ~mixed_mask
+            if not valid.any():
+                continue
+            v_idx = np.nonzero(valid)[0]
+            jv = global_targets[v_idx]
+            ctx_hash = np.zeros(len(jv), dtype=np.uint64)
+            for k in range(ctx_width):
+                tok = val_np[jv - ctx_width + k].astype(np.uint64)
+                ctx_hash ^= tok * NGRAM_PRIMES[k % len(NGRAM_PRIMES)]
+            ctx_key = (ctx_hash & self.mask).astype(np.int64)
+            tgt = val_np[jv].astype(np.uint64)
+            full_key = ((ctx_hash ^ (tgt * NGRAM_PRIMES[ctx_width % len(NGRAM_PRIMES)])) & self.mask).astype(np.int64)
+            ctx_counts = self.ctx_tables[oi][ctx_key].astype(np.float64)
+            full_counts = self.full_tables[oi][full_key].astype(np.float64)
+            can_mix = ctx_counts >= float(self.min_count)
+            if not can_mix.any():
+                continue
+            p_ng = np.minimum(full_counts[can_mix], ctx_counts[can_mix]) / np.maximum(ctx_counts[can_mix], 1.0)
+            p_ng = np.clip(p_ng, 0.0, 1.0)
+            mix_idx = v_idx[can_mix]
+            alpha = self.alpha_base + self.alpha_range / (
+                1.0 + np.exp(-2.0 * (entropy[mix_idx] - self.alpha_center))
+            )
+            alpha = np.clip(alpha, 0.0, 0.95)
+            mixed[mix_idx] = (1.0 - alpha) * mixed[mix_idx] + alpha * p_ng
+            mixed_mask[mix_idx] = True
+        return mixed
+
+    def update(self, val_np: np.ndarray, start_target: int, end_target: int) -> None:
+        for order in range(self.min_order, self.max_order + 1):
+            oi = order - self.min_order
+            ctx_width = order - 1
+            j_start = max(start_target, ctx_width)
+            if j_start >= end_target:
+                continue
+            j = np.arange(j_start, end_target, dtype=np.int64)
+            ctx_hash = np.zeros(len(j), dtype=np.uint64)
+            for k in range(ctx_width):
+                tok = val_np[j - ctx_width + k].astype(np.uint64)
+                ctx_hash ^= tok * NGRAM_PRIMES[k % len(NGRAM_PRIMES)]
+            ctx_key = (ctx_hash & self.mask).astype(np.int64)
+            tgt = val_np[j].astype(np.uint64)
+            full_key = ((ctx_hash ^ (tgt * NGRAM_PRIMES[ctx_width % len(NGRAM_PRIMES)])) & self.mask).astype(np.int64)
+            self.ctx_tables[oi] += np.bincount(ctx_key, minlength=len(self.ctx_tables[oi])).astype(np.uint32)
+            self.full_tables[oi] += np.bincount(full_key, minlength=len(self.full_tables[oi])).astype(np.uint32)
+
+
+def eval_val_causal_backoff_mixer(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int,
+    batch_seqs: int = 128,
+    eval_seq_len: int | None = None,
+) -> tuple[float, float]:
+    """Strict-legal score-first causal backoff on top of sliding exact eval.
+
+    All ranks process the same windows in the same order so the mixer state stays
+    identical without extra communication. We average the final aggregates across
+    ranks because each rank computes the same statistics.
+    """
+
+    seq_len = eval_seq_len or args.train_seq_len
+    total_tokens = val_tokens.numel() - 1
+    window_starts = [
+        ws for ws in range(0, total_tokens, stride)
+        if min(ws + seq_len, total_tokens) - ws >= 1
+    ]
+    loss_sum = 0.0
+    token_count = 0.0
+    byte_count = 0.0
+    val_np = val_tokens.numpy()
+    mixer = StrictCausalBackoffMixer(
+        num_buckets=args.ngram_buckets,
+        max_order=args.ngram_order,
+        min_order=args.ngram_min_order,
+        min_count=args.ngram_min_count,
+        alpha_base=args.alpha_base,
+        alpha_range=args.alpha_range,
+        alpha_center=args.alpha_center,
+    )
+    base_model.eval()
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    with torch.inference_mode():
+        for bi in range(0, len(window_starts), batch_seqs):
+            batch_ws = window_starts[bi:bi + batch_seqs]
+            bsz = len(batch_ws)
+            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            wlens: list[int] = []
+            for i, ws in enumerate(batch_ws):
+                end = min(ws + seq_len, total_tokens)
+                wlen = end - ws
+                wlens.append(wlen)
+                chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                x_batch[i, :wlen] = chunk[:-1]
+                y_batch[i, :wlen] = chunk[1:]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = compiled_logits(x_batch)
+            log_probs = F.log_softmax(logits.float(), dim=-1)
+            probs = log_probs.exp()
+            batch_update_start: int | None = None
+            batch_update_end: int | None = None
+            for i, ws in enumerate(batch_ws):
+                wlen = wlens[i]
+                s = 0 if ws == 0 else max(wlen - stride, 0)
+                seg_len = wlen - s
+                if seg_len <= 0:
+                    continue
+                tgt = y_batch[i, s:wlen]
+                prev = x_batch[i, s:wlen]
+                target_probs = probs[i, s:wlen].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+                entropy = -(probs[i, s:wlen] * log_probs[i, s:wlen]).sum(dim=-1)
+                global_targets = np.arange(ws + s + 1, ws + wlen + 1, dtype=np.int64)
+                mixed_probs = mixer.mix_target_probs(
+                    val_np=val_np,
+                    global_targets=global_targets,
+                    neural_target_probs=target_probs.to(torch.float64).cpu().numpy(),
+                    entropy=entropy.to(torch.float64).cpu().numpy(),
+                )
+                seg_nll = -np.log(np.clip(mixed_probs, 1e-12, 1.0))
+                loss_sum += float(seg_nll.sum())
+                token_count += float(seg_len)
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += float(tb.sum().item())
+                scored_start = int(global_targets[0])
+                scored_end = int(global_targets[-1]) + 1
+                batch_update_start = scored_start if batch_update_start is None else min(batch_update_start, scored_start)
+                batch_update_end = scored_end if batch_update_end is None else max(batch_update_end, scored_end)
+            if batch_update_start is not None and batch_update_end is not None:
+                mixer.update(val_np, batch_update_start, batch_update_end)
+    if dist.is_available() and dist.is_initialized():
+        totals = torch.tensor([loss_sum, token_count, byte_count], device=device, dtype=torch.float64)
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        totals /= float(world_size)
+        loss_sum, token_count, byte_count = (float(totals[0].item()), float(totals[1].item()), float(totals[2].item()))
+    val_loss = loss_sum / max(token_count, 1.0)
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count / max(byte_count, 1.0)
+    base_model.train()
+    return float(val_loss), float(bits_per_token * tokens_per_byte)
 
 # --- Quantization helpers ---
 
@@ -2421,6 +2635,14 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.use_ngram_mixer:
+        mixer_mem_mb = args.ngram_buckets * 4 * 2 * (args.ngram_order - args.ngram_min_order + 1) / 1e6
+        log0(
+            f"ngram_mixer:o={args.ngram_order} min_o={args.ngram_min_order} "
+            f"b={args.ngram_buckets} min_count={args.ngram_min_count} "
+            f"a={args.alpha_base}+{args.alpha_range}*sigmoid(2*(H-{args.alpha_center})) "
+            f"batch_seqs={args.ngram_batch_seqs} mem={mixer_mem_mb:.0f}MB"
+        )
     sw_seq_len = effective_eval_seq_len
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
@@ -2438,6 +2660,22 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+        if args.use_ngram_mixer:
+            torch.cuda.synchronize()
+            t_familyb = time.perf_counter()
+            fb_val_loss, fb_val_bpb = eval_val_causal_backoff_mixer(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride,
+                batch_seqs=args.ngram_batch_seqs,
+                eval_seq_len=sw_seq_len,
+            )
+            torch.cuda.synchronize()
+            log0(
+                f"final_int6_causal_backoff val_loss:{fb_val_loss:.4f} val_bpb:{fb_val_bpb:.4f} "
+                f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_familyb):.0f}ms"
+            )
+            log0(f"final_int6_causal_backoff_exact val_loss:{fb_val_loss:.8f} val_bpb:{fb_val_bpb:.8f}")
     if args.eval_stride != 64 and 64 < sw_seq_len:
         torch.cuda.synchronize()
         t_slide64 = time.perf_counter()
