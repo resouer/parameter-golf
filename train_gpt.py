@@ -106,6 +106,7 @@ class Hyperparameters:
     alpha_range = float(os.environ.get("ALPHA_RANGE", 0.55))
     alpha_center = float(os.environ.get("ALPHA_CENTER", 3.0))
     ngram_batch_seqs = int(os.environ.get("NGRAM_BATCH_SEQS", 128))
+    familyb_reuse_sliding_pass = bool(int(os.environ.get("FAMILYB_REUSE_SLIDING_PASS", "0")))
     # Keep Mousse off by default on the bounded #1019 lineage lane.
     mousse_enabled = bool(int(os.environ.get("MOUSSE", "0")))
     mousse_alpha = float(os.environ.get("MOUSSE_ALPHA", 0.125))  # spectral tempering exponent
@@ -601,6 +602,69 @@ class StrictCausalBackoffMixer:
         return scored_windows
 
 
+def _score_causal_backoff_batch(
+    mixer: StrictCausalBackoffMixer,
+    val_np: np.ndarray,
+    batch_ws: list[int],
+    wlens: list[int],
+    stride: int,
+    x_batch: Tensor,
+    y_batch: Tensor,
+    probs: Tensor,
+    log_probs: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float, float]:
+    batch_target_probs: list[np.ndarray] = []
+    batch_entropy: list[np.ndarray] = []
+    batch_prev: list[Tensor] = []
+    batch_tgt: list[Tensor] = []
+    window_specs: list[tuple[int, int]] = []
+    scored_start: int | None = None
+    scored_end: int | None = None
+    for i, ws in enumerate(batch_ws):
+        wlen = wlens[i]
+        s = 0 if ws == 0 else max(wlen - stride, 0)
+        seg_len = wlen - s
+        if seg_len <= 0:
+            continue
+        tgt = y_batch[i, s:wlen]
+        prev = x_batch[i, s:wlen]
+        target_probs = probs[i, s:wlen].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+        entropy = -(probs[i, s:wlen] * log_probs[i, s:wlen]).sum(dim=-1)
+        batch_target_probs.append(target_probs.to(torch.float64).cpu().numpy())
+        batch_entropy.append(entropy.to(torch.float64).cpu().numpy())
+        batch_prev.append(prev.cpu())
+        batch_tgt.append(tgt.cpu())
+        seg_start = ws + s + 1
+        seg_end = ws + wlen + 1
+        window_specs.append((seg_start, seg_end))
+        scored_start = seg_start if scored_start is None else min(scored_start, seg_start)
+        scored_end = seg_end if scored_end is None else max(scored_end, seg_end)
+    if scored_start is None or scored_end is None:
+        return 0.0, 0.0, 0.0
+    mixed_windows = mixer.score_windows_with_batch_update_cache(
+        val_np=val_np,
+        batch_start=scored_start,
+        batch_end=scored_end,
+        window_specs=window_specs,
+        neural_target_probs=batch_target_probs,
+        entropy=batch_entropy,
+    )
+    loss_sum = 0.0
+    token_count = 0.0
+    byte_count = 0.0
+    for mixed_probs, tgt, prev in zip(mixed_windows, batch_tgt, batch_prev):
+        seg_nll = -np.log(np.clip(mixed_probs, 1e-12, 1.0))
+        loss_sum += float(seg_nll.sum())
+        token_count += float(len(mixed_probs))
+        tb = base_bytes_lut[tgt].to(torch.float64)
+        tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+        byte_count += float(tb.sum().item())
+    return loss_sum, token_count, byte_count
+
+
 def eval_val_causal_backoff_mixer(
     args: Hyperparameters,
     base_model: nn.Module,
@@ -661,49 +725,23 @@ def eval_val_causal_backoff_mixer(
                 logits = compiled_logits(x_batch)
             log_probs = F.log_softmax(logits.float(), dim=-1)
             probs = log_probs.exp()
-            batch_target_probs: list[np.ndarray] = []
-            batch_entropy: list[np.ndarray] = []
-            batch_prev: list[Tensor] = []
-            batch_tgt: list[Tensor] = []
-            window_specs: list[tuple[int, int]] = []
-            scored_start: int | None = None
-            scored_end: int | None = None
-            for i, ws in enumerate(batch_ws):
-                wlen = wlens[i]
-                s = 0 if ws == 0 else max(wlen - stride, 0)
-                seg_len = wlen - s
-                if seg_len <= 0:
-                    continue
-                tgt = y_batch[i, s:wlen]
-                prev = x_batch[i, s:wlen]
-                target_probs = probs[i, s:wlen].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-                entropy = -(probs[i, s:wlen] * log_probs[i, s:wlen]).sum(dim=-1)
-                batch_target_probs.append(target_probs.to(torch.float64).cpu().numpy())
-                batch_entropy.append(entropy.to(torch.float64).cpu().numpy())
-                batch_prev.append(prev.cpu())
-                batch_tgt.append(tgt.cpu())
-                seg_start = ws + s + 1
-                seg_end = ws + wlen + 1
-                window_specs.append((seg_start, seg_end))
-                scored_start = seg_start if scored_start is None else min(scored_start, seg_start)
-                scored_end = seg_end if scored_end is None else max(scored_end, seg_end)
-            if scored_start is None or scored_end is None:
-                continue
-            mixed_windows = mixer.score_windows_with_batch_update_cache(
+            batch_loss, batch_tokens, batch_bytes = _score_causal_backoff_batch(
+                mixer=mixer,
                 val_np=val_np,
-                batch_start=scored_start,
-                batch_end=scored_end,
-                window_specs=window_specs,
-                neural_target_probs=batch_target_probs,
-                entropy=batch_entropy,
+                batch_ws=batch_ws,
+                wlens=wlens,
+                stride=stride,
+                x_batch=x_batch,
+                y_batch=y_batch,
+                probs=probs,
+                log_probs=log_probs,
+                base_bytes_lut=base_bytes_lut,
+                has_leading_space_lut=has_leading_space_lut,
+                is_boundary_token_lut=is_boundary_token_lut,
             )
-            for mixed_probs, tgt, prev in zip(mixed_windows, batch_tgt, batch_prev):
-                seg_nll = -np.log(np.clip(mixed_probs, 1e-12, 1.0))
-                loss_sum += float(seg_nll.sum())
-                token_count += float(len(mixed_probs))
-                tb = base_bytes_lut[tgt].to(torch.float64)
-                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                byte_count += float(tb.sum().item())
+            loss_sum += batch_loss
+            token_count += batch_tokens
+            byte_count += batch_bytes
     if dist.is_available() and dist.is_initialized():
         totals = torch.tensor([loss_sum, token_count, byte_count], device=device, dtype=torch.float64)
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
@@ -1533,7 +1571,7 @@ def eval_val_sliding(
     stride: int,
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
-) -> tuple[float, float]:
+) -> tuple[float, float, tuple[float, float] | None]:
     """Sliding window evaluation: each token scored with maximum context."""
     seq_len = eval_seq_len or args.train_seq_len
     total_tokens = val_tokens.numel() - 1
@@ -1546,11 +1584,30 @@ def eval_val_sliding(
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    reuse_familyb = args.use_ngram_mixer and args.familyb_reuse_sliding_pass and stride == args.eval_stride
+    fb_loss_sum = 0.0
+    fb_token_count = 0.0
+    fb_byte_count = 0.0
+    val_np = val_tokens.numpy() if reuse_familyb else None
+    effective_batch_seqs = max(batch_seqs, args.ngram_batch_seqs) if reuse_familyb else batch_seqs
+    mixer = (
+        StrictCausalBackoffMixer(
+            num_buckets=args.ngram_buckets,
+            max_order=args.ngram_order,
+            min_order=args.ngram_min_order,
+            min_count=args.ngram_min_count,
+            alpha_base=args.alpha_base,
+            alpha_range=args.alpha_range,
+            alpha_center=args.alpha_center,
+        )
+        if reuse_familyb
+        else None
+    )
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     with torch.inference_mode():
-        for bi in range(0, len(my_windows), batch_seqs):
-            batch_ws = my_windows[bi:bi + batch_seqs]
+        for bi in range(0, len(my_windows), effective_batch_seqs):
+            batch_ws = my_windows[bi:bi + effective_batch_seqs]
             bsz = len(batch_ws)
             x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
             y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
@@ -1564,11 +1621,16 @@ def eval_val_sliding(
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = compiled_logits(x_batch)
-            nll = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                y_batch.reshape(-1),
-                reduction="none",
-            ).reshape(bsz, seq_len)
+            if reuse_familyb:
+                log_probs = F.log_softmax(logits.float(), dim=-1)
+                probs = log_probs.exp()
+                nll = -log_probs.gather(-1, y_batch.unsqueeze(-1)).squeeze(-1)
+            else:
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1),
+                    reduction="none",
+                ).reshape(bsz, seq_len)
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
@@ -1580,6 +1642,24 @@ def eval_val_sliding(
                 tb = base_bytes_lut[tgt].to(torch.float64)
                 tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                 byte_count += tb.sum()
+            if reuse_familyb and mixer is not None and val_np is not None:
+                batch_loss, batch_tokens, batch_bytes = _score_causal_backoff_batch(
+                    mixer=mixer,
+                    val_np=val_np,
+                    batch_ws=batch_ws,
+                    wlens=wlens,
+                    stride=stride,
+                    x_batch=x_batch,
+                    y_batch=y_batch,
+                    probs=probs,
+                    log_probs=log_probs,
+                    base_bytes_lut=base_bytes_lut,
+                    has_leading_space_lut=has_leading_space_lut,
+                    is_boundary_token_lut=is_boundary_token_lut,
+                )
+                fb_loss_sum += batch_loss
+                fb_token_count += batch_tokens
+                fb_byte_count += batch_bytes
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
@@ -1588,7 +1668,19 @@ def eval_val_sliding(
     bits_per_token = val_loss / math.log(2.0)
     tokens_per_byte = token_count.item() / byte_count.item()
     base_model.train()
-    return val_loss, bits_per_token * tokens_per_byte
+    if not reuse_familyb:
+        return val_loss, bits_per_token * tokens_per_byte, None
+    if dist.is_available() and dist.is_initialized():
+        fb_totals = torch.tensor([fb_loss_sum, fb_token_count, fb_byte_count], device=device, dtype=torch.float64)
+        dist.all_reduce(fb_totals, op=dist.ReduceOp.SUM)
+        fb_totals /= float(world_size)
+        fb_loss_sum = float(fb_totals[0].item())
+        fb_token_count = float(fb_totals[1].item())
+        fb_byte_count = float(fb_totals[2].item())
+    fb_val_loss = fb_loss_sum / max(fb_token_count, 1.0)
+    fb_bits_per_token = fb_val_loss / math.log(2.0)
+    fb_tokens_per_byte = fb_token_count / max(fb_byte_count, 1.0)
+    return val_loss, bits_per_token * tokens_per_byte, (fb_val_loss, fb_bits_per_token * fb_tokens_per_byte)
 def generate_autoregressive_calib(model, device, num_seqs=64, seq_len=2048,
                                    vocab_size=1024, temperature=0.8, batch_size=8, seed=42):
     """Generate sequences autoregressively from the model for GPTQ calibration.
@@ -2707,7 +2799,7 @@ def main() -> None:
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
         t_slide = time.perf_counter()
-        sw_val_loss, sw_val_bpb = eval_val_sliding(
+        sw_val_loss, sw_val_bpb, shared_familyb = eval_val_sliding(
             args, eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=args.eval_stride,
@@ -2721,25 +2813,31 @@ def main() -> None:
         log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
         if args.use_ngram_mixer:
-            torch.cuda.synchronize()
-            t_familyb = time.perf_counter()
-            fb_val_loss, fb_val_bpb = eval_val_causal_backoff_mixer(
-                args, eval_model, rank, world_size, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                stride=args.eval_stride,
-                batch_seqs=args.ngram_batch_seqs,
-                eval_seq_len=sw_seq_len,
-            )
-            torch.cuda.synchronize()
+            if shared_familyb is not None:
+                fb_val_loss, fb_val_bpb = shared_familyb
+                log0("ngram_mixer:reuse_sliding_pass=1 shared_eval=true")
+                familyb_eval_ms = 1000.0 * (time.perf_counter() - t_slide)
+            else:
+                torch.cuda.synchronize()
+                t_familyb = time.perf_counter()
+                fb_val_loss, fb_val_bpb = eval_val_causal_backoff_mixer(
+                    args, eval_model, rank, world_size, device,
+                    val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                    stride=args.eval_stride,
+                    batch_seqs=args.ngram_batch_seqs,
+                    eval_seq_len=sw_seq_len,
+                )
+                torch.cuda.synchronize()
+                familyb_eval_ms = 1000.0 * (time.perf_counter() - t_familyb)
             log0(
                 f"final_int6_causal_backoff val_loss:{fb_val_loss:.4f} val_bpb:{fb_val_bpb:.4f} "
-                f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_familyb):.0f}ms"
+                f"stride:{args.eval_stride} eval_time:{familyb_eval_ms:.0f}ms"
             )
             log0(f"final_int6_causal_backoff_exact val_loss:{fb_val_loss:.8f} val_bpb:{fb_val_bpb:.8f}")
     if args.eval_stride != 64 and 64 < sw_seq_len:
         torch.cuda.synchronize()
         t_slide64 = time.perf_counter()
-        sw64_val_loss, sw64_val_bpb = eval_val_sliding(
+        sw64_val_loss, sw64_val_bpb, _ = eval_val_sliding(
             args, eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=64,
