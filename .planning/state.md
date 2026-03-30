@@ -1,4 +1,4 @@
-Current round: Round 129
+Current round: Round 143
 
 ## [2026-03-30 09:40] Round 116
 
@@ -50,4 +50,19 @@ Current round: Round 129
 - Intended delta:
   - reuse the already-required sliding exact pass when `FAMILYB_REUSE_SLIDING_PASS=1`
   - feed the strict-legal causal backoff scorer from that shared pass instead of launching a second full model-forward eval
+  - keep the old standalone `eval_val_causal_backoff_mixer(...)` path available as the fallback
+
+## [2026-03-30 15:58] Round 143
+
+- Current round: Round 143
+- Branch: `autoresearch/exp-familyb-reuse-sliding-pass-parity`
+- Base head: `e8d6d047977a9a976a29153e38e7dc0827ad8952`
+- Deliverable: bounded strict-legal `Family B` follow-up packet after the parity-confirmed `#142` closeout
+- Scope:
+  - keep the same strict-legal `Family B` scoring semantics as `#142`
+  - patch `train_gpt.py`
+  - no launch in this round
+- Intended delta:
+  - enable the already-prepared sliding-pass reuse path as the chosen next bounded packet
+  - reuse the already-required sliding exact pass when `FAMILYB_REUSE_SLIDING_PASS=1`
   - keep the old standalone `eval_val_causal_backoff_mixer(...)` path available as the fallback

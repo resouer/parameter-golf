@@ -175,3 +175,45 @@
 - `#124` showed that exact-tail speedups can easily introduce hidden invariants that only fail at closeout time.
 - Reusing the sliding pass changes evaluation orchestration and logging shape, so timing lines must be interpreted as shared-pass cost when the new flag is enabled.
 - This round does not fix the broader pure-neural runtime envelope; it is only a Family B bounded follow-up.
+
+## [2026-03-30 15:58] Round 143
+
+### Research Findings
+- `#142` completed as the corrected full-env parity rerun and reached the full Family B causal-backoff closeout surface:
+  - `TIMING:final_eval=1790.8s`
+  - `final_int6_causal_backoff_exact val_bpb:0.39344583`
+  - `final_int6_causal_backoff eval_time:1656267ms`
+- That means the governing keep-base is no longer just `#126` by ordinary Lepton evidence; it is now the same Family B surface with parity-targeted evidence that the env/image path can also close cleanly.
+- Under this stronger base, the dominant remaining exact-tail cost is still the standalone Family B causal-backoff pass itself rather than training-body runtime.
+
+### Paradigm Assumptions
+- Keep the strict-legal Family B scoring semantics unchanged from `#142`.
+- Keep the repaired parity launcher/env findings as evidence only; this round is still a code packet, not a launch.
+- Restrict the implementation delta to reusing the already-required sliding exact pass when explicitly enabled by `FAMILYB_REUSE_SLIDING_PASS=1`.
+
+### Frontier Snapshot
+- `#142` is now the parity-confirmed keep-base for strict-legal Family B.
+- The queue is empty again under the single-node budget after the clean parity closeout.
+- The highest-EV next move is to reduce the remaining exact-tail Family B eval cost without reopening env-parity or legality questions.
+
+### Comparable Methods
+- `#126` remains the repaired semantic control.
+- `#142` is the parity-confirmed control and therefore the correct governing base for the next packet.
+- The chosen bounded follow-up is the already-prepared reuse-sliding-pass path, because it attacks the largest remaining exact-tail duplicate work directly.
+
+### Novelty-Relevant Findings
+- The bounded novelty remains orchestration-only:
+  - reuse the sliding exact pass that already computes the needed logits/probabilities/entropies
+  - feed those same windows into the unchanged strict-legal Family B scorer
+  - keep the standalone causal-backoff eval as the fallback when the reuse flag is off
+- Relative to `#142`, this is the narrowest next move that targets the still-dominant `final_int6_causal_backoff` time without changing the Family B formula.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is semantic drift from `#142` due to shared-pass orchestration or timing/log interpretation.
+- Local validation remains bounded to code inspection, `py_compile`, and launcher dry-run; this shell still lacks a deeper semantic A/B harness.
+
+### Known Failures
+- `#124` remains the negative control for unsafe exact-tail acceleration.
+- `#136` remains the negative control for parity launch-spec omission; it is no longer the governing explanation after `#142`.
+- Shared-pass timing must still be interpreted as shared exact-tail cost when `FAMILYB_REUSE_SLIDING_PASS=1` is enabled.

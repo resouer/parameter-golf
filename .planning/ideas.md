@@ -88,3 +88,28 @@
   - packet writeup must state the explicit boundary:
     - same strict-legal scoring semantics intended as `#116/#126`
     - shared-pass timing/logging is a bounded implementation change, not a new scoring family
+
+## [2026-03-30 15:58] Round 143
+
+### Research Findings
+- `#142` has now closed as the corrected full-env parity rerun on the official-targeted RunPod image with the full Family B env surface visibly active.
+- The parity-confirmed keep-base is therefore the same clean semantic surface as `#126`, but now with stronger env evidence:
+  - `TIMING:final_eval=1790.8s`
+  - `final_int6_causal_backoff_exact val_bpb:0.39344583`
+  - `final_int6_causal_backoff eval_time:1656267ms`
+- The training-side regime already improved materially under parity (`~87.9ms/step` through wallclock cap), so the dominant remaining exact-tail waste is even more concentrated in the standalone Family B causal-backoff eval pass itself.
+
+### Decision
+- Choose the bounded `FAMILYB_REUSE_SLIDING_PASS=1` follow-up as the single next packet on top of the parity-confirmed Family B keep-base.
+- Keep the exact same strict-legal Family B env surface as `#142`; only add the reuse flag as the bounded implementation delta.
+- Preserve the standalone `eval_val_causal_backoff_mixer(...)` path as the fallback when the reuse flag is off.
+
+### Codex Review
+- Scope remains `train_gpt.py` plus the mandatory `Round 143` planning-file updates.
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean `run_lepton.py --dry-run --round 143 --env USE_NGRAM_MIXER=1 --env FAMILYB_REUSE_SLIDING_PASS=1 ...`
+  - packet writeup must state the new governing read:
+    - keep-base is parity-confirmed `#142`
+    - bounded EV is to attack the remaining standalone Family B closeout pass
+    - this is still a no-launch packet, not a new family/search pivot
