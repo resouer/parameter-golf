@@ -336,27 +336,31 @@ class RuntimePackedMemory:
 
     def lookup(self, order: int, ctx_key: tuple[int, int], target_id: int) -> tuple[int, int]:
         total = int(self.ctx_kept_totals[order].get(ctx_key, 0))
-        count = int(self.ctx_counts[order].get((ctx_key, int(target_id)), 0))
+        bucket = self.ctx_counts[order].get(ctx_key)
+        count = int(bucket.get(int(target_id), 0)) if bucket is not None else 0
         return count, total
 
     def update(self, order: int, ctx_key: tuple[int, int], target_id: int) -> None:
         totals = self.ctx_kept_totals[order]
-        if ctx_key not in totals and len(totals) >= self.context_caps[order]:
-            return
         counts = self.ctx_counts[order]
-        pair = (ctx_key, int(target_id))
-        new_count = min(int(counts.get(pair, 0)) + 1, 65535)
-        counts[pair] = new_count
-        bucket_pairs = [k for k in counts if k[0] == ctx_key]
-        if len(bucket_pairs) > self.topk:
-            worst = min(bucket_pairs, key=lambda key: (counts[key], -key[1]))
-            counts.pop(worst, None)
-            bucket_pairs = [k for k in counts if k[0] == ctx_key]
-        kept_total = min(sum(int(counts[key]) for key in bucket_pairs), 2**32 - 1)
+        bucket = counts.get(ctx_key)
+        if bucket is None:
+            if ctx_key not in totals and len(totals) >= self.context_caps[order]:
+                return
+            bucket = {}
+            counts[ctx_key] = bucket
+        target_id = int(target_id)
+        new_count = min(int(bucket.get(target_id, 0)) + 1, 65535)
+        bucket[target_id] = new_count
+        if len(bucket) > self.topk:
+            worst_target = min(bucket, key=lambda key: (bucket[key], -key))
+            bucket.pop(worst_target, None)
+        kept_total = min(sum(int(count) for count in bucket.values()), 2**32 - 1)
         if kept_total > 0:
             totals[ctx_key] = kept_total
         else:
             totals.pop(ctx_key, None)
+            counts.pop(ctx_key, None)
 
     def estimated_nbytes(self) -> int:
         per_context_bytes = 16 + 4 + self.topk * (2 + 2)
@@ -719,6 +723,7 @@ def eval_val_packed_memory(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    log0=None,
 ) -> tuple[float, float]:
     if args.packed_memory_eval_batch_seqs <= 0:
         raise ValueError("PACKED_MEMORY_EVAL_BATCH_SEQS must be positive")
@@ -739,6 +744,9 @@ def eval_val_packed_memory(
     with torch.inference_mode():
         seq_len = args.train_seq_len
         batch_span = seq_len * args.packed_memory_eval_batch_seqs
+        total_tokens = max(val_tokens_cpu.size - 1, 1)
+        progress_interval_tokens = max(batch_span, 1 << 21)
+        next_progress_tokens = progress_interval_tokens
         for chunk_start in range(0, val_tokens_cpu.size - 1, batch_span):
             remaining = val_tokens_cpu.size - 1 - chunk_start
             usable = min(batch_span, remaining)
@@ -799,6 +807,11 @@ def eval_val_packed_memory(
                         continue
                     ctx_key = pack_context_tokens(ctx_tokens.astype(np.uint16, copy=False))
                     runtime_memory.update(order, ctx_key, target_id)
+            processed_tokens = min(chunk_start + usable, total_tokens)
+            if log0 is not None and (processed_tokens >= next_progress_tokens or processed_tokens == total_tokens):
+                pct = 100.0 * processed_tokens / total_tokens
+                log0(f"packed_memory_final_eval:progress tokens:{processed_tokens}/{total_tokens} pct:{pct:.1f}")
+                next_progress_tokens += progress_interval_tokens
     val_loss = val_loss_sum / max(val_token_count, 1)
     bits_per_token = val_loss / math.log(2.0)
     tokens_per_byte = val_token_count / max(val_byte_count, 1.0)
@@ -831,6 +844,7 @@ def log_packed_memory_final_eval(
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        log0=log0,
     )
     torch.cuda.synchronize()
     log0(
