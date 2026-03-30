@@ -802,6 +802,7 @@ class BigramHashEmbedding(nn.Module):
         bigram_dim: int,
         model_dim: int,
         trigram: bool = False,
+        token_vocab_size: int = 0,
         engram_lite: bool = False,
         engram_heads: int = 2,
         engram_gate: bool = False,
@@ -815,16 +816,17 @@ class BigramHashEmbedding(nn.Module):
             raise ValueError(f"BIGRAM_DIM={bigram_dim} must be divisible by ENGRAM_HEADS={self.engram_heads}")
         self.head_dim = bigram_dim // self.engram_heads
         if self.engram_lite:
+            if token_vocab_size <= 0:
+                raise ValueError("token_vocab_size must be positive when ENGRAM_LITE=1")
             self.embed_heads = nn.ModuleList(
                 [nn.Embedding(bigram_vocab_size, self.head_dim) for _ in range(self.engram_heads)]
             )
             for embed in self.embed_heads:
                 nn.init.zeros_(embed.weight)
             self.embed = None
-            self.gate = nn.Linear(bigram_dim, self.engram_heads, bias=True) if engram_gate else None
+            self.gate = nn.Embedding(token_vocab_size, self.engram_heads) if engram_gate else None
             if self.gate is not None:
                 nn.init.zeros_(self.gate.weight)
-                nn.init.zeros_(self.gate.bias)
         else:
             self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
             nn.init.zeros_(self.embed.weight)
@@ -837,7 +839,10 @@ class BigramHashEmbedding(nn.Module):
 
     def token_embedding_weights(self) -> list[Tensor]:
         if self.engram_lite:
-            return [embed.weight for embed in self.embed_heads]
+            weights = [embed.weight for embed in self.embed_heads]
+            if self.gate is not None:
+                weights.append(self.gate.weight)
+            return weights
         return [self.embed.weight]
 
     def _hash_with_coeffs(self, tokens: Tensor, coeffs: tuple[int, ...]) -> Tensor:
@@ -873,10 +878,9 @@ class BigramHashEmbedding(nn.Module):
         if self.engram_lite:
             head_states = [self._embed_head(token_ids, i) for i in range(self.engram_heads)]
             if self.gate is not None:
-                gate_in = torch.cat(head_states, dim=-1)
-                gate = torch.softmax(self.gate(gate_in.to(dtype=self.gate.weight.dtype)), dim=-1).to(dtype=head_states[0].dtype)
+                gate = torch.softmax(self.gate(token_ids).to(dtype=head_states[0].dtype), dim=-1) * self.engram_heads
                 h = torch.cat(
-                    [head_states[i] * gate[..., i:i+1] * self.engram_heads for i in range(self.engram_heads)],
+                    [head_states[i] * gate[..., i:i+1] for i in range(self.engram_heads)],
                     dim=-1,
                 )
             else:
@@ -1002,6 +1006,7 @@ class GPT(nn.Module):
                 bigram_dim,
                 model_dim,
                 trigram=bool(int(os.environ.get("TRIGRAM", "0"))),
+                token_vocab_size=vocab_size,
                 engram_lite=engram_lite,
                 engram_heads=engram_heads,
                 engram_gate=engram_gate,
@@ -1603,6 +1608,7 @@ class _HessianGPT(nn.Module):
                 bigram_dim,
                 model_dim,
                 trigram=bool(int(os.environ.get("TRIGRAM", "0"))),
+                token_vocab_size=vocab_size,
                 engram_lite=engram_lite,
                 engram_heads=engram_heads,
                 engram_gate=engram_gate,
@@ -1947,8 +1953,6 @@ def main() -> None:
         tok_params.append({"params": base_model.bigram.token_embedding_weights(), "lr": token_lr, "base_lr": token_lr})
         if base_model.bigram.proj is not None:
             scalar_params.append(base_model.bigram.proj.weight)
-        if base_model.bigram.gate is not None:
-            scalar_params.extend([base_model.bigram.gate.weight, base_model.bigram.gate.bias])
     if base_model.ve_shared is not None:
         tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.ve_shared.proj is not None:
