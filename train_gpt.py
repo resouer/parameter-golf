@@ -87,6 +87,9 @@ class Hyperparameters:
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
     trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default, risky)
+    engram_lite = bool(int(os.environ.get("ENGRAM_LITE", "0")))
+    engram_heads = int(os.environ.get("ENGRAM_HEADS", 2))
+    engram_gate = bool(int(os.environ.get("ENGRAM_GATE", "0")))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
@@ -780,35 +783,106 @@ class SmearGate(nn.Module):
         return (1 - g) * x + g * x_prev
 
 class BigramHashEmbedding(nn.Module):
-    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int, trigram: bool = False):
+    _BIGRAM_HEAD_COEFFS = (
+        (36313, 27191),
+        (51437, 36781),
+        (21929, 47221),
+        (61043, 17393),
+    )
+    _TRIGRAM_HEAD_COEFFS = (
+        (36313, 27191, 51497),
+        (51437, 36781, 19373),
+        (21929, 47221, 63419),
+        (61043, 17393, 29789),
+    )
+
+    def __init__(
+        self,
+        bigram_vocab_size: int,
+        bigram_dim: int,
+        model_dim: int,
+        trigram: bool = False,
+        engram_lite: bool = False,
+        engram_heads: int = 2,
+        engram_gate: bool = False,
+    ):
         super().__init__()
         self.bigram_vocab_size = bigram_vocab_size
         self._trigram = trigram
-        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
-        nn.init.zeros_(self.embed.weight)
+        self.engram_lite = engram_lite
+        self.engram_heads = max(1, engram_heads if engram_lite else 1)
+        if self.engram_lite and bigram_dim % self.engram_heads != 0:
+            raise ValueError(f"BIGRAM_DIM={bigram_dim} must be divisible by ENGRAM_HEADS={self.engram_heads}")
+        self.head_dim = bigram_dim // self.engram_heads
+        if self.engram_lite:
+            self.embed_heads = nn.ModuleList(
+                [nn.Embedding(bigram_vocab_size, self.head_dim) for _ in range(self.engram_heads)]
+            )
+            for embed in self.embed_heads:
+                nn.init.zeros_(embed.weight)
+            self.embed = None
+            self.gate = nn.Linear(bigram_dim, self.engram_heads, bias=True) if engram_gate else None
+            if self.gate is not None:
+                nn.init.zeros_(self.gate.weight)
+                nn.init.zeros_(self.gate.bias)
+        else:
+            self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+            nn.init.zeros_(self.embed.weight)
+            self.embed_heads = None
+            self.gate = None
         self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
         if self.proj is not None:
             nn.init.zeros_(self.proj.weight)
         self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
-    def bigram_hash(self, tokens: Tensor) -> Tensor:
+
+    def token_embedding_weights(self) -> list[Tensor]:
+        if self.engram_lite:
+            return [embed.weight for embed in self.embed_heads]
+        return [self.embed.weight]
+
+    def _hash_with_coeffs(self, tokens: Tensor, coeffs: tuple[int, ...]) -> Tensor:
         t = tokens.to(torch.int32)
         mod = self.bigram_vocab_size - 1
         out = torch.empty_like(t)
-        out[..., 0] = mod
-        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        if len(coeffs) == 2:
+            cur_mul, prev_mul = coeffs
+            out[..., 0] = mod
+            out[..., 1:] = torch.bitwise_xor(cur_mul * t[..., 1:], prev_mul * t[..., :-1]) % mod
+        else:
+            cur_mul, prev_mul, prev2_mul = coeffs
+            out[..., :2] = mod
+            out[..., 2:] = (cur_mul * t[..., 2:] ^ prev_mul * t[..., 1:-1] ^ prev2_mul * t[..., :-2]) % mod
         return out.long()
-    def trigram_hash(self, tokens: Tensor) -> Tensor:
-        """Hash (t-2, t-1, t) trigrams into same embedding table. Zero extra params."""
-        t = tokens.to(torch.int32)
-        mod = self.bigram_vocab_size - 1
-        out = torch.empty_like(t)
-        out[..., :2] = mod
-        out[..., 2:] = (36313 * t[..., 2:] ^ 27191 * t[..., 1:-1] ^ 51497 * t[..., :-2]) % mod
-        return out.long()
-    def forward(self, token_ids: Tensor) -> Tensor:
-        h = self.embed(self.bigram_hash(token_ids))
+
+    def bigram_hash(self, tokens: Tensor, head_idx: int = 0) -> Tensor:
+        coeffs = self._BIGRAM_HEAD_COEFFS[head_idx % len(self._BIGRAM_HEAD_COEFFS)]
+        return self._hash_with_coeffs(tokens, coeffs)
+
+    def trigram_hash(self, tokens: Tensor, head_idx: int = 0) -> Tensor:
+        coeffs = self._TRIGRAM_HEAD_COEFFS[head_idx % len(self._TRIGRAM_HEAD_COEFFS)]
+        return self._hash_with_coeffs(tokens, coeffs)
+
+    def _embed_head(self, token_ids: Tensor, head_idx: int) -> Tensor:
+        embed = self.embed_heads[head_idx] if self.engram_lite else self.embed
+        h = embed(self.bigram_hash(token_ids, head_idx))
         if self._trigram:
-            h = h + self.embed(self.trigram_hash(token_ids))
+            h = h + embed(self.trigram_hash(token_ids, head_idx))
+        return h
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        if self.engram_lite:
+            head_states = [self._embed_head(token_ids, i) for i in range(self.engram_heads)]
+            if self.gate is not None:
+                gate_in = torch.cat(head_states, dim=-1)
+                gate = torch.softmax(self.gate(gate_in.to(dtype=self.gate.weight.dtype)), dim=-1).to(dtype=head_states[0].dtype)
+                h = torch.cat(
+                    [head_states[i] * gate[..., i:i+1] * self.engram_heads for i in range(self.engram_heads)],
+                    dim=-1,
+                )
+            else:
+                h = torch.cat(head_states, dim=-1)
+        else:
+            h = self._embed_head(token_ids, 0)
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
@@ -898,6 +972,9 @@ class GPT(nn.Module):
         mtp_loss_weight: float = 0.1,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
+        engram_lite: bool = False,
+        engram_heads: int = 2,
+        engram_gate: bool = False,
         xsa_last_n: int = 0,
         rope_dims: int = 0,
         ln_scale: bool = False,
@@ -919,7 +996,18 @@ class GPT(nn.Module):
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
+        self.bigram = (
+            BigramHashEmbedding(
+                bigram_vocab_size,
+                bigram_dim,
+                model_dim,
+                trigram=bool(int(os.environ.get("TRIGRAM", "0"))),
+                engram_lite=engram_lite,
+                engram_heads=engram_heads,
+                engram_gate=engram_gate,
+            )
+            if bigram_vocab_size > 0 else None
+        )
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1501,7 +1589,7 @@ class _HessianGPT(nn.Module):
     """Non-banked GPT model matching unbanked state dict keys for Hessian collection."""
     def __init__(self, vocab_size, num_layers, model_dim, num_heads, num_kv_heads,
                  mlp_mult, tie_embeddings, logit_softcap, rope_base, qk_gain_init,
-                 bigram_vocab_size=0, bigram_dim=128, xsa_last_n=0,
+                 bigram_vocab_size=0, bigram_dim=128, engram_lite=False, engram_heads=2, engram_gate=False, xsa_last_n=0,
                  rope_dims=0, ln_scale=False,
                  ve_enabled=False, ve_dim=128, ve_layers="9,10"):
         super().__init__()
@@ -1509,7 +1597,18 @@ class _HessianGPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.num_layers = num_layers
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
+        self.bigram = (
+            BigramHashEmbedding(
+                bigram_vocab_size,
+                bigram_dim,
+                model_dim,
+                trigram=bool(int(os.environ.get("TRIGRAM", "0"))),
+                engram_lite=engram_lite,
+                engram_heads=engram_heads,
+                engram_gate=engram_gate,
+            )
+            if bigram_vocab_size > 0 else None
+        )
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1795,6 +1894,9 @@ def main() -> None:
         mtp_loss_weight=args.mtp_loss_weight,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        engram_lite=args.engram_lite,
+        engram_heads=args.engram_heads,
+        engram_gate=args.engram_gate,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
@@ -1842,9 +1944,11 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:
-        tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
+        tok_params.append({"params": base_model.bigram.token_embedding_weights(), "lr": token_lr, "base_lr": token_lr})
         if base_model.bigram.proj is not None:
             scalar_params.append(base_model.bigram.proj.weight)
+        if base_model.bigram.gate is not None:
+            scalar_params.extend([base_model.bigram.gate.weight, base_model.bigram.gate.bias])
     if base_model.ve_shared is not None:
         tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.ve_shared.proj is not None:
@@ -1906,6 +2010,10 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"bigram:vocab={args.bigram_vocab_size} dim={args.bigram_dim} trigram={args.trigram_enabled} "
+        f"engram_lite={args.engram_lite} heads={args.engram_heads} gate={args.engram_gate}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -2130,6 +2238,7 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings, logit_softcap=args.logit_softcap,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+        engram_lite=args.engram_lite, engram_heads=args.engram_heads, engram_gate=args.engram_gate,
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
     ).to(device).bfloat16()
@@ -2253,6 +2362,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         mtp_num_heads=0, mtp_loss_weight=0.0,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+        engram_lite=args.engram_lite, engram_heads=args.engram_heads, engram_gate=args.engram_gate,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
