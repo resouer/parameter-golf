@@ -552,6 +552,77 @@ class StrictCausalBackoffMixer:
             self.ctx_tables[oi] += np.bincount(ctx_key, minlength=len(self.ctx_tables[oi])).astype(np.uint32)
             self.full_tables[oi] += np.bincount(full_key, minlength=len(self.full_tables[oi])).astype(np.uint32)
 
+    def score_and_update_contiguous(
+        self,
+        val_np: np.ndarray,
+        global_targets: np.ndarray,
+        neural_target_probs: np.ndarray,
+        entropy: np.ndarray,
+    ) -> np.ndarray:
+        """Score one contiguous score-first batch and then update counts.
+
+        The strict-legal semantics stay unchanged:
+        - mix probabilities using only counts from earlier scored tokens
+        - then update tables with the just-scored targets
+
+        Compared with the first #116 implementation, this avoids recomputing
+        the same context hashes twice (once in mix, once in update) and lets
+        the caller score each contiguous batch in one pass instead of looping
+        window-by-window through the same union range.
+        """
+        mixed = neural_target_probs.copy()
+        if len(global_targets) == 0:
+            return mixed
+
+        order_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        for order in range(self.min_order, self.max_order + 1):
+            ctx_width = order - 1
+            valid = global_targets >= ctx_width
+            ctx_key = np.zeros(len(global_targets), dtype=np.int64)
+            full_key = np.zeros(len(global_targets), dtype=np.int64)
+            if valid.any():
+                jv = global_targets[valid]
+                ctx_hash = np.zeros(len(jv), dtype=np.uint64)
+                for k in range(ctx_width):
+                    tok = val_np[jv - ctx_width + k].astype(np.uint64)
+                    ctx_hash ^= tok * NGRAM_PRIMES[k % len(NGRAM_PRIMES)]
+                ctx_key[valid] = (ctx_hash & self.mask).astype(np.int64)
+                tgt = val_np[jv].astype(np.uint64)
+                full_key[valid] = (
+                    (ctx_hash ^ (tgt * NGRAM_PRIMES[ctx_width % len(NGRAM_PRIMES)])) & self.mask
+                ).astype(np.int64)
+            order_cache.append((valid, ctx_key, full_key))
+
+        mixed_mask = np.zeros(len(global_targets), dtype=bool)
+        for order in range(self.max_order, self.min_order - 1, -1):
+            oi = order - self.min_order
+            valid, ctx_key, full_key = order_cache[oi]
+            can_consider = valid & ~mixed_mask
+            if not can_consider.any():
+                continue
+            v_idx = np.nonzero(can_consider)[0]
+            ctx_counts = self.ctx_tables[oi][ctx_key[v_idx]].astype(np.float64)
+            full_counts = self.full_tables[oi][full_key[v_idx]].astype(np.float64)
+            can_mix = ctx_counts >= float(self.min_count)
+            if not can_mix.any():
+                continue
+            mix_idx = v_idx[can_mix]
+            p_ng = np.minimum(full_counts[can_mix], ctx_counts[can_mix]) / np.maximum(ctx_counts[can_mix], 1.0)
+            p_ng = np.clip(p_ng, 0.0, 1.0)
+            alpha = self.alpha_base + self.alpha_range / (
+                1.0 + np.exp(-2.0 * (entropy[mix_idx] - self.alpha_center))
+            )
+            alpha = np.clip(alpha, 0.0, 0.95)
+            mixed[mix_idx] = (1.0 - alpha) * mixed[mix_idx] + alpha * p_ng
+            mixed_mask[mix_idx] = True
+
+        for oi, (valid, ctx_key, full_key) in enumerate(order_cache):
+            if not valid.any():
+                continue
+            self.ctx_tables[oi] += np.bincount(ctx_key[valid], minlength=len(self.ctx_tables[oi])).astype(np.uint32)
+            self.full_tables[oi] += np.bincount(full_key[valid], minlength=len(self.full_tables[oi])).astype(np.uint32)
+        return mixed
+
 
 def eval_val_causal_backoff_mixer(
     args: Hyperparameters,
@@ -613,8 +684,12 @@ def eval_val_causal_backoff_mixer(
                 logits = compiled_logits(x_batch)
             log_probs = F.log_softmax(logits.float(), dim=-1)
             probs = log_probs.exp()
-            batch_update_start: int | None = None
-            batch_update_end: int | None = None
+            batch_target_probs: list[Tensor] = []
+            batch_entropy: list[Tensor] = []
+            batch_prev: list[Tensor] = []
+            batch_tgt: list[Tensor] = []
+            scored_start: int | None = None
+            scored_end: int | None = None
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
@@ -625,25 +700,38 @@ def eval_val_causal_backoff_mixer(
                 prev = x_batch[i, s:wlen]
                 target_probs = probs[i, s:wlen].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
                 entropy = -(probs[i, s:wlen] * log_probs[i, s:wlen]).sum(dim=-1)
-                global_targets = np.arange(ws + s + 1, ws + wlen + 1, dtype=np.int64)
-                mixed_probs = mixer.mix_target_probs(
-                    val_np=val_np,
-                    global_targets=global_targets,
-                    neural_target_probs=target_probs.to(torch.float64).cpu().numpy(),
-                    entropy=entropy.to(torch.float64).cpu().numpy(),
+                batch_target_probs.append(target_probs.to(torch.float64).cpu())
+                batch_entropy.append(entropy.to(torch.float64).cpu())
+                batch_prev.append(prev.cpu())
+                batch_tgt.append(tgt.cpu())
+                seg_start = ws + s + 1
+                seg_end = ws + wlen + 1
+                scored_start = seg_start if scored_start is None else min(scored_start, seg_start)
+                scored_end = seg_end if scored_end is None else max(scored_end, seg_end)
+            if scored_start is None or scored_end is None:
+                continue
+            global_targets = np.arange(scored_start, scored_end, dtype=np.int64)
+            flat_target_probs = torch.cat(batch_target_probs).numpy()
+            flat_entropy = torch.cat(batch_entropy).numpy()
+            if len(global_targets) != len(flat_target_probs):
+                raise RuntimeError(
+                    f"Non-contiguous scored targets in causal backoff batch: "
+                    f"targets={len(global_targets)} probs={len(flat_target_probs)}"
                 )
-                seg_nll = -np.log(np.clip(mixed_probs, 1e-12, 1.0))
-                loss_sum += float(seg_nll.sum())
-                token_count += float(seg_len)
-                tb = base_bytes_lut[tgt].to(torch.float64)
-                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                byte_count += float(tb.sum().item())
-                scored_start = int(global_targets[0])
-                scored_end = int(global_targets[-1]) + 1
-                batch_update_start = scored_start if batch_update_start is None else min(batch_update_start, scored_start)
-                batch_update_end = scored_end if batch_update_end is None else max(batch_update_end, scored_end)
-            if batch_update_start is not None and batch_update_end is not None:
-                mixer.update(val_np, batch_update_start, batch_update_end)
+            mixed_probs = mixer.score_and_update_contiguous(
+                val_np=val_np,
+                global_targets=global_targets,
+                neural_target_probs=flat_target_probs,
+                entropy=flat_entropy,
+            )
+            seg_nll = -np.log(np.clip(mixed_probs, 1e-12, 1.0))
+            loss_sum += float(seg_nll.sum())
+            token_count += float(len(global_targets))
+            tgt_all = torch.cat(batch_tgt)
+            prev_all = torch.cat(batch_prev)
+            tb = base_bytes_lut[tgt_all].to(torch.float64)
+            tb += (has_leading_space_lut[tgt_all] & ~is_boundary_token_lut[prev_all]).to(torch.float64)
+            byte_count += float(tb.sum().item())
     if dist.is_available() and dist.is_initialized():
         totals = torch.tensor([loss_sum, token_count, byte_count], device=device, dtype=torch.float64)
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
