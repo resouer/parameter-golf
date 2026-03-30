@@ -39,3 +39,26 @@
   - `python3 -m py_compile train_gpt.py`
   - clean `run_lepton.py --dry-run --round 124 ...`
   - packet writeup must explain expected value vs `#116` as a semantics-preserving exact-tail runtime reduction, not a new scoring family.
+
+## [2026-03-30 12:20] Round 126
+
+### Research Findings
+- The recovered `#124` failure is a code-level invariant break, not a Family B failure:
+  - `Non-contiguous scored targets in causal backoff batch: targets=6208 probs=8192`
+- The unsafe assumption was that one batch’s scored tokens could always be collapsed into a single deduplicated contiguous target list.
+- The exact-tail speedup still matters, but the next packet must re-establish semantic safety first.
+
+### Decision
+- Replace the broken `#124` one-pass contiguous scorer with a safe cache-sharing path:
+  - precompute the contiguous batch-update key range once
+  - score each window independently by slicing that batch cache
+  - keep the single post-batch update exactly like `#116`
+- Keep the exact same strict-legal Family B env surface as `#116/#124`.
+- Keep the packet no-launch and pre-launch-ready only.
+
+### Codex Review
+- File scope remains `train_gpt.py` plus the mandatory `Round 126` planning-file updates.
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean `run_lepton.py --dry-run --round 126 ...`
+  - packet writeup must explain why this preserves `#116` semantics while replacing the broken `#124` optimization path.

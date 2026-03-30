@@ -1,4 +1,4 @@
-Current round: Round 116
+Current round: Round 126
 
 ## [2026-03-30 09:40] Round 116
 
@@ -21,3 +21,18 @@ Current round: Round 116
 - Intended delta:
   - batchwise contiguous score-first mixer pass
   - reuse per-order hash/key computations for both mixing and update
+
+## [2026-03-30 12:20] Round 126
+
+- Current round: Round 126
+- Branch: `autoresearch/exp-familyb-safe-batch-cache`
+- Base head: `88e9ebbd70c87264b66055f7bf3bb30117e9b789`
+- Deliverable: strict-legal `Family B` safe repair packet after the `#124` non-contiguous-target failure
+- Scope:
+  - preserve `#116` semantics exactly
+  - patch `train_gpt.py`
+  - no launch in this round
+- Intended delta:
+  - remove the broken one-pass contiguous-union scorer from `#124`
+  - precompute the contiguous batch-update key range once
+  - score each window by slicing that batch cache, then do the single post-batch update exactly like `#116`

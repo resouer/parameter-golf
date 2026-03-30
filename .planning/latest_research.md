@@ -82,3 +82,46 @@
 - `#116` already proved that raw training-body runtime on this host family is not healthy.
 - The `#116` exact-tail implementation is extraordinarily slow even though the final score is excellent.
 - Reopening broader `#1019` host-runtime-negative lines would violate the new single-node mainline decision.
+
+## [2026-03-30 12:20] Round 126
+
+### Research Findings
+- `#124` did not fail on infra or generic closeout; it failed inside the new batchwise optimization with:
+  - `RuntimeError: Non-contiguous scored targets in causal backoff batch: targets=6208 probs=8192`
+- The thrown guard proved the `#124` one-pass contiguous-union scorer had introduced a hidden correctness invariant that is false on the real Family B exact path.
+- The missing `final_int6_causal_backoff_exact` / `TIMING:final_eval` markers are therefore genuinely absent evidence from `#124`, not lost logs.
+
+### Paradigm Assumptions
+- The repair must preserve `#116` semantics exactly:
+  - score each window against the same pre-update mixer tables
+  - then perform one post-batch update on the contiguous batch range
+- The replacement should stay on the exact same strict-legal Family B surface as `#116/#124`.
+- The repair should target the same exact-tail waste, but it must not rely on a deduplicated union of scored targets.
+
+### Frontier Snapshot
+- `#116 = 0.39421265` remains the governing Family B success packet.
+- `#124` is a code-path failure of the attempted optimization, not a Family B quality failure.
+- Under the single-node strategy, the next acceptable Family B packet must first re-establish semantic correctness.
+
+### Comparable Methods
+- `#116` is the semantic control: per-window score-first mixing plus one post-batch contiguous update.
+- `#124` is the negative control: one-pass contiguous union with a hidden non-contiguity bug.
+- The correct safe-repair target is between them:
+  - keep `#116` semantics
+  - keep the `#124` idea of reusing batch-range hashes
+  - remove the broken contiguous-union assumption
+
+### Novelty-Relevant Findings
+- The safe optimization is to precompute the contiguous batch-update key range once and slice that cache for each per-window score.
+- This still eliminates the duplicated hash rebuild between scoring and update, but it does not collapse overlapping scored windows into one deduplicated target list.
+- That makes it a narrow implementation repair, not a family or legality change.
+
+### Compliance & Risk Status
+- Compliance boundary is unchanged: strict-legal Family B only.
+- Main technical risk is still semantic drift from `#116`; the safe repair is acceptable only if code inspection, compile, and dry-run all point back to `#116` semantics.
+- A deeper semantic A/B harness is still unavailable locally because this shell lacks `numpy`.
+
+### Known Failures
+- `#124` proved that a single contiguous-union scorer is unsafe on the real exact path.
+- Missing Family B closeout markers from `#124` cannot be treated as hidden positive evidence.
+- Any future speedup that again assumes scored-target contiguity across a batch is suspect until explicitly justified.
