@@ -1,4 +1,4 @@
-Current round: Round 126
+Current round: Round 129
 
 ## [2026-03-30 09:40] Round 116
 
@@ -36,3 +36,18 @@ Current round: Round 126
   - remove the broken one-pass contiguous-union scorer from `#124`
   - precompute the contiguous batch-update key range once
   - score each window by slicing that batch cache, then do the single post-batch update exactly like `#116`
+
+## [2026-03-30 13:40] Round 129
+
+- Current round: Round 129
+- Branch: `autoresearch/exp-familyb-count-prefetch`
+- Base head: `e8d6d047977a9a976a29153e38e7dc0827ad8952`
+- Deliverable: strict-legal `Family B` bounded follow-up packet after clean `#126` closeout
+- Scope:
+  - keep `#126` as the base
+  - patch `train_gpt.py`
+  - no launch in this round
+- Intended delta:
+  - prefetch per-order table counts once for the contiguous batch cache
+  - slice those cached counts per window during score-first mixing
+  - keep the same post-batch update path as `#126`

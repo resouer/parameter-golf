@@ -551,6 +551,52 @@ class StrictCausalBackoffMixer:
             mixed_mask[mix_idx] = True
         return mixed
 
+    def build_count_cache(
+        self,
+        order_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Prefetch per-order table counts once for a fixed key cache."""
+        count_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        for oi, (valid, ctx_key, full_key) in enumerate(order_cache):
+            ctx_counts = np.zeros(len(ctx_key), dtype=np.float64)
+            full_counts = np.zeros(len(full_key), dtype=np.float64)
+            if valid.any():
+                valid_idx = np.nonzero(valid)[0]
+                ctx_counts[valid_idx] = self.ctx_tables[oi][ctx_key[valid_idx]].astype(np.float64)
+                full_counts[valid_idx] = self.full_tables[oi][full_key[valid_idx]].astype(np.float64)
+            count_cache.append((valid, ctx_counts, full_counts))
+        return count_cache
+
+    def mix_target_probs_count_cached(
+        self,
+        neural_target_probs: np.ndarray,
+        entropy: np.ndarray,
+        count_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    ) -> np.ndarray:
+        """Score one window using pre-fetched table counts for its key cache."""
+        mixed = neural_target_probs.copy()
+        mixed_mask = np.zeros(len(neural_target_probs), dtype=bool)
+        for order in range(self.max_order, self.min_order - 1, -1):
+            oi = order - self.min_order
+            valid, ctx_counts, full_counts = count_cache[oi]
+            can_consider = valid & ~mixed_mask
+            if not can_consider.any():
+                continue
+            v_idx = np.nonzero(can_consider)[0]
+            can_mix = ctx_counts[v_idx] >= float(self.min_count)
+            if not can_mix.any():
+                continue
+            mix_idx = v_idx[can_mix]
+            p_ng = np.minimum(full_counts[mix_idx], ctx_counts[mix_idx]) / np.maximum(ctx_counts[mix_idx], 1.0)
+            p_ng = np.clip(p_ng, 0.0, 1.0)
+            alpha = self.alpha_base + self.alpha_range / (
+                1.0 + np.exp(-2.0 * (entropy[mix_idx] - self.alpha_center))
+            )
+            alpha = np.clip(alpha, 0.0, 0.95)
+            mixed[mix_idx] = (1.0 - alpha) * mixed[mix_idx] + alpha * p_ng
+            mixed_mask[mix_idx] = True
+        return mixed
+
     def update_from_cache(self, order_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> None:
         for oi, (valid, ctx_key, full_key) in enumerate(order_cache):
             if not valid.any():
@@ -591,12 +637,16 @@ class StrictCausalBackoffMixer:
         """
         batch_targets = np.arange(batch_start, batch_end, dtype=np.int64)
         batch_cache = self.build_order_cache(val_np, batch_targets)
+        batch_count_cache = self.build_count_cache(batch_cache)
         scored_windows: list[np.ndarray] = []
         for (seg_start, seg_end), target_prob_np, entropy_np in zip(window_specs, neural_target_probs, entropy):
             lo = seg_start - batch_start
             hi = seg_end - batch_start
-            window_cache = [(valid[lo:hi], ctx_key[lo:hi], full_key[lo:hi]) for valid, ctx_key, full_key in batch_cache]
-            scored_windows.append(self.mix_target_probs_cached(target_prob_np, entropy_np, window_cache))
+            window_count_cache = [
+                (valid[lo:hi], ctx_counts[lo:hi], full_counts[lo:hi])
+                for valid, ctx_counts, full_counts in batch_count_cache
+            ]
+            scored_windows.append(self.mix_target_probs_count_cached(target_prob_np, entropy_np, window_count_cache))
         self.update_from_cache(batch_cache)
         return scored_windows
 

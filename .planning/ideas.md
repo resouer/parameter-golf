@@ -62,3 +62,25 @@
   - `python3 -m py_compile train_gpt.py`
   - clean `run_lepton.py --dry-run --round 126 ...`
   - packet writeup must explain why this preserves `#116` semantics while replacing the broken `#124` optimization path.
+
+## [2026-03-30 13:40] Round 129
+
+### Research Findings
+- `#126` is the correct keep-base because it already repaired `#124` and closed the Family B causal-backoff path cleanly.
+- It also delivered a small exact-tail timing win over `#116`, so the next move should stack on `#126` rather than reset to `#116`.
+- The remaining bounded optimization target is repeated per-window table lookup work inside the exact-tail mixer.
+
+### Decision
+- Keep base = `#126` / `e8d6d047977a9a976a29153e38e7dc0827ad8952`.
+- Apply one bounded follow-up only:
+  - prefetch per-order `ctx_tables/full_tables` counts once for the contiguous batch cache
+  - slice those cached counts per window during score-first mixing
+  - keep the same post-batch update path as `#126`
+- Do not change family, legality surface, scored-window boundaries, or update order in this round.
+
+### Codex Review
+- File scope remains `train_gpt.py` plus the mandatory `Round 129` planning-file updates.
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean `run_lepton.py --dry-run --round 129 ...`
+  - packet writeup must explain why `#126` is the keep-base and why the new count-prefetch path is safer than `#124` while still targeting exact-tail speed.

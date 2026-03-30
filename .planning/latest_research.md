@@ -125,3 +125,52 @@
 - `#124` proved that a single contiguous-union scorer is unsafe on the real exact path.
 - Missing Family B closeout markers from `#124` cannot be treated as hidden positive evidence.
 - Any future speedup that again assumes scored-target contiguity across a batch is suspect until explicitly justified.
+
+## [2026-03-30 13:40] Round 129
+
+### Research Findings
+- `#126` cleanly closed the strict-legal Family B path that `#124` broke:
+  - `TIMING:final_eval=1813.1s`
+  - `final_int6_causal_backoff_exact val_bpb:0.39442306`
+- Relative to `#116`, `#126` already gave a small exact-tail runtime win without reopening the `#124` correctness failure mode:
+  - `#116`: `final_int6_causal_backoff eval_time:1710133ms`, `TIMING:final_eval=1851.3s`
+  - `#126`: `final_int6_causal_backoff eval_time:1671402ms`, `TIMING:final_eval=1813.1s`
+- The remaining visible waste in `#126` is that each window still re-reads the same per-order table counts from `ctx_tables` / `full_tables` even though those tables are fixed for the whole pre-update batch.
+
+### Paradigm Assumptions
+- Keep-base should be `#126`, not `#116`:
+  - it already preserves the repaired strict-legal closeout path
+  - it already improved exact-tail timing slightly
+  - it does not rely on the broken contiguous-union scorer from `#124`
+- The next move should remain a bounded implementation-side speedup only:
+  - no family drift
+  - no legality drift
+  - no change to score-then-update semantics
+
+### Frontier Snapshot
+- `#116` and `#126` both validate Family B as the live strict-legal champion family.
+- `#126` is the more relevant base because it proved the repaired closeout path can finish cleanly.
+- Under the single-node budget, the best-EV next move is still exact-tail runtime reduction on this same Family B surface.
+
+### Comparable Methods
+- `#116` is the semantic and quality baseline.
+- `#126` is the repaired keep-base.
+- The acceptable follow-up should only optimize the `#126` exact-tail implementation path, not alter training, model family, or the mixer formula.
+
+### Novelty-Relevant Findings
+- The safe bounded follow-up is to prefetch per-order table counts once for the contiguous batch cache, then slice those cached counts per window during score-first mixing.
+- This removes repeated `ctx_tables/full_tables` indexing across windows while preserving:
+  - the same batch key cache
+  - the same per-window score order
+  - the same single post-batch update
+- Unlike `#124`, this does not collapse window scores into a single union probability array, so it does not reintroduce the non-contiguous-target failure mode.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is subtle semantic drift from `#126` if the count-prefetch cache is misaligned with the per-window slices.
+- Local Python still lacks `numpy`, so validation remains limited to code inspection, `py_compile`, and clean launcher dry-run rather than a semantic A/B harness.
+
+### Known Failures
+- `#124` remains the explicit negative control for unsafe contiguous-union scoring.
+- The broader pure-neural `#110/#120/#123` line remains runtime-negative and is out of scope for this round.
+- Any follow-up that changes scored-window boundaries or mixer update order would violate the bounded speedup requirement for this round.
