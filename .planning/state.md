@@ -1,4 +1,4 @@
-Current round: Round 126
+Current round: Round 129
 
 ## [2026-03-30 09:40] Round 116
 
@@ -36,3 +36,18 @@ Current round: Round 126
   - remove the broken one-pass contiguous-union scorer from `#124`
   - precompute the contiguous batch-update key range once
   - score each window by slicing that batch cache, then do the single post-batch update exactly like `#116`
+
+## [2026-03-30 13:37] Round 129
+
+- Current round: Round 129
+- Branch: `autoresearch/exp-familyb-reuse-sliding-pass`
+- Base head: `e8d6d047977a9a976a29153e38e7dc0827ad8952`
+- Deliverable: strict-legal `Family B` bounded follow-up packet after the clean `#126` closeout
+- Scope:
+  - keep the same strict-legal `Family B` scoring semantics as `#116/#126`
+  - patch `train_gpt.py`
+  - no launch in this round
+- Intended delta:
+  - reuse the already-required sliding exact pass when `FAMILYB_REUSE_SLIDING_PASS=1`
+  - feed the strict-legal causal backoff scorer from that shared pass instead of launching a second full model-forward eval
+  - keep the old standalone `eval_val_causal_backoff_mixer(...)` path available as the fallback

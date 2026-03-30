@@ -62,3 +62,29 @@
   - `python3 -m py_compile train_gpt.py`
   - clean `run_lepton.py --dry-run --round 126 ...`
   - packet writeup must explain why this preserves `#116` semantics while replacing the broken `#124` optimization path.
+
+## [2026-03-30 13:37] Round 129
+
+### Research Findings
+- `#126` closed cleanly and repaired `#124`'s exact-tail crash without changing the winning strict-legal Family B surface:
+  - `final_int6_causal_backoff_exact val_bpb:0.39442306`
+  - `TIMING:final_eval=1813.1s`
+- The remaining obvious waste is that strict-legal Family B still launches a second full sliding-style eval pass after the already-required `final_int6_sliding_window` pass.
+- The shared-pass opportunity is narrow and local:
+  - sliding exact and Family B exact use the same window order, same logits source, and the same score-first window semantics
+  - the avoidable duplication is the second model-forward sweep, not the mixer formula itself
+
+### Decision
+- Keep `#126` as the semantic base and add one bounded opt-in follow-up:
+  - `FAMILYB_REUSE_SLIDING_PASS=1`
+- Reuse the main sliding exact pass to supply target probabilities and entropy to the same strict-legal Family B scorer.
+- Preserve the old standalone causal-backoff path as the fallback when the new env flag is off.
+
+### Codex Review
+- File scope remains `train_gpt.py` plus the mandatory `Round 129` planning-file updates.
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean `run_lepton.py --dry-run --round 129 --env USE_NGRAM_MIXER=1 --env FAMILYB_REUSE_SLIDING_PASS=1 ...`
+  - packet writeup must state the explicit boundary:
+    - same strict-legal scoring semantics intended as `#116/#126`
+    - shared-pass timing/logging is a bounded implementation change, not a new scoring family

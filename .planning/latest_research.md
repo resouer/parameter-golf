@@ -125,3 +125,53 @@
 - `#124` proved that a single contiguous-union scorer is unsafe on the real exact path.
 - Missing Family B closeout markers from `#124` cannot be treated as hidden positive evidence.
 - Any future speedup that again assumes scored-target contiguity across a batch is suspect until explicitly justified.
+
+## [2026-03-30 13:37] Round 129
+
+### Research Findings
+- `#126` has now established the clean post-repair Family B baseline:
+  - `final_int6_causal_backoff_exact val_bpb:0.39442306`
+  - `TIMING:final_eval=1813.1s`
+- That means the next highest-EV move is no longer semantic repair, but exact-tail speed on the same winning strict-legal surface.
+- The heaviest remaining waste is architectural duplication:
+  - `final_int6_sliding_window` and `final_int6_causal_backoff` both run over the same windows
+  - today the Family B closeout still pays for a second full model-forward sweep after the sliding exact pass
+
+### Paradigm Assumptions
+- Keep the strict-legal Family B surface unchanged:
+  - score-first
+  - backward-looking only
+  - full-vocab normalized mix
+  - no TTT
+  - no two-pass / hindsight / normalization-bug drift
+- Treat `#126` as the semantic control.
+- Restrict this round to a bounded implementation-side change that can be gated off with one env flag.
+
+### Frontier Snapshot
+- `#116 = 0.39421265` remains the strongest prior Family B evidence.
+- `#126 = 0.39442306` confirms the safe-repair line is still competitive and, critically, cleanly reaches causal-backoff closeout.
+- The broader `#1019` host family remains runtime-negative and does not re-enter the single-node main budget from this round.
+
+### Comparable Methods
+- `#116` is the clean semantic control.
+- `#124` is the negative control for unsafe exact-tail acceleration.
+- `#126` is the current safe-repair base that already removed the broken contiguous-union assumption.
+- The bounded follow-up here is to share the sliding pass with Family B scoring instead of scheduling a second standalone causal-backoff eval pass.
+
+### Novelty-Relevant Findings
+- The new packet does not invent a new Family B formula; its bounded novelty is implementation-side:
+  - reuse the already-required sliding exact pass
+  - feed the existing strict-legal causal-backoff scorer from those same logits / probabilities / entropies
+  - preserve the old standalone path as a fallback behind `FAMILYB_REUSE_SLIDING_PASS=1`
+- This is narrower than `#124` because it avoids a new scorer/update invariant and instead reuses the already accepted `#126` batch scorer.
+
+### Compliance & Risk Status
+- Compliance boundary is unchanged and still strict-legal.
+- Main technical risk is not legality drift but semantic drift from `#116/#126` due to the new shared-pass orchestration.
+- The packet should therefore stay explicitly no-launch until compile and launcher dry-run are clean.
+- Local validation remains bounded: this shell still does not have a deeper semantic A/B harness for full proof of identity.
+
+### Known Failures
+- `#124` showed that exact-tail speedups can easily introduce hidden invariants that only fail at closeout time.
+- Reusing the sliding pass changes evaluation orchestration and logging shape, so timing lines must be interpreted as shared-pass cost when the new flag is enabled.
+- This round does not fix the broader pure-neural runtime envelope; it is only a Family B bounded follow-up.
