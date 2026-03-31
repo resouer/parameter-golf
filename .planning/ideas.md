@@ -287,3 +287,90 @@
     - standalone count/state prefetch remains the keep-line
     - no Family B formula or control-flow change is introduced
     - the only delta is sparse post-batch update accumulation
+
+## [2026-03-30 20:59] Round 155
+
+### Research Findings
+- `#154` is accepted and launch-authorized.
+- Scope collapses back to launch hygiene only on accepted head `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`.
+- This round is not a new search move; it is the first live validation of the sparse-update follow-up on top of the confirmed standalone-prefetch line.
+
+### Decision
+- Do one last minimal re-gate on the accepted sparse-update head.
+- Launch on the single allowed AWS node under the same corrected parity/full-Family-B surface.
+- Report:
+  - `job`
+  - `job id`
+  - `node group`
+  - `direct state`
+
+### Codex Review
+- Scope is launch hygiene only; no new code delta beyond accepted head `c6e77c4`.
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean parity/full-Family-B `run_lepton.py --dry-run --round 155 ...`
+  - launch report must state explicitly:
+    - sparse-update follow-up remains bounded to post-batch accumulation
+    - semantic base and Family B formula are unchanged
+
+## [2026-03-30 22:23] Round 156
+
+### Research Findings
+- `#155` completed cleanly and now looks like a potentially important positive sample:
+  - full strict-legal Family B closeout landed
+  - exact stayed near the confirmed safe line
+  - `TIMING:final_eval` dropped sharply to `1188.4s`
+- That means the correct next move is one confirmation rerun on the same head, not an immediate promotion and not a pivot away.
+
+### Decision
+- Keep the same sparse-update head `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`.
+- Do one minimal re-gate and rerun it on the same corrected parity/full-Family-B surface.
+- Report:
+  - `job`
+  - `job id`
+  - `node group`
+  - `direct state`
+- The decision target is explicit:
+  - determine whether the large `TIMING:final_eval` gain with only a tiny semantic delta is persistent or noise
+
+### Codex Review
+- Scope is launch hygiene only; no new code delta beyond accepted head `c6e77c4`.
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean parity/full-Family-B `run_lepton.py --dry-run --round 156 ...`
+  - launch report must state explicitly:
+    - this is a confirmation rerun of `#155`, not a new method lane
+    - sparse-update remains bounded to post-batch accumulation
+    - semantic base and Family B formula are unchanged
+
+## [2026-03-30 23:45] Round 158
+
+### Research Findings
+- `#155/#156` confirm that sparse-update is now the current safe working line after the standalone-prefetch confirmation pair.
+- The next remaining obvious cost center inside that accepted scorer path is the dense count-cache layout used during scoring:
+  - `build_count_cache(...)` still allocates full-length `float64` arrays over the contiguous batch span for every order
+  - most of those positions are invalid at higher orders
+  - `mix_target_probs_count_cached(...)` then rescans those dense arrays with boolean masks / `np.nonzero(...)` for every window
+- A bounded next move is to keep the same cached key range and fetched counts, but store them only for valid positions and slice those valid-position spans per window.
+
+### Decision
+- Build one bounded follow-up on top of accepted sparse-update head `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`:
+  - keep `c6e77c4` semantics and control flow
+  - patch only the count-cache representation and per-window slicing path inside `train_gpt.py`
+  - switch from dense full-length count-cache arrays to valid-position/count slices
+  - preserve the same score-before-update semantics and post-batch update order
+- Deliver patch + pre-launch packet only.
+- No launch in this round.
+
+### Codex Review
+- Scope is:
+  - `train_gpt.py`
+  - mandatory `Round 158` planning-file updates
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean parity/full-Family-B `run_lepton.py --dry-run --round 158 ...`
+  - packet writeup must state explicitly:
+    - sparse-update remains the keep-line
+    - the keep-head is `c6e77c4`
+    - no Family B formula or control-flow change is introduced
+    - the only intended delta is valid-position count-cache slicing inside the same causal-backoff scorer

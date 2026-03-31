@@ -169,3 +169,50 @@ Current round: Round 142
   - replace dense full-bucket `np.bincount(..., minlength=...)` post-batch updates
   - use sparse unique-key accumulation only for the keys touched by the current batch
   - leave Family B scoring semantics and update order unchanged
+
+## [2026-03-30 20:59] Round 155
+
+- Current round: Round 155
+- Branch: `autoresearch/exp-familyb-sparse-update`
+- Base head: `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`
+- Deliverable: launch the accepted sparse-update follow-up on the corrected parity/full-Family-B surface
+- Scope:
+  - keep the same semantic base as `#142`
+  - keep the same accepted standalone-prefetch plus sparse-update code surface
+  - no new code changes in this round
+- Intended delta:
+  - minimal re-gate only
+  - launch the accepted sparse-update candidate on the single allowed AWS node
+  - report `job / job id / node group / direct state`
+
+## [2026-03-30 22:23] Round 156
+
+- Current round: Round 156
+- Branch: `autoresearch/exp-familyb-sparse-update`
+- Base head: `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`
+- Deliverable: confirmation rerun of the accepted sparse-update follow-up to test whether the large eval-time gain from `#155` is persistent or one-run noise
+- Scope:
+  - keep the same semantic base as `#142`
+  - keep the same accepted standalone-prefetch plus sparse-update code surface
+  - keep the same corrected parity/full-Family-B launch surface
+  - no new code changes in this round
+- Intended delta:
+  - minimal re-gate only
+  - relaunch the accepted sparse-update candidate on the single allowed AWS node
+  - report `job / job id / node group / direct state`
+
+## [2026-03-30 23:45] Round 158
+
+- Current round: Round 158
+- Branch: `autoresearch/exp-familyb-valid-count-cache`
+- Base head: `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`
+- Deliverable: bounded valid-position count-cache follow-up on top of the confirmed sparse-update working line
+- Scope:
+  - keep the same semantic base as `#142`
+  - keep the same accepted sparse-update scorer/update order from `c6e77c4`
+  - patch `train_gpt.py`
+  - no launch in this round
+- Intended delta:
+  - stop materializing full-length prefetched count arrays for every order during causal-backoff scoring
+  - cache only valid positions plus their fetched ctx/full counts
+  - slice those valid-position spans per window while preserving the same per-window score semantics and the same single post-batch update

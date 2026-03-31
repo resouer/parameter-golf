@@ -471,3 +471,136 @@
 - Do not reopen synchronized/shared-pass reuse.
 - Do not change semantic base, parity surface, or Family B formula in this round.
 - If this sparse-update follow-up still cannot improve exact-tail behavior, escalate back to the next `#149` ladder rather than layering unbounded local tweaks.
+
+## [2026-03-30 20:59] Round 155
+
+### Research Findings
+- `#154` is now accepted as the next bounded follow-up on top of the confirmed standalone-prefetch working line.
+- The accepted head stays on the same semantic/parity surface and only changes the dense post-batch update accumulation path.
+- This round is launch hygiene only:
+  - no new code delta beyond accepted head `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`
+  - no Family B formula, semantic base, or shared-state/shared-pass change
+
+### Paradigm Assumptions
+- Keep standalone count/state prefetch as the current safe working line.
+- Keep `#142` as the semantic comparison base.
+- Treat the sparse-update path as a bounded hotspot optimization inside the same scorer/update order.
+
+### Frontier Snapshot
+- Queue is empty again under the single-node budget.
+- `#155` should immediately launch the accepted sparse-update follow-up on the corrected parity/full-Family-B surface.
+
+### Comparable Methods
+- `#142`: semantic control.
+- `#152/#153`: safe standalone-prefetch working line.
+- `#154/#155`: sparse post-batch update follow-up on top of that safe line.
+
+### Novelty-Relevant Findings
+- This launch still preserves the same standalone Family B scoring path.
+- The only intended delta remains sparse accumulation for touched keys during cache updates.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main launch risk is operational only:
+  - minimal re-gate must pass
+  - parity/full-Family-B launch surface must remain unchanged
+
+### Known Failures
+- Do not reintroduce synchronized/shared-pass reuse.
+- Do not widen scope beyond the accepted sparse-update head in this launch round.
+
+## [2026-03-30 22:23] Round 156
+
+### Research Findings
+- `#155` completed with a full strict-legal Family B closeout on the sparse-update head `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`.
+- The semantic surface still looks close to the current safe working line:
+  - `#152 exact = 0.39363898`
+  - `#153 exact = 0.39341511`
+  - `#155 exact = 0.39361811`
+- But `#155` also showed a much larger-than-noise-looking eval-time shift:
+  - `#153 TIMING:final_eval = 1790.6s`
+  - `#155 TIMING:final_eval = 1188.4s`
+- That combination changes the next move:
+  - do not treat `#155` as final from one sample
+  - do not throw it away as a clear regression either
+  - do one confirmation rerun on the exact same sparse-update head
+
+### Paradigm Assumptions
+- Keep `c6e77c4` as the accepted sparse-update head.
+- Keep `#142` as the semantic/control base.
+- Keep the same corrected parity/full-Family-B launch surface.
+- Treat this round as confirmation only, not new method search.
+
+### Frontier Snapshot
+- `#155` is now the strongest completed sample on the current safe working line.
+- `#156` exists only to test whether the large `TIMING:final_eval` gain is persistent or just one-run noise.
+- Frontier scanning of unmerged-but-legal submission-shaped upstream lines now lives in separate lane `#157` and does not block this confirmation rerun.
+
+### Comparable Methods
+- `#142`: semantic control.
+- `#152/#153`: confirmed safe standalone-prefetch line.
+- `#155/#156`: sparse-update follow-up on top of that line, now under confirmation for persistence.
+
+### Novelty-Relevant Findings
+- This round adds no new code delta beyond accepted head `c6e77c4`.
+- The novelty claim under test remains the same bounded sparse-update optimization, not a new family or new base.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is no longer obvious semantics breakage; it is whether the large eval-time gain reproduces.
+- Launch risk is operational only: minimal re-gate plus same launch surface.
+
+### Known Failures
+- Do not widen scope beyond the accepted sparse-update head in this round.
+- Do not reopen shared-state/shared-pass reuse while running this confirmation.
+
+## [2026-03-30 23:45] Round 158
+
+### Research Findings
+- `#155/#156` now jointly establish the sparse-update head `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea` as the current safe working line:
+  - `#155`: `final_int6_causal_backoff_exact = 0.39361811`, `TIMING:final_eval = 1188.4s`
+  - `#156`: `final_int6_causal_backoff_exact = 0.39332185`, `TIMING:final_eval = 1178.3s`
+- The remaining obvious waste inside that same accepted line is no longer the post-batch update itself.
+- Inside `score_windows_with_batch_update_cache(...)`, `build_count_cache(...)` still materializes full-length `float64` arrays for every order over the contiguous batch span, even though higher orders only touch a sparse subset of positions.
+- Those dense zero-filled count arrays are then sliced per window and scanned again via boolean masks / `np.nonzero(...)` inside `mix_target_probs_count_cached(...)`.
+- A bounded next move is to keep the same count lookups and score-before-update semantics, but represent the prefetched counts as:
+  - valid-position indices
+  - fetched ctx/full counts only at those valid positions
+  - per-window slices derived from those valid-position spans
+
+### Paradigm Assumptions
+- Keep `c6e77c4` as the accepted sparse-update keep-head.
+- Keep `#142` as the semantic/control base.
+- Keep the same corrected parity/full-Family-B launch surface.
+- Treat this round as one bounded hotspot follow-up inside the accepted sparse-update scorer path, not as a new family or base change.
+
+### Frontier Snapshot
+- `#156` materially strengthens the read that the sparse-update gain is not one-run noise.
+- `#158` is therefore not another confirmation rerun.
+- The queue question is now whether one more bounded exact-tail packet can improve the current sparse-update working line without reopening semantics risk.
+
+### Comparable Methods
+- `#142`: semantic control.
+- `#152/#153`: confirmed safe standalone-prefetch line.
+- `#155/#156`: confirmed sparse-update working line.
+- `#158`: valid-position count-cache follow-up on top of sparse-update.
+
+### Novelty-Relevant Findings
+- The intended delta stays strictly inside the accepted Family B causal-backoff scorer.
+- No Family B formula change is introduced.
+- No update-order or score-window-boundary change is introduced.
+- The novelty claim for this round is only a narrower cache/layout optimization on top of the already accepted sparse-update head.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main technical risk is semantic drift from misaligned valid-position slicing.
+- The follow-up should therefore preserve:
+  - the same key cache
+  - the same fetched counts
+  - the same score-before-update order
+  - the same launch surface
+
+### Known Failures
+- Do not reopen shared-state/shared-pass reuse.
+- Do not widen scope beyond the accepted sparse-update scorer path.
+- Do not change scored-window boundaries, mixer formula, or post-batch update order.
