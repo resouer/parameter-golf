@@ -169,3 +169,19 @@ Current round: Round 142
   - replace dense full-bucket `np.bincount(..., minlength=...)` post-batch updates
   - use sparse unique-key accumulation only for the keys touched by the current batch
   - leave Family B scoring semantics and update order unchanged
+
+## [2026-03-31 06:37] Round 171
+
+- Current round: Round 171
+- Branch: `autoresearch/exp-familyb-vectorized-order-cache`
+- Base head: `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`
+- Deliverable: bounded keep-line follow-up that vectorizes Family B order-cache key construction
+- Scope:
+  - keep confirmed sparse-update keep-line `c6e77c4`
+  - keep semantic/control anchor at `#142`
+  - patch `train_gpt.py`
+  - no launch in this round
+- Intended delta:
+  - precompute per-order offset and prime vectors once in the mixer
+  - compute the same `ctx_hash` / `full_key` values with NumPy bulk gather/XOR instead of the inner Python token loop
+  - leave Family B scoring semantics and update order unchanged

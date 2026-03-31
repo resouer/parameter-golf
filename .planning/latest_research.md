@@ -471,3 +471,46 @@
 - Do not reopen synchronized/shared-pass reuse.
 - Do not change semantic base, parity surface, or Family B formula in this round.
 - If this sparse-update follow-up still cannot improve exact-tail behavior, escalate back to the next `#149` ladder rather than layering unbounded local tweaks.
+
+## [2026-03-31 06:37] Round 171
+
+### Research Findings
+- `#170` closed cleanly on accepted head `38c6140`, but it did not promote over keep-line `#156`:
+  - `#156`: submission `1.11238486`, exact `0.39332185`, `TIMING:final_eval=1178.3s`
+  - `#170`: submission `1.11249477`, exact `0.39366507`, `TIMING:final_eval=1179.4s`
+- So the queue resets to confirmed sparse-update keep-line `c6e77c4`.
+- The next unspent bounded hotspot remains in keep-line `build_order_cache(...)`:
+  - per-order context hashes still run through an inner Python token loop
+  - each order also reconstructs the same offset/prime vectors on the fly in loop form
+- A bounded next move is to precompute the per-order offset/prime vectors once and evaluate the same hash formula with NumPy bulk gather/XOR instead of the repeated inner Python loop.
+
+### Paradigm Assumptions
+- Reset to confirmed sparse-update keep-line `c6e77c4`.
+- Keep semantic/control anchor at `#142`.
+- Keep Family B hash formula, scorer logic, order traversal, and post-batch update timing unchanged.
+- Only target deterministic order-cache key construction inside `build_order_cache(...)`.
+
+### Frontier Snapshot
+- `#156` remains the promoted keep-line.
+- Later keep-line-local follow-ups (`#164`, `#166`, `#168`, `#170`) all closed cleanly but failed to replace `#156`.
+- The next bounded move should stay on `#156` and target a fresh narrow hotspot rather than revisit the non-promoted count/index/probability cache variants.
+
+### Comparable Methods
+- `#156`: promoted sparse-update keep-line.
+- `#169/#170`: `uint64` order-cache prep reuse, non-promoting.
+- `#171`: vectorized order-cache hash construction on the same keep-line.
+
+### Novelty-Relevant Findings
+- The packet does not change which contexts or targets are hashed.
+- It does not change the XOR/multiply hash formula or bucket mapping.
+- It only precomputes the per-order offset/prime vectors once and moves the same hash math into NumPy bulk operations.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is implementation correctness in the vectorized hash construction.
+- Risk remains bounded because the same hash operands and order-specific primes are preserved exactly.
+
+### Known Failures
+- Do not promote `38c6140` after `#170`.
+- Do not reopen non-promoted keep-line variants as new bases.
+- Do not change parity surface, semantic anchor, or Family B formula in this round.

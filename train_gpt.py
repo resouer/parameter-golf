@@ -493,6 +493,22 @@ class StrictCausalBackoffMixer:
         n_orders = max_order - min_order + 1
         self.ctx_tables = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(n_orders)]
         self.full_tables = [np.zeros(num_buckets, dtype=np.uint32) for _ in range(n_orders)]
+        prime_mod = len(NGRAM_PRIMES)
+        self._ctx_offsets = [
+            np.arange(-(order - 1), 0, dtype=np.int64)
+            for order in range(self.min_order, self.max_order + 1)
+        ]
+        self._ctx_primes = [
+            np.asarray(
+                [NGRAM_PRIMES[k % prime_mod] for k in range(order - 1)],
+                dtype=np.uint64,
+            )
+            for order in range(self.min_order, self.max_order + 1)
+        ]
+        self._full_primes = [
+            np.uint64(NGRAM_PRIMES[(order - 1) % prime_mod])
+            for order in range(self.min_order, self.max_order + 1)
+        ]
 
     def build_order_cache(
         self,
@@ -501,21 +517,21 @@ class StrictCausalBackoffMixer:
     ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Precompute per-order context/full-key arrays for a fixed target list."""
         order_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-        for order in range(self.min_order, self.max_order + 1):
+        for oi, order in enumerate(range(self.min_order, self.max_order + 1)):
             ctx_width = order - 1
             valid = global_targets >= ctx_width
             ctx_key = np.zeros(len(global_targets), dtype=np.int64)
             full_key = np.zeros(len(global_targets), dtype=np.int64)
             if valid.any():
                 jv = global_targets[valid]
-                ctx_hash = np.zeros(len(jv), dtype=np.uint64)
-                for k in range(ctx_width):
-                    tok = val_np[jv - ctx_width + k].astype(np.uint64)
-                    ctx_hash ^= tok * NGRAM_PRIMES[k % len(NGRAM_PRIMES)]
+                ctx_offsets = self._ctx_offsets[oi]
+                ctx_primes = self._ctx_primes[oi]
+                ctx_tokens = val_np[jv[:, None] + ctx_offsets].astype(np.uint64, copy=False)
+                ctx_hash = np.bitwise_xor.reduce(ctx_tokens * ctx_primes, axis=1)
                 ctx_key[valid] = (ctx_hash & self.mask).astype(np.int64)
                 tgt = val_np[jv].astype(np.uint64)
                 full_key[valid] = (
-                    (ctx_hash ^ (tgt * NGRAM_PRIMES[ctx_width % len(NGRAM_PRIMES)])) & self.mask
+                    (ctx_hash ^ (tgt * self._full_primes[oi])) & self.mask
                 ).astype(np.int64)
             order_cache.append((valid, ctx_key, full_key))
         return order_cache
