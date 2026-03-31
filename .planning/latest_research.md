@@ -174,3 +174,300 @@
 - `#124` remains the explicit negative control for unsafe contiguous-union scoring.
 - The broader pure-neural `#110/#120/#123` line remains runtime-negative and is out of scope for this round.
 - Any follow-up that changes scored-window boundaries or mixer update order would violate the bounded speedup requirement for this round.
+
+## [2026-03-30 14:25] Round 134
+
+### Research Findings
+- The parity audit is now fully concrete:
+  - official validation template image = `runpod/parameter-golf@sha256:394ad73416e110e306004171d712e5835c94e3a09032bed59fcd3c1a959a4f85`
+  - current ordinary Lepton image = `pytorch/pytorch@sha256:a7103283ea7113e10ae5d014bd2342acebda0bc53164b2f7b1dd6eb7a766bdb6`
+- `#126` is the cleanest Family B confirmation surface because it already closed the causal-backoff exact path cleanly:
+  - `final_int6_causal_backoff_exact val_bpb:0.39442306`
+  - `TIMING:final_eval=1813.1s`
+- `#129` is not the keep-base for parity confirmation yet because it had not produced decisive Family B causal-backoff closeout markers when this round was chosen.
+
+### Paradigm Assumptions
+- This round is a bounded parity-confirmation lane, not a new family or search pivot.
+- The model/code surface should stay exactly on accepted `#126`.
+- The launcher should switch only the env/image/bootstrap surface to the official RunPod parity mode and make the label explicit.
+
+### Frontier Snapshot
+- `#116/#126` keep Family B as the governing strict-legal champion family.
+- The live queue is empty under the single-node budget at this decision point.
+- The highest-EV next question is no longer family choice; it is whether the clean `#126` evidence survives under the official-targeted env surface.
+
+### Comparable Methods
+- `#126` is the direct semantic control for this round.
+- Ordinary Lepton launches remain the baseline unverified env path and must stay labeled `env-parity-unverified`.
+- The new parity-mode launcher path is the only acceptable env change in this round.
+
+### Novelty-Relevant Findings
+- The new information gain here is environmental, not algorithmic:
+  - use the official RunPod image target
+  - preserve the clean `#126` Family B base
+  - make parity labeling explicit in the launcher/job env
+- This gives a bounded confirmation run without reopening model-family search.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is env-stack mismatch rather than method drift.
+- Until parity mode is actually used, the correct evidence label remains `env-parity-unverified`.
+
+### Known Failures
+- The generic Lepton image is not parity-equivalent to the official RunPod image.
+- `#124` remains the explicit negative control for unsafe Family B exact-tail optimization.
+- Using `#129` as the parity keep-base right now would mix env confirmation with unresolved optimization-side uncertainty.
+
+## [2026-03-30 14:35] Round 136
+
+### Research Findings
+- `#134` did launch under parity mode, but it failed before live evaluation with a launcher-path collision:
+  - `fatal: destination path '/workspace/parameter-golf' already exists and is not an empty directory.`
+- `#135` repaired that bounded parity-bootstrap issue by moving parity-mode checkout to `/workspace/parameter-golf-parity`.
+- The repair leaves the intended env surface unchanged:
+  - same official RunPod digest image
+  - same `runpod-template` mode
+  - same `runpod-template-targeted` label
+
+### Paradigm Assumptions
+- This round remains a bounded parity-confirmation rerun, not a new family or method pivot.
+- The model/code surface must stay exactly on clean keep-base `#126`.
+- The only meaningful changed variable from `#134` to `#136` is the repaired launcher checkout path.
+
+### Frontier Snapshot
+- `#126` remains the best clean Family B control for parity confirmation.
+- The node is idle again after the bounded launcher failure on `#134`.
+- The highest-EV next question is whether the repaired parity launcher now allows the clean `#126` surface to enter real evaluation.
+
+### Comparable Methods
+- `#134` is now the negative control for the old parity-bootstrap path.
+- `#135` is the launcher-only repair lane that fixed the checkout-dir collision.
+- `#136` should therefore be read as `#126` rerun under repaired parity mode, not as a new Family B experiment.
+
+### Novelty-Relevant Findings
+- The new information gain is narrow and infrastructural:
+  - keep the same Family B method surface
+  - reuse the same official parity image/label
+  - verify that the repaired checkout path eliminates the `/workspace/parameter-golf` collision
+- That keeps the lane attributable to the launcher fix rather than to any method drift.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is still env/bootstrap behavior on the official image surface, not model semantics.
+- Because the launcher repair is bounded, the rerun should be read as a parity-bootstrap confirmation attempt rather than a new method result.
+
+### Known Failures
+- `#134` cannot be read as a parity-quality verdict because it died before evaluation body.
+- The old parity checkout target `/workspace/parameter-golf` is now a known-bad path on the official image surface.
+- Reopening `#129` or changing Family B method surfaces would confound the launcher repair confirmation.
+
+## [2026-03-30 15:04] Round 142
+
+### Research Findings
+- `#136` established that the repaired parity launcher path is now operational:
+  - same official RunPod digest image
+  - same repaired checkout dir `/workspace/parameter-golf-parity`
+  - real training body and exact-tail closeout both ran to control-plane completion
+- `#141` recovered the missing-boundary root cause:
+  - `#136` launched with `job[0] env=(none)`
+  - `USE_NGRAM_MIXER` defaults to `0`
+  - `final_int6_causal_backoff(_exact)` only runs when the Family B env surface is explicitly enabled
+- So the next highest-EV question is no longer parity launcher health; it is whether the full Family B env surface survives cleanly on the same repaired parity path.
+
+### Paradigm Assumptions
+- This round remains a bounded parity-confirmation rerun, not a new family or method pivot.
+- The model/code surface must stay exactly on clean keep-base `#126`.
+- The only changed variable from `#136` to this round is the restored Family B env surface.
+
+### Frontier Snapshot
+- `#126` remains the cleanest accepted Family B keep-base.
+- `#136` gives real parity-side runtime evidence, but it is incomplete as a Family B verdict because causal-backoff was not activated.
+- The node is free again, so the correct next move is an immediate corrected parity rerun rather than a search pivot.
+
+### Comparable Methods
+- `#126` is the known-good Family B closeout control under the ordinary Lepton image.
+- `#136` is the negative control for a parity rerun that dropped the env surface.
+- This round is the corrected parity counterpart: same code, same image path, same launcher repair, but with the full Family B env surface restored.
+
+### Novelty-Relevant Findings
+- The new information gain is narrow and attributable:
+  - same keep-base code
+  - same parity image/bootstrap surface
+  - explicit restoration of the Family B env activation surface
+- That keeps the round interpretable as a missing-closeout-surface correction, not a new algorithmic result.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is no longer parity bootstrap; it is accidental env drift or an incomplete env restore.
+- The launch record must therefore explicitly show the full Family B env surface, or the run cannot be read as a valid parity verdict.
+
+### Known Failures
+- `#134` remains the negative control for the old parity checkout-dir collision.
+- `#136` remains the negative control for a parity rerun that omitted the Family B env surface.
+- Any relaunch that changes the keep-base code or the parity image/bootstrap at the same time would confound the correction.
+
+## [2026-03-30 18:44] Round 151
+
+### Research Findings
+- `#147` and `#150` have now split the synchronized reuse family from the semantic control cleanly:
+  - runtime-side win reproduced (`506.9s`, `502.8s`)
+  - semantic delta vs `#142` also reproduced (`0.39390852`, `0.39386201` vs `0.39344583`)
+- That means synchronized reuse is no longer a noise question; it is a persistent speed/semantics tradeoff relative to `#142`.
+- The accepted `#149` ranking explicitly puts the safer standalone-cache/state optimization next once that tradeoff becomes persistent.
+
+### Paradigm Assumptions
+- Keep `#142 / e8d6d04` as the semantic comparison anchor.
+- Stop treating synchronized reuse as a base-preserving repair family.
+- Switch next to the standalone cache/state idea that keeps the standalone causal-backoff control flow intact.
+
+### Frontier Snapshot
+- `#142` remains the semantic control.
+- `#147/#150` now jointly characterize the synchronized reuse family:
+  - reproducible runtime win
+  - reproducible small semantic drift
+- The next bounded move is therefore not another distributed/reuse repair, but the safer standalone cache/state branch already prototyped in `#129`.
+
+### Comparable Methods
+- `#142`: control, fully trusted semantics, slow exact tail.
+- `#147/#150`: synchronized reuse, fast exact tail, persistent small semantic drift.
+- `#151`: standalone count/state prefetch on the same semantic base, intended to attack exact-tail cost without changing evaluation control flow.
+
+### Novelty-Relevant Findings
+- The revived candidate does not change the Family B formula or base.
+- It only prefetches table-count/state lookups once for the fixed batch cache and then slices those prefetched counts per window.
+- That makes it strictly safer than shared-pass reuse from a semantic-control standpoint.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is now implementation payoff: this candidate may deliver less speedup than synchronized reuse.
+- But it is ranked next because it removes the distributed/state-sharing failure mode from the optimization family entirely.
+
+### Known Failures
+- Do not open another confirmation rerun on synchronized reuse.
+- Do not reintroduce rank-sharded or shared-pass mixer-state tricks under the label of “safer cache/state.”
+- If this standalone candidate still fails to preserve `#142`, the next move should follow the `#149` switch ladder rather than more local patching on the same idea.
+
+## [2026-03-30 18:48] Round 152
+
+### Research Findings
+- `#151` has already been accepted as the next safer switch candidate.
+- There is no new method delta in this round; the information gain is whether the accepted standalone count/state prefetch candidate can run cleanly on the same corrected parity/full-Family-B surface that `#147/#150` used.
+- That keeps the next live result attributable to:
+  - same semantic base `#142`
+  - same parity launcher/image/env surface
+  - different optimization family: standalone count/state prefetch instead of synchronized reuse
+
+### Paradigm Assumptions
+- Keep `#142 / e8d6d04` as the semantic comparison anchor.
+- Keep the accepted `4dc08a7` code surface unchanged.
+- Read this as a family switch inside the same semantic-base comparison frame, not as a new formula/base search.
+
+### Frontier Snapshot
+- `#142` remains the control.
+- `#147/#150` have retired synchronized reuse as a base-preserving repair family.
+- `#151/#152` now advance the next ranked safer candidate from the accepted switch ladder.
+
+### Comparable Methods
+- `#142`: control, fully trusted semantics, slow exact tail.
+- `#147/#150`: synchronized reuse, fast exact tail, persistent small semantic drift.
+- `#152`: standalone count/state prefetch on the same semantic base, intended to chase runtime without inherited shared-state failure modes.
+
+### Novelty-Relevant Findings
+- The live question is now cleanly isolated:
+  - does standalone count/state prefetch buy runtime on the parity/full-Family-B surface
+  - without reproducing the persistent semantic drift seen in synchronized reuse
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is implementation payoff and possible smaller speed gain than synchronized reuse.
+- But the live experiment is substantially safer semantically because it stays inside the standalone scorer path.
+
+### Known Failures
+- Do not keep treating synchronized reuse as an active repair family.
+- Do not change semantic base or parity surface in the same round as this family switch.
+- If this safer candidate still fails to preserve `#142`, escalate to the next `#149` switch-base ladder rather than mixing families again.
+
+## [2026-03-30 19:53] Round 153
+
+### Research Findings
+- `#152` did reach full strict-legal Family B closeout on the safer standalone count/state prefetch path.
+- But versus semantic base `#142`, it still showed a small residual semantic delta and no clear tail-time win:
+  - `#142`: `final_int6_causal_backoff_exact val_bpb:0.39344583`, `TIMING:final_eval=1790.8s`
+  - `#152`: `final_int6_causal_backoff_exact val_bpb:0.39363898`, `TIMING:final_eval=1804.7s`
+- The next information gain is therefore not a new method change.
+- It is whether that residual delta is just run-to-run noise or a persistent property of the standalone-prefetch candidate.
+
+### Paradigm Assumptions
+- Keep `#142 / e8d6d04` as the semantic comparison anchor.
+- Keep the accepted `4dc08a7` code surface unchanged.
+- Keep the same corrected parity/full-Family-B launch surface unchanged.
+- Read this round as a confirmation rerun, not a new optimization search.
+
+### Frontier Snapshot
+- `#142` remains the semantic control.
+- `#147/#150` confirmed synchronized reuse is a persistent speed/semantics tradeoff and is no longer the active repair family.
+- `#152/#153` now test whether the safer standalone-prefetch family has a persistent residual delta of its own.
+
+### Comparable Methods
+- `#142`: control, fully trusted semantics, slow exact tail.
+- `#147/#150`: synchronized reuse, fast exact tail, persistent small semantic drift.
+- `#152`: standalone count/state prefetch, full closeout, small residual delta vs `#142`.
+- `#153`: confirmation rerun on the same standalone-prefetch candidate.
+
+### Novelty-Relevant Findings
+- No new novelty is introduced in this round.
+- The information gain is purely statistical/diagnostic:
+  - does `4dc08a7` reproduce its small delta vs `#142`
+  - or does it collapse back toward the `#142` value on rerun
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is wasted cycle if the residual delta is already effectively established.
+- But this is still the cheapest clean way to decide noise vs persistent drift before abandoning or escalating the family.
+
+### Known Failures
+- Do not change code, semantic base, or parity surface in this round.
+- Do not reopen synchronized reuse for another repair attempt here.
+- If `#153` reproduces the same residual delta vs `#142`, treat that as persistence and move back to the next `#149` switch ladder.
+
+## [2026-03-30 20:54] Round 154
+
+### Research Findings
+- `#152/#153` jointly establish standalone count/state prefetch as the current safe working line:
+  - full strict-legal Family B closeout lands cleanly
+  - residual semantic delta vs `#142` now reads like noise, not persistent drift
+- But the exact tail still spends most of its time in the standalone causal-backoff closeout:
+  - `#153 final_int6_causal_backoff eval_time = 1655741ms`
+  - this remains far larger than the sliding/roundtrip exact subpasses
+- On the confirmed `4dc08a7` safe line, the post-batch update still allocates dense full-bucket `np.bincount(..., minlength=4,194,304)` vectors for every order.
+
+### Paradigm Assumptions
+- Keep `4dc08a7` as the current safe working line after `#152/#153`.
+- Keep the Family B formula, scoring order, and standalone control flow unchanged.
+- Only target the post-batch table-update implementation detail inside the standalone scorer.
+
+### Frontier Snapshot
+- `#142` remains the semantic control.
+- `#152/#153` have now promoted standalone-prefetch from “candidate” to current safe working line.
+- The next bounded move should attack exact-tail cost inside that same safe line, not reopen shared-state or base-switch questions.
+
+### Comparable Methods
+- `#142`: clean semantic control, slow exact tail.
+- `#152/#153`: safe standalone-prefetch line, semantics consistent with `#142`, but still heavy exact-tail cost.
+- `#154`: sparse post-batch table updates inside the same standalone scorer path.
+
+### Novelty-Relevant Findings
+- This follow-up does not change what gets counted or when it gets counted.
+- It only changes how the batch update is accumulated:
+  - from dense full-bucket `np.bincount(..., minlength=...)`
+  - to sparse unique-key accumulation on only the keys touched by the batch
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is implementation correctness in the accumulator path, not semantic policy drift.
+- Risk is bounded because the change stays entirely inside the already-confirmed standalone scorer/update path.
+
+### Known Failures
+- Do not reopen synchronized/shared-pass reuse.
+- Do not change semantic base, parity surface, or Family B formula in this round.
+- If this sparse-update follow-up still cannot improve exact-tail behavior, escalate back to the next `#149` ladder rather than layering unbounded local tweaks.

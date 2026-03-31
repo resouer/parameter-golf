@@ -598,11 +598,22 @@ class StrictCausalBackoffMixer:
         return mixed
 
     def update_from_cache(self, order_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> None:
+        """Apply one batch update without allocating full-bucket bincount vectors."""
         for oi, (valid, ctx_key, full_key) in enumerate(order_cache):
             if not valid.any():
                 continue
-            self.ctx_tables[oi] += np.bincount(ctx_key[valid], minlength=len(self.ctx_tables[oi])).astype(np.uint32)
-            self.full_tables[oi] += np.bincount(full_key[valid], minlength=len(self.full_tables[oi])).astype(np.uint32)
+            valid_ctx = ctx_key[valid]
+            valid_full = full_key[valid]
+            self._sparse_accumulate_counts(self.ctx_tables[oi], valid_ctx)
+            self._sparse_accumulate_counts(self.full_tables[oi], valid_full)
+
+    @staticmethod
+    def _sparse_accumulate_counts(table: np.ndarray, keys: np.ndarray) -> None:
+        """Accumulate counts only for keys touched by the current batch."""
+        if len(keys) == 0:
+            return
+        uniq, counts = np.unique(keys, return_counts=True)
+        table[uniq.astype(np.intp, copy=False)] += counts.astype(np.uint32, copy=False)
 
     def mix_target_probs(
         self,
