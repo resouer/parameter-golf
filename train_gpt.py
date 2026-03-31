@@ -558,8 +558,10 @@ class StrictCausalBackoffMixer:
         """Prefetch per-order table counts once for a fixed key cache."""
         count_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         for oi, (valid, ctx_key, full_key) in enumerate(order_cache):
-            ctx_counts = np.zeros(len(ctx_key), dtype=np.float64)
-            full_counts = np.zeros(len(full_key), dtype=np.float64)
+            # Invalid slots are never read: every scoring access stays gated by
+            # the companion `valid` mask before indexing ctx/full counts.
+            ctx_counts = np.empty(len(ctx_key), dtype=np.float64)
+            full_counts = np.empty(len(full_key), dtype=np.float64)
             if valid.any():
                 valid_idx = np.nonzero(valid)[0]
                 ctx_counts[valid_idx] = self.ctx_tables[oi][ctx_key[valid_idx]].astype(np.float64)

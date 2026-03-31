@@ -471,3 +471,44 @@
 - Do not reopen synchronized/shared-pass reuse.
 - Do not change semantic base, parity surface, or Family B formula in this round.
 - If this sparse-update follow-up still cannot improve exact-tail behavior, escalate back to the next `#149` ladder rather than layering unbounded local tweaks.
+
+## [2026-03-31 07:36] Round 173
+
+### Research Findings
+- `#172` cleanly closed the accepted vectorized-order-cache follow-up on reset keep-line `c6e77c4`, but it did not promote over `#156`:
+  - `#156`: `1.11238486 / 0.39332185 / 1178.3s`
+  - `#172`: `1.11251068 / 0.39362715 / 1208.5s`
+- So the queue resets again to confirmed sparse-update keep-line `c6e77c4`.
+- The count/index/probability cache variants and the order-cache key-construction variants have now all failed to promote.
+- A fresh bounded hotspot remains in `build_count_cache(...)` on the keep-line:
+  - every order still zero-fills full-length `ctx_counts/full_counts` arrays
+  - but invalid positions are semantically dead because all downstream reads are gated by the paired `valid` mask before indexing counts
+
+### Paradigm Assumptions
+- Reset to confirmed sparse-update keep-line `c6e77c4`.
+- Keep semantic/control anchor `#142`.
+- Keep Family B formula, score/update order, and standalone sparse-update control flow unchanged.
+- No launch in this round.
+
+### Frontier Snapshot
+- `#156` remains the promoted keep-line.
+- `#164`, `#166`, `#168`, `#170`, and `#172` all closed cleanly but failed to replace it.
+- The next bounded move should therefore stay on `#156` and attack one fresh implementation-side hotspot rather than reopen any non-promoted local variant as a base.
+
+### Comparable Methods
+- `#156`: promoted sparse-update keep-line.
+- `#169/#170`: `uint64` order-cache prep reuse, non-promoting.
+- `#171/#172`: vectorized order-cache hash construction, non-promoting.
+- `#173`: skip zero-filling invalid count-cache slots while preserving the existing `valid`-gated read path.
+
+### Novelty-Relevant Findings
+- This follow-up does not change which targets are valid, which counts are read, or when anything is updated.
+- It only removes repeated zero-initialization of count-cache slots that are semantically unreachable under the existing `valid` mask.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Risk is bounded because the change does not alter any live read path; invalid slots remain masked out before scoring.
+
+### Known Failures
+- Do not reopen non-promoted keep-line variants as new bases.
+- Do not change Family B formula, alpha schedule, order traversal, or post-batch update timing in this round.

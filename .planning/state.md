@@ -169,3 +169,19 @@ Current round: Round 142
   - replace dense full-bucket `np.bincount(..., minlength=...)` post-batch updates
   - use sparse unique-key accumulation only for the keys touched by the current batch
   - leave Family B scoring semantics and update order unchanged
+
+## [2026-03-31 07:36] Round 173
+
+- Current round: Round 173
+- Branch: `autoresearch/exp-familyb-skip-zero-count-cache`
+- Base head: `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`
+- Deliverable: bounded keep-line follow-up that removes zero-filling of semantically dead invalid slots in `build_count_cache(...)`
+- Scope:
+  - keep semantic/control base `#142`
+  - keep confirmed sparse-update keep-line `c6e77c4`
+  - patch `train_gpt.py`
+  - no launch in this round
+- Intended delta:
+  - replace `np.zeros(...)` count-cache allocation with `np.empty(...)`
+  - keep the same `valid` mask and the same valid-slot table lookups
+  - rely on the unchanged `valid`-gated scoring path so invalid slots remain unreachable

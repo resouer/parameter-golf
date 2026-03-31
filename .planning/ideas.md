@@ -287,3 +287,33 @@
     - standalone count/state prefetch remains the keep-line
     - no Family B formula or control-flow change is introduced
     - the only delta is sparse post-batch update accumulation
+
+## [2026-03-31 07:36] Round 173
+
+### Research Findings
+- `#172` closed cleanly on accepted head `c333ae5`, but it did not promote over keep-line `#156`.
+- So the queue resets to confirmed sparse-update keep-line `c6e77c4`.
+- The spent count/index/probability-cache and order-cache-key variants should not be reused as implicit bases.
+- A fresh bounded keep-line hotspot remains in `build_count_cache(...)`:
+  - it still allocates and zero-fills full-length `ctx_counts/full_counts`
+  - yet invalid positions are never read because scoring first gates by `valid`
+
+### Decision
+- Build one bounded keep-line follow-up on reset base `c6e77c4`:
+  - patch only `build_count_cache(...)`
+  - replace full-length zero-fill with uninitialized arrays whose invalid slots remain dead under the existing `valid` mask
+  - keep Family B semantics and update order unchanged
+- Deliver patch + pre-launch packet only.
+- No launch in this round.
+
+### Codex Review
+- Scope is:
+  - `train_gpt.py`
+  - mandatory `Round 173` planning-file updates
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean parity/full-Family-B `run_lepton.py --dry-run ...`
+  - packet writeup must state explicitly:
+    - keep-line remains `c6e77c4`
+    - invalid count-cache slots remain unreachable under the unchanged `valid` mask
+    - no Family B formula, traversal, or update-order change is introduced
