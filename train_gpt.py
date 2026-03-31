@@ -499,25 +499,26 @@ class StrictCausalBackoffMixer:
         val_np: np.ndarray,
         global_targets: np.ndarray,
     ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Precompute per-order context/full-key arrays for a fixed target list."""
+        """Precompute per-order valid indices plus context/full-key arrays for a fixed target list."""
         order_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         for order in range(self.min_order, self.max_order + 1):
             ctx_width = order - 1
             valid = global_targets >= ctx_width
+            valid_idx = np.nonzero(valid)[0]
             ctx_key = np.zeros(len(global_targets), dtype=np.int64)
             full_key = np.zeros(len(global_targets), dtype=np.int64)
-            if valid.any():
-                jv = global_targets[valid]
+            if len(valid_idx) > 0:
+                jv = global_targets[valid_idx]
                 ctx_hash = np.zeros(len(jv), dtype=np.uint64)
                 for k in range(ctx_width):
                     tok = val_np[jv - ctx_width + k].astype(np.uint64)
                     ctx_hash ^= tok * NGRAM_PRIMES[k % len(NGRAM_PRIMES)]
-                ctx_key[valid] = (ctx_hash & self.mask).astype(np.int64)
+                ctx_key[valid_idx] = (ctx_hash & self.mask).astype(np.int64)
                 tgt = val_np[jv].astype(np.uint64)
-                full_key[valid] = (
+                full_key[valid_idx] = (
                     (ctx_hash ^ (tgt * NGRAM_PRIMES[ctx_width % len(NGRAM_PRIMES)])) & self.mask
                 ).astype(np.int64)
-            order_cache.append((valid, ctx_key, full_key))
+            order_cache.append((valid_idx, ctx_key, full_key))
         return order_cache
 
     def mix_target_probs_cached(
@@ -530,11 +531,12 @@ class StrictCausalBackoffMixer:
         mixed_mask = np.zeros(len(neural_target_probs), dtype=bool)
         for order in range(self.max_order, self.min_order - 1, -1):
             oi = order - self.min_order
-            valid, ctx_key, full_key = order_cache[oi]
-            can_consider = valid & ~mixed_mask
-            if not can_consider.any():
+            valid_idx, ctx_key, full_key = order_cache[oi]
+            if len(valid_idx) == 0:
                 continue
-            v_idx = np.nonzero(can_consider)[0]
+            v_idx = valid_idx[~mixed_mask[valid_idx]]
+            if len(v_idx) == 0:
+                continue
             ctx_counts = self.ctx_tables[oi][ctx_key[v_idx]].astype(np.float64)
             full_counts = self.full_tables[oi][full_key[v_idx]].astype(np.float64)
             can_mix = ctx_counts >= float(self.min_count)
@@ -557,14 +559,13 @@ class StrictCausalBackoffMixer:
     ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Prefetch per-order table counts once for a fixed key cache."""
         count_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-        for oi, (valid, ctx_key, full_key) in enumerate(order_cache):
+        for oi, (valid_idx, ctx_key, full_key) in enumerate(order_cache):
             ctx_counts = np.zeros(len(ctx_key), dtype=np.float64)
             full_counts = np.zeros(len(full_key), dtype=np.float64)
-            if valid.any():
-                valid_idx = np.nonzero(valid)[0]
+            if len(valid_idx) > 0:
                 ctx_counts[valid_idx] = self.ctx_tables[oi][ctx_key[valid_idx]].astype(np.float64)
                 full_counts[valid_idx] = self.full_tables[oi][full_key[valid_idx]].astype(np.float64)
-            count_cache.append((valid, ctx_counts, full_counts))
+            count_cache.append((valid_idx, ctx_counts, full_counts))
         return count_cache
 
     def mix_target_probs_count_cached(
@@ -578,11 +579,12 @@ class StrictCausalBackoffMixer:
         mixed_mask = np.zeros(len(neural_target_probs), dtype=bool)
         for order in range(self.max_order, self.min_order - 1, -1):
             oi = order - self.min_order
-            valid, ctx_counts, full_counts = count_cache[oi]
-            can_consider = valid & ~mixed_mask
-            if not can_consider.any():
+            valid_idx, ctx_counts, full_counts = count_cache[oi]
+            if len(valid_idx) == 0:
                 continue
-            v_idx = np.nonzero(can_consider)[0]
+            v_idx = valid_idx[~mixed_mask[valid_idx]]
+            if len(v_idx) == 0:
+                continue
             can_mix = ctx_counts[v_idx] >= float(self.min_count)
             if not can_mix.any():
                 continue
@@ -599,11 +601,11 @@ class StrictCausalBackoffMixer:
 
     def update_from_cache(self, order_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> None:
         """Apply one batch update without allocating full-bucket bincount vectors."""
-        for oi, (valid, ctx_key, full_key) in enumerate(order_cache):
-            if not valid.any():
+        for oi, (valid_idx, ctx_key, full_key) in enumerate(order_cache):
+            if len(valid_idx) == 0:
                 continue
-            valid_ctx = ctx_key[valid]
-            valid_full = full_key[valid]
+            valid_ctx = ctx_key[valid_idx]
+            valid_full = full_key[valid_idx]
             self._sparse_accumulate_counts(self.ctx_tables[oi], valid_ctx)
             self._sparse_accumulate_counts(self.full_tables[oi], valid_full)
 
@@ -654,8 +656,12 @@ class StrictCausalBackoffMixer:
             lo = seg_start - batch_start
             hi = seg_end - batch_start
             window_count_cache = [
-                (valid[lo:hi], ctx_counts[lo:hi], full_counts[lo:hi])
-                for valid, ctx_counts, full_counts in batch_count_cache
+                (
+                    valid_idx[(valid_idx >= lo) & (valid_idx < hi)] - lo,
+                    ctx_counts[lo:hi],
+                    full_counts[lo:hi],
+                )
+                for valid_idx, ctx_counts, full_counts in batch_count_cache
             ]
             scored_windows.append(self.mix_target_probs_count_cached(target_prob_np, entropy_np, window_count_cache))
         self.update_from_cache(batch_cache)

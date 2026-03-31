@@ -287,3 +287,33 @@
     - standalone count/state prefetch remains the keep-line
     - no Family B formula or control-flow change is introduced
     - the only delta is sparse post-batch update accumulation
+
+## [2026-03-31 02:47] Round 163
+
+### Research Findings
+- Sparse-update `c6e77c4` remains the confirmed keep-line after the non-promoting `#159/#160` and `#161/#162` follow-ups.
+- A remaining bounded hotspot on that keep-line is repeated candidate-index reconstruction in the cached scorer:
+  - per-order `valid & ~mixed_mask`
+  - followed by `np.nonzero(...)`
+- Those valid positions are already determined by the cached target range, so we can cache them once and reuse them.
+
+### Decision
+- Build one bounded valid-index-cache follow-up on top of sparse-update keep-line `c6e77c4`.
+- Patch only `train_gpt.py` plus mandatory `Round 163` planning-file updates.
+- Keep:
+  - semantic anchor `#142`
+  - sparse-update keep-line behavior
+  - full parity/full-Family-B launch surface
+- No launch in this round.
+
+### Codex Review
+- Scope is:
+  - `train_gpt.py`
+  - mandatory `Round 163` planning-file updates
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean parity/full-Family-B `run_lepton.py --dry-run --round 163 ...`
+  - packet writeup must state explicitly:
+    - keep-line remains `c6e77c4`
+    - `508892d` is not promoted
+    - the only delta is reusing per-order valid indices inside the cached scorer path

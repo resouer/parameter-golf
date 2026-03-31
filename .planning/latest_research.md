@@ -471,3 +471,51 @@
 - Do not reopen synchronized/shared-pass reuse.
 - Do not change semantic base, parity surface, or Family B formula in this round.
 - If this sparse-update follow-up still cannot improve exact-tail behavior, escalate back to the next `#149` ladder rather than layering unbounded local tweaks.
+
+## [2026-03-31 02:47] Round 163
+
+### Research Findings
+- `#159/#160` showed that valid-count-cache was a clean bounded follow-up, but not a clear promotion over sparse-update keep-line `c6e77c4`.
+- `#161/#162` showed the same for alpha-cache: clean closeout, tiny timing movement, but no semantic/submission promotion over `#156`.
+- Keep-line therefore remains sparse-update `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`.
+- Inside the confirmed keep-line scorer, we still rebuild per-order candidate positions from full-length boolean arrays on every score pass:
+  - `valid & ~mixed_mask`
+  - `np.nonzero(...)`
+- That candidate selection work is repeated in both `mix_target_probs_cached(...)` and `mix_target_probs_count_cached(...)`, even though the base valid positions are already fixed by the cached target range.
+
+### Paradigm Assumptions
+- Keep semantic anchor at `#142`.
+- Keep sparse-update `c6e77c4` as the confirmed keep-line.
+- Keep Family B formula, scoring order, window semantics, and single post-batch update semantics unchanged.
+- Only optimize how per-order valid candidate indices are reused inside the existing cached scorer path.
+
+### Frontier Snapshot
+- `#156` remains the keep-line result to beat:
+  - submission `1.11238486`
+  - exact `0.39332185`
+  - `TIMING:final_eval=1178.3s`
+- `#159/#160` and `#162` are clean but non-promoting bounded follow-ups.
+- The next packet should therefore stay bounded and behavior-preserving on top of `c6e77c4`, not reopen base-promotion or parity-surface questions.
+
+### Comparable Methods
+- `#156`: sparse-update keep-line, current safe working line.
+- `#159/#160`: valid-count-cache follow-up, mixed confirmation pair, not promoted.
+- `#162`: alpha-cache follow-up, clean but non-promoting.
+- `#163`: valid-index-cache follow-up, reusing per-order valid positions instead of recomputing them from full boolean masks every pass.
+
+### Novelty-Relevant Findings
+- This follow-up does not change:
+  - which positions are valid for each order
+  - how probabilities are mixed
+  - when post-batch updates happen
+- It only caches and reuses the already-determined valid indices for each order so the scorer stops rebuilding the same candidate set from full-length boolean masks each pass.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is index-slicing correctness when cutting a fixed batch cache down to per-window caches.
+- Risk is bounded because the change stays inside the existing cached scorer path and leaves formula/control flow intact.
+
+### Known Failures
+- Do not promote `508892d` as keep-line.
+- Do not reintroduce valid-count-cache or alpha-cache assumptions into the base packet.
+- Do not change Family B formula, order traversal, or update timing in this round.
