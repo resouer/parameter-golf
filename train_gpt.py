@@ -555,16 +555,27 @@ class StrictCausalBackoffMixer:
         self,
         order_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
     ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Prefetch per-order table counts once for a fixed key cache."""
+        """Prefetch per-order counts and precompute the deterministic n-gram mix probs."""
         count_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        min_count = float(self.min_count)
         for oi, (valid, ctx_key, full_key) in enumerate(order_cache):
-            ctx_counts = np.zeros(len(ctx_key), dtype=np.float64)
-            full_counts = np.zeros(len(full_key), dtype=np.float64)
+            can_mix = np.zeros(len(ctx_key), dtype=bool)
+            mix_prob = np.zeros(len(ctx_key), dtype=np.float64)
             if valid.any():
                 valid_idx = np.nonzero(valid)[0]
-                ctx_counts[valid_idx] = self.ctx_tables[oi][ctx_key[valid_idx]].astype(np.float64)
-                full_counts[valid_idx] = self.full_tables[oi][full_key[valid_idx]].astype(np.float64)
-            count_cache.append((valid, ctx_counts, full_counts))
+                ctx_counts = self.ctx_tables[oi][ctx_key[valid_idx]].astype(np.float64)
+                full_counts = self.full_tables[oi][full_key[valid_idx]].astype(np.float64)
+                can_mix_valid = ctx_counts >= min_count
+                if can_mix_valid.any():
+                    mix_idx = valid_idx[can_mix_valid]
+                    can_mix[mix_idx] = True
+                    mix_prob[mix_idx] = np.clip(
+                        np.minimum(full_counts[can_mix_valid], ctx_counts[can_mix_valid]) /
+                        np.maximum(ctx_counts[can_mix_valid], 1.0),
+                        0.0,
+                        1.0,
+                    )
+            count_cache.append((valid, can_mix, mix_prob))
         return count_cache
 
     def mix_target_probs_count_cached(
@@ -578,17 +589,12 @@ class StrictCausalBackoffMixer:
         mixed_mask = np.zeros(len(neural_target_probs), dtype=bool)
         for order in range(self.max_order, self.min_order - 1, -1):
             oi = order - self.min_order
-            valid, ctx_counts, full_counts = count_cache[oi]
-            can_consider = valid & ~mixed_mask
+            valid, can_mix, mix_prob = count_cache[oi]
+            can_consider = valid & can_mix & ~mixed_mask
             if not can_consider.any():
                 continue
-            v_idx = np.nonzero(can_consider)[0]
-            can_mix = ctx_counts[v_idx] >= float(self.min_count)
-            if not can_mix.any():
-                continue
-            mix_idx = v_idx[can_mix]
-            p_ng = np.minimum(full_counts[mix_idx], ctx_counts[mix_idx]) / np.maximum(ctx_counts[mix_idx], 1.0)
-            p_ng = np.clip(p_ng, 0.0, 1.0)
+            mix_idx = np.nonzero(can_consider)[0]
+            p_ng = mix_prob[mix_idx]
             alpha = self.alpha_base + self.alpha_range / (
                 1.0 + np.exp(-2.0 * (entropy[mix_idx] - self.alpha_center))
             )

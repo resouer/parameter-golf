@@ -471,3 +471,48 @@
 - Do not reopen synchronized/shared-pass reuse.
 - Do not change semantic base, parity surface, or Family B formula in this round.
 - If this sparse-update follow-up still cannot improve exact-tail behavior, escalate back to the next `#149` ladder rather than layering unbounded local tweaks.
+
+## [2026-03-31 04:37] Round 167
+
+### Research Findings
+- `#166` closed cleanly but did not promote over keep-line `#156`:
+  - `#156`: submission `1.11238486`, exact `0.39332185`, `TIMING:final_eval=1178.3s`
+  - `#166`: submission `1.11274166`, exact `0.39344189`, `TIMING:final_eval=1235.5s`
+- So the working base stays the confirmed sparse-update keep-line `c6e77c4`, not the later cache-index variants.
+- Inside the keep-line cached scorer, one remaining narrow hotspot is still repeated per-window arithmetic on already-prefetched counts:
+  - re-thresholding `ctx_counts[v_idx] >= min_count`
+  - recomputing `min(full_counts, ctx_counts) / ctx_counts`
+- Those quantities are deterministic functions of the prefetched counts and can be cached once per batch without changing scoring order or update timing.
+
+### Paradigm Assumptions
+- Reset to confirmed sparse-update keep-line `c6e77c4`.
+- Keep semantic/control anchor at `#142`.
+- Keep Family B formula, alpha schedule, order traversal, and post-batch update timing unchanged.
+- Only target deterministic reuse of prefetched count-derived mix probabilities inside the existing cached scorer path.
+
+### Frontier Snapshot
+- `#156` remains the promoted keep-line.
+- `#159/#160`, `#162`, and `#166` all closed cleanly but failed to beat `#156` cleanly enough to replace it.
+- The next bounded move should stay on `#156` and attack a tighter cached-scorer hotspot rather than changing family/base.
+
+### Comparable Methods
+- `#156`: promoted sparse-update keep-line.
+- `#164`: valid-index-cache on the keep-line, non-promoting.
+- `#166`: mixable-index-cache on the keep-line, non-promoting.
+- `#167`: precompute the deterministic n-gram mix probabilities from prefetched counts on the keep-line.
+
+### Novelty-Relevant Findings
+- The packet does not change which positions are eligible to mix.
+- It does not change how alpha is computed.
+- It does not change what counts are fetched or when updates are applied.
+- It only caches deterministic count-derived probabilities that the scorer already recomputes window after window.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is local implementation correctness in the cached scorer path.
+- Risk stays bounded because the patch does not alter Family B semantics, order traversal, or update timing.
+
+### Known Failures
+- Do not promote `59c0745` after `#166`.
+- Do not reopen non-promoted alpha/index cache variants as new bases.
+- Do not change parity surface, semantic anchor, or Family B formula in this round.

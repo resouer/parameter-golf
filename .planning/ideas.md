@@ -287,3 +287,32 @@
     - standalone count/state prefetch remains the keep-line
     - no Family B formula or control-flow change is introduced
     - the only delta is sparse post-batch update accumulation
+
+## [2026-03-31 04:37] Round 167
+
+### Research Findings
+- `#166` was a clean closeout but not a promotion over `#156`, so the next move must reset to keep-line `c6e77c4`.
+- The cached scorer on `c6e77c4` still repeats two deterministic count-derived operations on every window:
+  - thresholding prefetched `ctx_counts` against `min_count`
+  - converting prefetched `ctx/full` counts into the n-gram mix probability
+- A bounded keep-line follow-up is to precompute those deterministic count-derived quantities once per batch and reuse them during per-window scoring.
+
+### Decision
+- Build one bounded keep-line follow-up on top of `c6e77c4`:
+  - patch only the cached scorer/count-cache path in `train_gpt.py`
+  - precompute the deterministic n-gram mix probability from the prefetched counts
+  - keep Family B formula, alpha schedule, order traversal, and post-batch update timing unchanged
+- Deliver patch + pre-launch packet only.
+- No launch in this round.
+
+### Codex Review
+- Scope is:
+  - `train_gpt.py`
+  - mandatory `Round 167` planning-file updates
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean parity-targeted `run_lepton.py --dry-run --round 167 ...`
+  - packet writeup must state explicitly:
+    - keep-line remains `c6e77c4`
+    - the delta only caches deterministic count-derived n-gram probabilities
+    - no Family B formula, alpha schedule, or update timing changes are introduced

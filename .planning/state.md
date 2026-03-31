@@ -169,3 +169,19 @@ Current round: Round 142
   - replace dense full-bucket `np.bincount(..., minlength=...)` post-batch updates
   - use sparse unique-key accumulation only for the keys touched by the current batch
   - leave Family B scoring semantics and update order unchanged
+
+## [2026-03-31 04:37] Round 167
+
+- Current round: Round 167
+- Branch: `autoresearch/exp-familyb-ngram-prob-cache`
+- Base head: `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`
+- Deliverable: bounded keep-line follow-up that caches deterministic count-derived n-gram mix probabilities inside the Family B cached scorer
+- Scope:
+  - keep confirmed sparse-update keep-line `c6e77c4`
+  - keep semantic/control anchor at `#142`
+  - patch `train_gpt.py`
+  - no launch in this round
+- Intended delta:
+  - precompute the `ctx/full` count threshold and n-gram mix probability once per cached batch span
+  - reuse those cached values during per-window scoring
+  - leave Family B formula, alpha schedule, order traversal, and post-batch update timing unchanged
