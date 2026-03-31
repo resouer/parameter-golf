@@ -217,3 +217,49 @@
 - `#124` remains the negative control for unsafe exact-tail acceleration.
 - `#136` remains the negative control for parity launch-spec omission; it is no longer the governing explanation after `#142`.
 - Shared-pass timing must still be interpreted as shared exact-tail cost when `FAMILYB_REUSE_SLIDING_PASS=1` is enabled.
+
+## [2026-03-30 17:24] Round 146
+
+### Research Findings
+- `#143` cleanly separated runtime and semantics:
+  - runtime win was real (`1656267ms -> 261095ms`, `1790.8s -> 284.6s`)
+  - semantic preservation failed hard (`0.39344583 -> 0.82366213`)
+- The postmortem pinned the exact cause:
+  - safe standalone Family B path requires all ranks to process the same windows in the same order
+  - `#143` instead created rank-local mixers on rank-sharded sliding windows and only all-reduced scalar totals
+- That means the valid next move is not to abandon reuse entirely, but to repair the orchestration boundary so one authoritative Family B state sees one global window order again.
+
+### Paradigm Assumptions
+- Keep the parity-confirmed `#142` Family B formula unchanged.
+- Keep the reuse-pass objective bounded to exact-tail implementation only.
+- The repair must avoid the unsafe pattern of rank-local mixer updates on sharded windows.
+
+### Frontier Snapshot
+- `#142` remains the semantic control and parity-confirmed keep-base.
+- `#143` is now runtime-win / semantic-failure evidence, not a launch candidate.
+- Under the single-node budget, the highest-EV next move is a safe repair that preserves the speed idea while restoring exact Family B state semantics.
+
+### Comparable Methods
+- `#142` is the control.
+- `#143` is the negative control for rank-sharded reuse.
+- The safe repair target is between them:
+  - keep the shared-pass reuse idea
+  - remove rank-local Family B state
+  - reintroduce one global Family B update order
+
+### Novelty-Relevant Findings
+- The safe repair is a synchronized global-batch reuse path:
+  - keep sliding exact sharded for its own metric
+  - gather per-window Family B payloads from all ranks back into one global order
+  - score/update one authoritative mixer state from that gathered order
+- This keeps the model-forward reuse idea while restoring the semantic invariant that `#143` violated.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is no longer rank-sharded state, but communication/orchestration mistakes while reconstructing global order.
+- Local validation remains bounded to code inspection, `py_compile`, and launcher dry-run; this shell still lacks a deeper semantic A/B harness.
+
+### Known Failures
+- Do not relaunch the current `#143` implementation.
+- Do not use all-reduced scalar totals as a substitute for synchronized Family B mixer state.
+- Any future reuse path that updates more than one independent mixer over disjoint window histories is out of bounds.

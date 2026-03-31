@@ -1,4 +1,4 @@
-Current round: Round 143
+Current round: Round 146
 
 ## [2026-03-30 09:40] Round 116
 
@@ -66,3 +66,18 @@ Current round: Round 143
   - enable the already-prepared sliding-pass reuse path as the chosen next bounded packet
   - reuse the already-required sliding exact pass when `FAMILYB_REUSE_SLIDING_PASS=1`
   - keep the old standalone `eval_val_causal_backoff_mixer(...)` path available as the fallback
+
+## [2026-03-30 17:24] Round 146
+
+- Current round: Round 146
+- Branch: `autoresearch/exp-familyb-reuse-sliding-sync`
+- Base head: `907640e977ee41768db004f4e39171e605c7e4ee`
+- Deliverable: strict-legal `Family B` safe repair packet after the `#143` rank-sharded reuse semantic failure
+- Scope:
+  - keep the same parity-confirmed `#142` Family B scoring semantics
+  - patch `train_gpt.py`
+  - no launch in this round
+- Intended delta:
+  - replace rank-local reuse with synchronized global-batch payload gathering
+  - let one authoritative mixer state score gathered Family B windows in global order
+  - keep the standalone `eval_val_causal_backoff_mixer(...)` path available as the fallback

@@ -616,13 +616,35 @@ def _score_causal_backoff_batch(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float, float]:
-    batch_target_probs: list[np.ndarray] = []
-    batch_entropy: list[np.ndarray] = []
-    batch_prev: list[Tensor] = []
-    batch_tgt: list[Tensor] = []
-    window_specs: list[tuple[int, int]] = []
-    scored_start: int | None = None
-    scored_end: int | None = None
+    prepared_windows = _prepare_causal_backoff_windows(
+        batch_ws=batch_ws,
+        wlens=wlens,
+        stride=stride,
+        x_batch=x_batch,
+        y_batch=y_batch,
+        probs=probs,
+        log_probs=log_probs,
+    )
+    return _score_causal_backoff_prepared_windows(
+        mixer=mixer,
+        val_np=val_np,
+        prepared_windows=prepared_windows,
+        base_bytes_lut=base_bytes_lut,
+        has_leading_space_lut=has_leading_space_lut,
+        is_boundary_token_lut=is_boundary_token_lut,
+    )
+
+
+def _prepare_causal_backoff_windows(
+    batch_ws: list[int],
+    wlens: list[int],
+    stride: int,
+    x_batch: Tensor,
+    y_batch: Tensor,
+    probs: Tensor,
+    log_probs: Tensor,
+) -> list[tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    prepared_windows: list[tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     for i, ws in enumerate(batch_ws):
         wlen = wlens[i]
         s = 0 if ws == 0 else max(wlen - stride, 0)
@@ -633,17 +655,37 @@ def _score_causal_backoff_batch(
         prev = x_batch[i, s:wlen]
         target_probs = probs[i, s:wlen].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
         entropy = -(probs[i, s:wlen] * log_probs[i, s:wlen]).sum(dim=-1)
-        batch_target_probs.append(target_probs.to(torch.float64).cpu().numpy())
-        batch_entropy.append(entropy.to(torch.float64).cpu().numpy())
-        batch_prev.append(prev.cpu())
-        batch_tgt.append(tgt.cpu())
         seg_start = ws + s + 1
         seg_end = ws + wlen + 1
-        window_specs.append((seg_start, seg_end))
-        scored_start = seg_start if scored_start is None else min(scored_start, seg_start)
-        scored_end = seg_end if scored_end is None else max(scored_end, seg_end)
-    if scored_start is None or scored_end is None:
+        prepared_windows.append(
+            (
+                ws,
+                seg_start,
+                seg_end,
+                target_probs.to(torch.float64).cpu().numpy(),
+                entropy.to(torch.float64).cpu().numpy(),
+                prev.cpu().numpy(),
+                tgt.cpu().numpy(),
+            )
+        )
+    return prepared_windows
+
+
+def _score_causal_backoff_prepared_windows(
+    mixer: StrictCausalBackoffMixer,
+    val_np: np.ndarray,
+    prepared_windows: list[tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float, float]:
+    if not prepared_windows:
         return 0.0, 0.0, 0.0
+    batch_target_probs = [target_probs for _, _, _, target_probs, _, _, _ in prepared_windows]
+    batch_entropy = [entropy for _, _, _, _, entropy, _, _ in prepared_windows]
+    window_specs = [(seg_start, seg_end) for _, seg_start, seg_end, _, _, _, _ in prepared_windows]
+    scored_start = min(seg_start for _, seg_start, _, _, _, _, _ in prepared_windows)
+    scored_end = max(seg_end for _, _, seg_end, _, _, _, _ in prepared_windows)
     mixed_windows = mixer.score_windows_with_batch_update_cache(
         val_np=val_np,
         batch_start=scored_start,
@@ -655,7 +697,9 @@ def _score_causal_backoff_batch(
     loss_sum = 0.0
     token_count = 0.0
     byte_count = 0.0
-    for mixed_probs, tgt, prev in zip(mixed_windows, batch_tgt, batch_prev):
+    for mixed_probs, (_, _, _, _, _, prev_np, tgt_np) in zip(mixed_windows, prepared_windows):
+        prev = torch.from_numpy(prev_np)
+        tgt = torch.from_numpy(tgt_np)
         seg_nll = -np.log(np.clip(mixed_probs, 1e-12, 1.0))
         loss_sum += float(seg_nll.sum())
         token_count += float(len(mixed_probs))
@@ -1575,12 +1619,10 @@ def eval_val_sliding(
     """Sliding window evaluation: each token scored with maximum context."""
     seq_len = eval_seq_len or args.train_seq_len
     total_tokens = val_tokens.numel() - 1
-    window_starts = [ws for ws in range(0, total_tokens, stride)
-                     if min(ws + seq_len, total_tokens) - ws >= 1]
-    total_windows = len(window_starts)
-    my_s = (total_windows * rank) // world_size
-    my_e = (total_windows * (rank + 1)) // world_size
-    my_windows = window_starts[my_s:my_e]
+    window_starts = [
+        ws for ws in range(0, total_tokens, stride)
+        if min(ws + seq_len, total_tokens) - ws >= 1
+    ]
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -1590,6 +1632,10 @@ def eval_val_sliding(
     fb_byte_count = 0.0
     val_np = val_tokens.numpy() if reuse_familyb else None
     effective_batch_seqs = max(batch_seqs, args.ngram_batch_seqs) if reuse_familyb else batch_seqs
+    total_windows = len(window_starts)
+    my_s = (total_windows * rank) // world_size
+    my_e = (total_windows * (rank + 1)) // world_size
+    my_windows = window_starts[my_s:my_e]
     mixer = (
         StrictCausalBackoffMixer(
             num_buckets=args.ngram_buckets,
@@ -1606,46 +1652,45 @@ def eval_val_sliding(
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     with torch.inference_mode():
-        for bi in range(0, len(my_windows), effective_batch_seqs):
-            batch_ws = my_windows[bi:bi + effective_batch_seqs]
-            bsz = len(batch_ws)
-            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-            wlens: list[int] = []
-            for i, ws in enumerate(batch_ws):
-                end = min(ws + seq_len, total_tokens)
-                wlen = end - ws
-                wlens.append(wlen)
-                chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
-                x_batch[i, :wlen] = chunk[:-1]
-                y_batch[i, :wlen] = chunk[1:]
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = compiled_logits(x_batch)
-            if reuse_familyb:
-                log_probs = F.log_softmax(logits.float(), dim=-1)
-                probs = log_probs.exp()
-                nll = -log_probs.gather(-1, y_batch.unsqueeze(-1)).squeeze(-1)
-            else:
-                nll = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)).float(),
-                    y_batch.reshape(-1),
-                    reduction="none",
-                ).reshape(bsz, seq_len)
-            for i, ws in enumerate(batch_ws):
-                wlen = wlens[i]
-                s = 0 if ws == 0 else max(wlen - stride, 0)
-                scored_nll = nll[i, s:wlen].to(torch.float64)
-                loss_sum += scored_nll.sum()
-                token_count += float(wlen - s)
-                tgt = y_batch[i, s:wlen]
-                prev = x_batch[i, s:wlen]
-                tb = base_bytes_lut[tgt].to(torch.float64)
-                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                byte_count += tb.sum()
-            if reuse_familyb and mixer is not None and val_np is not None:
-                batch_loss, batch_tokens, batch_bytes = _score_causal_backoff_batch(
-                    mixer=mixer,
-                    val_np=val_np,
+        if reuse_familyb:
+            global_batch_seqs = effective_batch_seqs * world_size
+            for bi in range(0, len(window_starts), global_batch_seqs):
+                global_batch_ws = window_starts[bi:bi + global_batch_seqs]
+                my_lo = rank * effective_batch_seqs
+                batch_ws = global_batch_ws[my_lo:my_lo + effective_batch_seqs]
+                bsz = len(batch_ws)
+                x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                wlens: list[int] = []
+                for i, ws in enumerate(batch_ws):
+                    end = min(ws + seq_len, total_tokens)
+                    wlen = end - ws
+                    wlens.append(wlen)
+                    chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                    x_batch[i, :wlen] = chunk[:-1]
+                    y_batch[i, :wlen] = chunk[1:]
+                if bsz > 0:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        logits = compiled_logits(x_batch)
+                    log_probs = F.log_softmax(logits.float(), dim=-1)
+                    probs = log_probs.exp()
+                    nll = -log_probs.gather(-1, y_batch.unsqueeze(-1)).squeeze(-1)
+                else:
+                    log_probs = torch.empty((0, seq_len, 0), dtype=torch.float32, device=device)
+                    probs = torch.empty((0, seq_len, 0), dtype=torch.float32, device=device)
+                    nll = torch.empty((0, seq_len), dtype=torch.float32, device=device)
+                for i, ws in enumerate(batch_ws):
+                    wlen = wlens[i]
+                    s = 0 if ws == 0 else max(wlen - stride, 0)
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
+                    loss_sum += scored_nll.sum()
+                    token_count += float(wlen - s)
+                    tgt = y_batch[i, s:wlen]
+                    prev = x_batch[i, s:wlen]
+                    tb = base_bytes_lut[tgt].to(torch.float64)
+                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                    byte_count += tb.sum()
+                local_prepared = _prepare_causal_backoff_windows(
                     batch_ws=batch_ws,
                     wlens=wlens,
                     stride=stride,
@@ -1653,13 +1698,71 @@ def eval_val_sliding(
                     y_batch=y_batch,
                     probs=probs,
                     log_probs=log_probs,
-                    base_bytes_lut=base_bytes_lut,
-                    has_leading_space_lut=has_leading_space_lut,
-                    is_boundary_token_lut=is_boundary_token_lut,
                 )
-                fb_loss_sum += batch_loss
-                fb_token_count += batch_tokens
-                fb_byte_count += batch_bytes
+                if dist.is_available() and dist.is_initialized():
+                    gathered_prepared: list[list[tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] | None] = [None] * world_size
+                    dist.all_gather_object(gathered_prepared, local_prepared)
+                    prepared_windows = []
+                    if rank == 0:
+                        for rank_windows in gathered_prepared:
+                            if rank_windows:
+                                prepared_windows.extend(rank_windows)
+                        prepared_windows.sort(key=lambda item: item[0])
+                        batch_loss, batch_tokens, batch_bytes = _score_causal_backoff_prepared_windows(
+                            mixer=mixer,
+                            val_np=val_np,
+                            prepared_windows=prepared_windows,
+                            base_bytes_lut=base_bytes_lut,
+                            has_leading_space_lut=has_leading_space_lut,
+                            is_boundary_token_lut=is_boundary_token_lut,
+                        )
+                        fb_loss_sum += batch_loss
+                        fb_token_count += batch_tokens
+                        fb_byte_count += batch_bytes
+                else:
+                    batch_loss, batch_tokens, batch_bytes = _score_causal_backoff_prepared_windows(
+                        mixer=mixer,
+                        val_np=val_np,
+                        prepared_windows=local_prepared,
+                        base_bytes_lut=base_bytes_lut,
+                        has_leading_space_lut=has_leading_space_lut,
+                        is_boundary_token_lut=is_boundary_token_lut,
+                    )
+                    fb_loss_sum += batch_loss
+                    fb_token_count += batch_tokens
+                    fb_byte_count += batch_bytes
+        else:
+            for bi in range(0, len(my_windows), effective_batch_seqs):
+                batch_ws = my_windows[bi:bi + effective_batch_seqs]
+                bsz = len(batch_ws)
+                x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                wlens: list[int] = []
+                for i, ws in enumerate(batch_ws):
+                    end = min(ws + seq_len, total_tokens)
+                    wlen = end - ws
+                    wlens.append(wlen)
+                    chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                    x_batch[i, :wlen] = chunk[:-1]
+                    y_batch[i, :wlen] = chunk[1:]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = compiled_logits(x_batch)
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1),
+                    reduction="none",
+                ).reshape(bsz, seq_len)
+                for i, ws in enumerate(batch_ws):
+                    wlen = wlens[i]
+                    s = 0 if ws == 0 else max(wlen - stride, 0)
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
+                    loss_sum += scored_nll.sum()
+                    token_count += float(wlen - s)
+                    tgt = y_batch[i, s:wlen]
+                    prev = x_batch[i, s:wlen]
+                    tb = base_bytes_lut[tgt].to(torch.float64)
+                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                    byte_count += tb.sum()
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
@@ -1673,7 +1776,6 @@ def eval_val_sliding(
     if dist.is_available() and dist.is_initialized():
         fb_totals = torch.tensor([fb_loss_sum, fb_token_count, fb_byte_count], device=device, dtype=torch.float64)
         dist.all_reduce(fb_totals, op=dist.ReduceOp.SUM)
-        fb_totals /= float(world_size)
         fb_loss_sum = float(fb_totals[0].item())
         fb_token_count = float(fb_totals[1].item())
         fb_byte_count = float(fb_totals[2].item())

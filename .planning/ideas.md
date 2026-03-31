@@ -113,3 +113,30 @@
     - keep-base is parity-confirmed `#142`
     - bounded EV is to attack the remaining standalone Family B closeout pass
     - this is still a no-launch packet, not a new family/search pivot
+
+## [2026-03-30 17:24] Round 146
+
+### Research Findings
+- `#143` proved the reuse-pass idea can deliver a real runtime win, but its first implementation was not behavior-preserving:
+  - `#142`: `final_int6_causal_backoff_exact val_bpb:0.39344583`, `TIMING:final_eval=1790.8s`
+  - `#143`: `final_int6_causal_backoff_exact val_bpb:0.82366213`, `TIMING:final_eval=284.6s`
+- The exact culprit is not parity drift or a changed Family B formula.
+- The culprit is that `#143` piggybacked Family B scoring onto rank-sharded sliding eval, so each rank updated a local mixer on only its own `my_windows` slice.
+
+### Decision
+- Keep `#142` as the semantic base and keep the bounded reuse-pass objective.
+- Replace the unsafe rank-local reuse path with a synchronized global-batch reuse path:
+  - sliding exact may stay rank-sharded for the neural metric
+  - but Family B window payloads must be gathered back into one global order before any mixer update happens
+  - a single authoritative mixer state should score those gathered windows
+- Keep the old standalone causal-backoff path as the fallback when the reuse flag is off.
+
+### Codex Review
+- Scope remains `train_gpt.py` plus the mandatory `Round 146` planning-file updates.
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean `run_lepton.py --dry-run --round 146 --env USE_NGRAM_MIXER=1 --env FAMILYB_REUSE_SLIDING_PASS=1 ...`
+  - packet writeup must state the safe repair boundary explicitly:
+    - no rank-sharded Family B mixer state
+    - gathered global order before any reuse-path mixer update
+    - no launch in this round
