@@ -496,11 +496,12 @@ class StrictCausalBackoffMixer:
 
     def build_order_cache(
         self,
-        val_np: np.ndarray,
+        val_u64: np.ndarray,
         global_targets: np.ndarray,
     ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Precompute per-order context/full-key arrays for a fixed target list."""
         order_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        target_u64 = val_u64[global_targets]
         for order in range(self.min_order, self.max_order + 1):
             ctx_width = order - 1
             valid = global_targets >= ctx_width
@@ -510,12 +511,10 @@ class StrictCausalBackoffMixer:
                 jv = global_targets[valid]
                 ctx_hash = np.zeros(len(jv), dtype=np.uint64)
                 for k in range(ctx_width):
-                    tok = val_np[jv - ctx_width + k].astype(np.uint64)
-                    ctx_hash ^= tok * NGRAM_PRIMES[k % len(NGRAM_PRIMES)]
+                    ctx_hash ^= val_u64[jv - ctx_width + k] * NGRAM_PRIMES[k % len(NGRAM_PRIMES)]
                 ctx_key[valid] = (ctx_hash & self.mask).astype(np.int64)
-                tgt = val_np[jv].astype(np.uint64)
                 full_key[valid] = (
-                    (ctx_hash ^ (tgt * NGRAM_PRIMES[ctx_width % len(NGRAM_PRIMES)])) & self.mask
+                    (ctx_hash ^ (target_u64[valid] * NGRAM_PRIMES[ctx_width % len(NGRAM_PRIMES)])) & self.mask
                 ).astype(np.int64)
             order_cache.append((valid, ctx_key, full_key))
         return order_cache
@@ -622,17 +621,17 @@ class StrictCausalBackoffMixer:
         neural_target_probs: np.ndarray,
         entropy: np.ndarray,
     ) -> np.ndarray:
-        order_cache = self.build_order_cache(val_np, global_targets)
+        order_cache = self.build_order_cache(val_np.astype(np.uint64, copy=False), global_targets)
         return self.mix_target_probs_cached(neural_target_probs, entropy, order_cache)
 
     def update(self, val_np: np.ndarray, start_target: int, end_target: int) -> None:
         global_targets = np.arange(start_target, end_target, dtype=np.int64)
-        order_cache = self.build_order_cache(val_np, global_targets)
+        order_cache = self.build_order_cache(val_np.astype(np.uint64, copy=False), global_targets)
         self.update_from_cache(order_cache)
 
     def score_windows_with_batch_update_cache(
         self,
-        val_np: np.ndarray,
+        val_u64: np.ndarray,
         batch_start: int,
         batch_end: int,
         window_specs: list[tuple[int, int]],
@@ -647,7 +646,7 @@ class StrictCausalBackoffMixer:
         per-window score, and finally reused for the single post-batch update.
         """
         batch_targets = np.arange(batch_start, batch_end, dtype=np.int64)
-        batch_cache = self.build_order_cache(val_np, batch_targets)
+        batch_cache = self.build_order_cache(val_u64, batch_targets)
         batch_count_cache = self.build_count_cache(batch_cache)
         scored_windows: list[np.ndarray] = []
         for (seg_start, seg_end), target_prob_np, entropy_np in zip(window_specs, neural_target_probs, entropy):
@@ -693,6 +692,7 @@ def eval_val_causal_backoff_mixer(
     token_count = 0.0
     byte_count = 0.0
     val_np = val_tokens.numpy()
+    val_u64 = val_np.astype(np.uint64, copy=False)
     mixer = StrictCausalBackoffMixer(
         num_buckets=args.ngram_buckets,
         max_order=args.ngram_order,
@@ -751,7 +751,7 @@ def eval_val_causal_backoff_mixer(
             if scored_start is None or scored_end is None:
                 continue
             mixed_windows = mixer.score_windows_with_batch_update_cache(
-                val_np=val_np,
+                val_u64=val_u64,
                 batch_start=scored_start,
                 batch_end=scored_end,
                 window_specs=window_specs,

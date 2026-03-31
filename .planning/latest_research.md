@@ -471,3 +471,47 @@
 - Do not reopen synchronized/shared-pass reuse.
 - Do not change semantic base, parity surface, or Family B formula in this round.
 - If this sparse-update follow-up still cannot improve exact-tail behavior, escalate back to the next `#149` ladder rather than layering unbounded local tweaks.
+
+## [2026-03-31 05:39] Round 169
+
+### Research Findings
+- `#168` closed cleanly but did not promote over keep-line `#156`:
+  - `#156`: submission `1.11238486`, exact `0.39332185`, `TIMING:final_eval=1178.3s`
+  - `#168`: submission `1.11275771`, exact `0.39367945`, `TIMING:final_eval=1179.3s`
+- So the working base resets to confirmed sparse-update keep-line `c6e77c4`.
+- The remaining untested hotspot inside the same Family B path is earlier than the per-window scorer:
+  - `build_order_cache(...)` still repeats `astype(np.uint64)` conversions on context/target slices for every order and batch
+  - and it re-fetches the target-token slice on every order even though `global_targets` is fixed per batch
+- A bounded keep-line follow-up is to reuse a `uint64` view of the validation tokens and prefetch the target-token slice once per batch while leaving the hashing formula unchanged.
+
+### Paradigm Assumptions
+- Reset to confirmed sparse-update keep-line `c6e77c4`.
+- Keep semantic/control anchor at `#142`.
+- Keep Family B hashing formula, scorer logic, order traversal, and post-batch update timing unchanged.
+- Only target repeated type-conversion / target-slice prep inside `build_order_cache(...)`.
+
+### Frontier Snapshot
+- `#156` remains the promoted keep-line.
+- Later keep-line-local follow-ups (`#164`, `#166`, `#168`) all closed cleanly but failed to replace `#156`.
+- The next bounded move should stay on `#156` and attack a different narrow exact-tail hotspot than the previously tried index/probability cache variants.
+
+### Comparable Methods
+- `#156`: promoted sparse-update keep-line.
+- `#166`: mixable-index-cache on keep-line, non-promoting.
+- `#168`: ngram-prob-cache on keep-line, non-promoting.
+- `#169`: `uint64` order-cache prep reuse on the same keep-line.
+
+### Novelty-Relevant Findings
+- The packet does not change which windows, contexts, or targets are hashed.
+- It does not change the hash formula or bucket mapping.
+- It only reuses a `uint64` token view and prefetches the fixed target-token slice once per batch so the same deterministic data-prep work is not repeated every order.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is local implementation correctness in order-cache construction.
+- Risk stays bounded because the hash math itself is unchanged; only repeated conversions/lookups are removed.
+
+### Known Failures
+- Do not promote `3d5ff1f` after `#168`.
+- Do not reopen non-promoted keep-line cache variants as new bases.
+- Do not change parity surface, semantic anchor, or Family B formula in this round.

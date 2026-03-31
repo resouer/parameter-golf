@@ -169,3 +169,19 @@ Current round: Round 142
   - replace dense full-bucket `np.bincount(..., minlength=...)` post-batch updates
   - use sparse unique-key accumulation only for the keys touched by the current batch
   - leave Family B scoring semantics and update order unchanged
+
+## [2026-03-31 05:39] Round 169
+
+- Current round: Round 169
+- Branch: `autoresearch/exp-familyb-u64-order-cache`
+- Base head: `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`
+- Deliverable: bounded keep-line follow-up that reuses `uint64` token prep inside Family B order-cache construction
+- Scope:
+  - keep confirmed sparse-update keep-line `c6e77c4`
+  - keep semantic/control anchor at `#142`
+  - patch `train_gpt.py`
+  - no launch in this round
+- Intended delta:
+  - reuse a `uint64` view of validation tokens across order-cache construction
+  - prefetch the fixed target-token slice once per batch before the per-order loop
+  - leave Family B hash formula, scorer logic, and update timing unchanged

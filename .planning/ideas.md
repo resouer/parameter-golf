@@ -287,3 +287,33 @@
     - standalone count/state prefetch remains the keep-line
     - no Family B formula or control-flow change is introduced
     - the only delta is sparse post-batch update accumulation
+
+## [2026-03-31 05:39] Round 169
+
+### Research Findings
+- `#168` was a clean closeout but not a promotion over `#156`, so the next move must reset to keep-line `c6e77c4`.
+- Earlier follow-ups targeted cached scorer/index/probability work inside the same path.
+- A new bounded hotspot remains in `build_order_cache(...)` itself:
+  - repeated `astype(np.uint64)` conversions on context/target slices
+  - repeated target-token lookup for every order even though the target list is fixed per batch
+- A bounded keep-line follow-up is to reuse a `uint64` token view and prefetch the fixed target-token slice once per batch while leaving the hash math unchanged.
+
+### Decision
+- Build one bounded keep-line follow-up on top of `c6e77c4`:
+  - patch only `train_gpt.py`
+  - keep the Family B hash formula identical
+  - remove repeated `uint64` conversions / target-slice prep in `build_order_cache(...)`
+- Deliver patch + pre-launch packet only.
+- No launch in this round.
+
+### Codex Review
+- Scope is:
+  - `train_gpt.py`
+  - mandatory `Round 169` planning-file updates
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean parity-targeted `run_lepton.py --dry-run --round 169 ...`
+  - packet writeup must state explicitly:
+    - keep-line remains `c6e77c4`
+    - the delta only reuses deterministic `uint64` token prep in order-cache construction
+    - no Family B hash formula, scorer logic, or update timing changes are introduced
