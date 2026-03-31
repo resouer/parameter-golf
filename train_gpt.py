@@ -555,16 +555,19 @@ class StrictCausalBackoffMixer:
         self,
         order_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
     ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Prefetch per-order table counts once for a fixed key cache."""
+        """Prefetch per-order counts and cache positions that already satisfy min_count."""
         count_cache: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        min_count = float(self.min_count)
         for oi, (valid, ctx_key, full_key) in enumerate(order_cache):
             ctx_counts = np.zeros(len(ctx_key), dtype=np.float64)
             full_counts = np.zeros(len(full_key), dtype=np.float64)
+            mixable_idx = np.empty(0, dtype=np.int64)
             if valid.any():
                 valid_idx = np.nonzero(valid)[0]
                 ctx_counts[valid_idx] = self.ctx_tables[oi][ctx_key[valid_idx]].astype(np.float64)
                 full_counts[valid_idx] = self.full_tables[oi][full_key[valid_idx]].astype(np.float64)
-            count_cache.append((valid, ctx_counts, full_counts))
+                mixable_idx = valid_idx[ctx_counts[valid_idx] >= min_count]
+            count_cache.append((mixable_idx, ctx_counts, full_counts))
         return count_cache
 
     def mix_target_probs_count_cached(
@@ -578,15 +581,12 @@ class StrictCausalBackoffMixer:
         mixed_mask = np.zeros(len(neural_target_probs), dtype=bool)
         for order in range(self.max_order, self.min_order - 1, -1):
             oi = order - self.min_order
-            valid, ctx_counts, full_counts = count_cache[oi]
-            can_consider = valid & ~mixed_mask
-            if not can_consider.any():
+            mixable_idx, ctx_counts, full_counts = count_cache[oi]
+            if len(mixable_idx) == 0:
                 continue
-            v_idx = np.nonzero(can_consider)[0]
-            can_mix = ctx_counts[v_idx] >= float(self.min_count)
-            if not can_mix.any():
+            mix_idx = mixable_idx[~mixed_mask[mixable_idx]]
+            if len(mix_idx) == 0:
                 continue
-            mix_idx = v_idx[can_mix]
             p_ng = np.minimum(full_counts[mix_idx], ctx_counts[mix_idx]) / np.maximum(ctx_counts[mix_idx], 1.0)
             p_ng = np.clip(p_ng, 0.0, 1.0)
             alpha = self.alpha_base + self.alpha_range / (
@@ -654,8 +654,12 @@ class StrictCausalBackoffMixer:
             lo = seg_start - batch_start
             hi = seg_end - batch_start
             window_count_cache = [
-                (valid[lo:hi], ctx_counts[lo:hi], full_counts[lo:hi])
-                for valid, ctx_counts, full_counts in batch_count_cache
+                (
+                    mixable_idx[(mixable_idx >= lo) & (mixable_idx < hi)] - lo,
+                    ctx_counts[lo:hi],
+                    full_counts[lo:hi],
+                )
+                for mixable_idx, ctx_counts, full_counts in batch_count_cache
             ]
             scored_windows.append(self.mix_target_probs_count_cached(target_prob_np, entropy_np, window_count_cache))
         self.update_from_cache(batch_cache)

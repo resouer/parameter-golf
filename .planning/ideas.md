@@ -287,3 +287,30 @@
     - standalone count/state prefetch remains the keep-line
     - no Family B formula or control-flow change is introduced
     - the only delta is sparse post-batch update accumulation
+
+## [2026-03-31 03:36] Round 165
+
+### Research Findings
+- Sparse-update `c6e77c4` remains the confirmed keep-line after valid-index-cache `2e38d38` failed to promote on `#164`.
+- The remaining bounded hotspot in the count-cached scorer is repeated `min_count` thresholding over counts that were already prefetched once for the fixed batch cache.
+
+### Decision
+- Build one bounded mixable-index-cache follow-up on top of sparse-update keep-line `c6e77c4`.
+- Patch only `train_gpt.py` plus mandatory `Round 165` planning-file updates.
+- Keep:
+  - semantic anchor `#142`
+  - sparse-update keep-line behavior
+  - full parity/full-Family-B launch surface
+- No launch in this round.
+
+### Codex Review
+- Scope is:
+  - `train_gpt.py`
+  - mandatory `Round 165` planning-file updates
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean parity/full-Family-B `run_lepton.py --dry-run --round 165 ...`
+  - packet writeup must state explicitly:
+    - keep-line remains `c6e77c4`
+    - `2e38d38` is not promoted
+    - the only delta is caching/reusing the already-eligible `min_count` positions inside the count-cached scorer path

@@ -471,3 +471,47 @@
 - Do not reopen synchronized/shared-pass reuse.
 - Do not change semantic base, parity surface, or Family B formula in this round.
 - If this sparse-update follow-up still cannot improve exact-tail behavior, escalate back to the next `#149` ladder rather than layering unbounded local tweaks.
+
+## [2026-03-31 03:36] Round 165
+
+### Research Findings
+- `#164` showed that valid-index-cache (`2e38d38`) closed cleanly but was not a promotion over sparse-update keep-line `#156`.
+- Keep-line therefore remains sparse-update `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`.
+- Inside the keep-line exact-tail path, `build_count_cache(...)` already prefetches the per-order counts for the fixed batch cache.
+- But `mix_target_probs_count_cached(...)` still rechecks the same prefetched counts against `min_count` on every window score pass, even though that pass/fail set is already determined once the counts are prefetched.
+
+### Paradigm Assumptions
+- Keep semantic anchor at `#142`.
+- Keep sparse-update `c6e77c4` as the working line.
+- Keep Family B formula, order traversal, and single post-batch update semantics unchanged.
+- Only optimize how the count-cached scorer reuses the already-known mixable positions for the fixed batch cache.
+
+### Frontier Snapshot
+- `#156` remains the reference keep-line result to beat:
+  - submission `1.11238486`
+  - exact `0.39332185`
+  - `TIMING:final_eval=1178.3s`
+- `#164` ruled out valid-index-cache as a promotion.
+- The next packet should stay on `c6e77c4` and remain tightly bounded inside the existing count-cached scorer path.
+
+### Comparable Methods
+- `#156`: sparse-update keep-line.
+- `#163/#164`: valid-index-cache follow-up, clean but clearly non-promoting.
+- `#165`: mixable-index-cache follow-up, caching the subset of positions that already clear `min_count` from the prefetched count cache.
+
+### Novelty-Relevant Findings
+- This follow-up does not change:
+  - which counts are prefetched
+  - which positions satisfy the `min_count` rule
+  - how probabilities are mixed once a position is eligible
+- It only caches the already-determined `min_count`-eligible indices once and reuses that subset across per-window scoring.
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is index-slicing correctness when turning batch-level eligible positions into per-window eligible positions.
+- Risk is bounded because the change stays inside the count-cached scorer path and leaves formula/control flow intact.
+
+### Known Failures
+- Do not promote `2e38d38` as keep-line.
+- Do not change Family B formula, alpha schedule, order traversal, or post-batch update semantics in this round.
+- Do not reopen valid-count-cache or alpha-cache as the base for this packet.

@@ -169,3 +169,19 @@ Current round: Round 142
   - replace dense full-bucket `np.bincount(..., minlength=...)` post-batch updates
   - use sparse unique-key accumulation only for the keys touched by the current batch
   - leave Family B scoring semantics and update order unchanged
+
+## [2026-03-31 03:36] Round 165
+
+- Current round: Round 165
+- Branch: `autoresearch/exp-familyb-mixable-index-cache`
+- Base head: `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`
+- Deliverable: bounded mixable-index-cache follow-up on top of the confirmed sparse-update keep-line
+- Scope:
+  - keep semantic anchor at `#142`
+  - keep sparse-update `c6e77c4` as the working line
+  - patch `train_gpt.py`
+  - no launch in this round
+- Intended delta:
+  - precompute the per-order positions that already satisfy `min_count` from the prefetched count cache
+  - reuse those eligible positions in the count-cached scorer instead of re-thresholding the same cached counts every window pass
+  - preserve Family B formula, order traversal, and single post-batch update semantics
