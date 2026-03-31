@@ -528,6 +528,7 @@ class StrictCausalBackoffMixer:
     ) -> np.ndarray:
         mixed = neural_target_probs.copy()
         mixed_mask = np.zeros(len(neural_target_probs), dtype=bool)
+        alpha_by_pos = self._alpha_from_entropy(entropy)
         for order in range(self.max_order, self.min_order - 1, -1):
             oi = order - self.min_order
             valid, ctx_key, full_key = order_cache[oi]
@@ -543,10 +544,7 @@ class StrictCausalBackoffMixer:
             mix_idx = v_idx[can_mix]
             p_ng = np.minimum(full_counts[can_mix], ctx_counts[can_mix]) / np.maximum(ctx_counts[can_mix], 1.0)
             p_ng = np.clip(p_ng, 0.0, 1.0)
-            alpha = self.alpha_base + self.alpha_range / (
-                1.0 + np.exp(-2.0 * (entropy[mix_idx] - self.alpha_center))
-            )
-            alpha = np.clip(alpha, 0.0, 0.95)
+            alpha = alpha_by_pos[mix_idx]
             mixed[mix_idx] = (1.0 - alpha) * mixed[mix_idx] + alpha * p_ng
             mixed_mask[mix_idx] = True
         return mixed
@@ -576,6 +574,7 @@ class StrictCausalBackoffMixer:
         """Score one window using pre-fetched table counts for its key cache."""
         mixed = neural_target_probs.copy()
         mixed_mask = np.zeros(len(neural_target_probs), dtype=bool)
+        alpha_by_pos = self._alpha_from_entropy(entropy)
         for order in range(self.max_order, self.min_order - 1, -1):
             oi = order - self.min_order
             valid, ctx_counts, full_counts = count_cache[oi]
@@ -589,10 +588,7 @@ class StrictCausalBackoffMixer:
             mix_idx = v_idx[can_mix]
             p_ng = np.minimum(full_counts[mix_idx], ctx_counts[mix_idx]) / np.maximum(ctx_counts[mix_idx], 1.0)
             p_ng = np.clip(p_ng, 0.0, 1.0)
-            alpha = self.alpha_base + self.alpha_range / (
-                1.0 + np.exp(-2.0 * (entropy[mix_idx] - self.alpha_center))
-            )
-            alpha = np.clip(alpha, 0.0, 0.95)
+            alpha = alpha_by_pos[mix_idx]
             mixed[mix_idx] = (1.0 - alpha) * mixed[mix_idx] + alpha * p_ng
             mixed_mask[mix_idx] = True
         return mixed
@@ -614,6 +610,13 @@ class StrictCausalBackoffMixer:
             return
         uniq, counts = np.unique(keys, return_counts=True)
         table[uniq.astype(np.intp, copy=False)] += counts.astype(np.uint32, copy=False)
+
+    def _alpha_from_entropy(self, entropy: np.ndarray) -> np.ndarray:
+        """Compute the Family B entropy->alpha schedule once per scored window."""
+        alpha = self.alpha_base + self.alpha_range / (
+            1.0 + np.exp(-2.0 * (entropy - self.alpha_center))
+        )
+        return np.clip(alpha, 0.0, 0.95)
 
     def mix_target_probs(
         self,

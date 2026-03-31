@@ -471,3 +471,47 @@
 - Do not reopen synchronized/shared-pass reuse.
 - Do not change semantic base, parity surface, or Family B formula in this round.
 - If this sparse-update follow-up still cannot improve exact-tail behavior, escalate back to the next `#149` ladder rather than layering unbounded local tweaks.
+
+## [2026-03-31 01:47] Round 161
+
+### Research Findings
+- `#159/#160` do not support promoting `3fddbaf` as a new keep-base:
+  - one sample slightly improved the submission-shaped metric vs `#156`
+  - the rerun did not preserve that edge
+  - both samples stayed slower than keep-line `#156` on `TIMING:final_eval`
+- The keep-line therefore remains sparse-update head `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`.
+- The next bounded move should stay on that keep-line and attack repeated compute inside the strict-legal causal-backoff scorer without changing what gets mixed or when.
+
+### Paradigm Assumptions
+- Keep `c6e77c4` as the confirmed working line.
+- Do not treat `3fddbaf` as promoted after the mixed `#159/#160` pair.
+- Keep `#142` as the semantic/control anchor.
+- Keep the Family B formula, scoring order, and post-batch update order unchanged.
+
+### Frontier Snapshot
+- Queue is empty again under the single-node budget.
+- `#161` is a patch/pre-launch packet only.
+- The bounded target is the entropy-driven alpha schedule inside the keep-line causal-backoff scorer.
+
+### Comparable Methods
+- `#142`: semantic control.
+- `#156`: current sparse-update keep-line.
+- `#159/#160`: mixed confirmation pair on top of rejected follow-up head `3fddbaf`.
+- `#161`: same keep-line as `#156`, but precompute the entropy->alpha map once per scored window.
+
+### Novelty-Relevant Findings
+- This follow-up does not change counts, windows, or update order.
+- It only removes repeated per-order recomputation of the same entropy->alpha schedule inside one scored window.
+- The intended optimization is:
+  - compute the Family B alpha curve once per window
+  - reuse those per-position alpha values across all n-gram orders
+
+### Compliance & Risk Status
+- Compliance boundary remains strict-legal Family B only.
+- Main risk is accidental semantic drift if alpha values change numerically.
+- Risk is bounded because the new path applies the same formula to the same entropy values, only once instead of repeatedly.
+
+### Known Failures
+- Do not build on `3fddbaf`.
+- Do not reopen synchronized/shared-pass reuse.
+- Do not change the Family B formula, the scored-window boundaries, or the batch update order in this round.

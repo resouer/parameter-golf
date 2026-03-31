@@ -169,3 +169,19 @@ Current round: Round 142
   - replace dense full-bucket `np.bincount(..., minlength=...)` post-batch updates
   - use sparse unique-key accumulation only for the keys touched by the current batch
   - leave Family B scoring semantics and update order unchanged
+
+## [2026-03-31 01:47] Round 161
+
+- Current round: Round 161
+- Branch: `autoresearch/exp-familyb-alpha-cache`
+- Base head: `c6e77c4d6e449273a3c8c9ff2510e0ccfb6bfeea`
+- Deliverable: bounded per-window alpha-precompute follow-up on top of the confirmed sparse-update keep-line
+- Scope:
+  - keep the same semantic base as `#142`
+  - keep the same sparse-update scorer/update order confirmed by `#156`
+  - patch `train_gpt.py`
+  - no launch in this round
+- Intended delta:
+  - precompute the entropy->alpha schedule once per scored window
+  - reuse those alpha values across n-gram orders in the cached scoring paths
+  - leave Family B counts, scoring semantics, and post-batch updates unchanged

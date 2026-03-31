@@ -287,3 +287,31 @@
     - standalone count/state prefetch remains the keep-line
     - no Family B formula or control-flow change is introduced
     - the only delta is sparse post-batch update accumulation
+
+## [2026-03-31 01:47] Round 161
+
+### Research Findings
+- `#159/#160` confirmed that valid-position count-cache is not promoted over keep-line `#156`.
+- So this round must pivot back to keep-line `c6e77c4`, not stack more changes on `3fddbaf`.
+- A bounded next move on the keep-line is to stop recomputing the same entropy->alpha curve once per order inside the causal-backoff scorer.
+
+### Decision
+- Build one bounded follow-up on top of keep-line `c6e77c4`:
+  - patch only the per-window alpha schedule computation in `train_gpt.py`
+  - precompute the Family B alpha values once per scored window
+  - reuse them across orders in both cached scorer paths
+- Deliver patch + pre-launch packet only.
+- No launch in this round.
+
+### Codex Review
+- Scope is:
+  - `train_gpt.py`
+  - mandatory `Round 161` planning-file updates
+- Success condition is:
+  - `python3 -m py_compile train_gpt.py`
+  - clean parity/full-Family-B `run_lepton.py --dry-run --round 161 ...`
+  - packet writeup must state explicitly:
+    - keep-line remains `c6e77c4`
+    - `3fddbaf` is not treated as promoted
+    - no Family B formula, windowing, or update-order change is introduced
+    - the only delta is one-time per-window alpha precompute
