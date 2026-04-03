@@ -59,6 +59,11 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
+    # Depth recurrence + parallel residuals
+    recur_layers = os.environ.get("RECUR_LAYERS", "3,4")
+    recur_start_step = int(os.environ.get("RECUR_START_STEP", "0"))
+    parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "6"))
+
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
@@ -626,8 +631,10 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        parallel: bool = False,
     ):
         super().__init__()
+        self.parallel = parallel
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
@@ -639,9 +646,14 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if self.parallel:
+            attn_out = self.attn(self.attn_norm(x))
+            mlp_out = self.mlp(self.mlp_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        else:
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -659,6 +671,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        parallel_start_layer: int = -1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,6 +679,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_layers = num_layers
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -680,6 +694,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    parallel=(parallel_start_layer >= 0 and i >= parallel_start_layer),
                 )
                 for i in range(num_layers)
             ]
@@ -688,6 +703,9 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        # Depth recurrence state (runtime, not parameters)
+        self.recur_layers: list[int] = []
+        self._recurrence_active = False
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -697,20 +715,39 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def set_recurrence_active(self, active: bool) -> None:
+        self._recurrence_active = active and bool(self.recur_layers)
+
+    def _get_virtual_layers(self) -> list[int]:
+        """Return virtual->physical layer index mapping when recurrence active."""
+        if not self._recurrence_active or not self.recur_layers:
+            return list(range(self.num_layers))
+        cutoff = max(self.recur_layers) + 1
+        return list(range(cutoff)) + list(self.recur_layers) + list(range(cutoff, self.num_layers))
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+        virtual = self._get_virtual_layers()
+        vlen = len(virtual)
+        num_enc = vlen // 2
+        num_dec = vlen - num_enc
+
+        # Encoder half: stores skips
+        for vi in range(num_enc):
+            pi = virtual[vi]
+            x = self.blocks[pi](x, x0)
             skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        # Decoder half: consumes skips in reverse order
+        num_skip_avail = min(num_enc, num_dec, self.num_skip_weights)
+        for di in range(num_dec):
+            pi = virtual[num_enc + di]
+            if di < num_skip_avail and skips:
+                x = x + self.skip_weights[di].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[pi](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -835,11 +872,17 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        parallel_start_layer=args.parallel_start_layer,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    # Parse depth recurrence layers
+    base_model.recur_layers = [int(x) for x in args.recur_layers.split(",") if x.strip()]
+    log0(f"recur_layers:{base_model.recur_layers} recur_start_step:{args.recur_start_step} parallel_start_layer:{args.parallel_start_layer}")
+    # Increase dynamo cache limit for depth recurrence graph changes
+    torch._dynamo.config.cache_size_limit = 32
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1006,6 +1049,10 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        # Activate depth recurrence at configured step
+        if base_model.recur_layers and not base_model._recurrence_active and step >= args.recur_start_step:
+            base_model.set_recurrence_active(True)
+            log0(f"recurrence:activated step:{step} layers:{base_model.recur_layers}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
