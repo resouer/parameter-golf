@@ -97,6 +97,7 @@ class Hyperparameters:
     # Depth recurrence
     recur_layers = os.environ.get("RECUR_LAYERS", "4,5")  # comma-separated physical layer indices to repeat
     recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
+    parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
     # TTT (test-time training)
     use_ttt = bool(int(os.environ.get("USE_TTT", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
@@ -766,8 +767,10 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
+        parallel: bool = False,
     ):
         super().__init__()
+        self.parallel = parallel
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
@@ -786,9 +789,14 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        normed_attn = self.attn_norm(x_in) * self.ln_scale_factor
+        attn_out, raw_v = self.attn(normed_attn, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
+        if self.parallel:
+            mlp_out = self.mlp(self.mlp_norm(x_in) * self.ln_scale_factor, up_w, down_w)
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out + self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * mlp_out
+        else:
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+            x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
@@ -821,8 +829,10 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        parallel_start_layer: int = -1,
     ):
         super().__init__()
+        self.parallel_start_layer = parallel_start_layer
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -862,6 +872,7 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
+                    parallel=(parallel_start_layer >= 0 and i >= parallel_start_layer),
                 )
                 for i in range(num_layers)
             ]
@@ -1836,6 +1847,7 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        parallel_start_layer=args.parallel_start_layer,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1849,6 +1861,7 @@ def main() -> None:
     # Parse depth recurrence layers
     base_model.recur_layers = [int(x) for x in args.recur_layers.split(",") if x.strip()]
     log0(f"recur_layers:{base_model.recur_layers} recur_start_step:{args.recur_start_step}")
+    log0(f"parallel_start_layer:{args.parallel_start_layer}")
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -2268,6 +2281,7 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        parallel_start_layer=args.parallel_start_layer,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
