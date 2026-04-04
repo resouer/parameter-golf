@@ -2236,7 +2236,11 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
-    # --- Causal SLOT: per-batch delta optimization using ONLY context (already-scored) positions ---
+    # --- Causal SLOT: L-BFGS logit-space delta optimization using ONLY context (already-scored) positions ---
+    # L-BFGS config (HARDCODED — env vars NOT forwarded to GPU)
+    # Ported from PR #1318: L-BFGS + logit-space delta + focal loss + warm-start + delta clamp
+    # Key changes vs AdamW hidden-space: delta in logit space (vocab_size=1024 > model_dim=512),
+    # L-BFGS with strong-Wolfe converges superlinearly, focal loss focuses on scored region
     if args.slot_enabled and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
       try:
         slot_stride = args.eval_stride
@@ -2250,10 +2254,18 @@ def main() -> None:
         sl_loss = torch.zeros((), device=device, dtype=torch.float64)
         sl_tc = torch.zeros((), device=device, dtype=torch.float64)
         sl_bc = torch.zeros((), device=device, dtype=torch.float64)
+        LBFGS_MAX_ITER = 25
+        LBFGS_HISTORY = 20
+        FOCAL_TOKENS = 128
+        DELTA_CLIP = 5.0
+        focal_start = max(seq_s - FOCAL_TOKENS, 0)
+        V = args.vocab_size
+        _delta_warmstart = None
         torch.cuda.synchronize()
         t_slot = time.perf_counter()
         eval_model.eval()
-        log0(f"causal_slot:start lr={args.slot_lr} steps={args.slot_steps} stride={slot_stride} "
+        log0(f"causal_slot_lbfgs:start max_iter={LBFGS_MAX_ITER} history={LBFGS_HISTORY} "
+             f"focal={FOCAL_TOKENS} clip={DELTA_CLIP} vocab={V} stride={slot_stride} "
              f"windows={len(my_ws)} batches={num_batches}")
         for batch_idx, bi in enumerate(range(0, len(my_ws), 32)):
             bws = my_ws[bi:bi+32]; bsz = len(bws)
@@ -2264,34 +2276,51 @@ def main() -> None:
                 end = min(ws + seq_s, total_tok); wl = end - ws; wls.append(wl)
                 ct = val_tokens[ws:end+1].to(dtype=torch.int64, device=device)
                 xb[i,:wl] = ct[:-1]; yb[i,:wl] = ct[1:]
-            # Frozen forward: get hidden states
+            # Frozen forward: hidden states → base logits (detached, float32)
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 H = eval_model.forward_hidden(xb)
-            H = H.detach().float()
-            # Build context mask (already-scored positions) and score mask (new positions)
-            context_mask = torch.zeros(bsz, seq_s, dtype=torch.bool, device=device)
-            has_context = False
+                logits_base = eval_model.compute_logits(H).float()
+            del H
+            # Build causal+focal optimization mask
+            # Causal: only context (already-scored) positions [0, s)
+            # Focal: last FOCAL_TOKENS positions of window [focal_start, seq_s)
+            # Combined: intersection [focal_start, s) — focuses optimization near scoring region
+            opt_mask = torch.zeros(bsz, seq_s, dtype=torch.bool, device=device)
+            has_opt = False
             for i, ws in enumerate(bws):
-                wl = wls[i]; s = 0 if ws == 0 else max(wl - slot_stride, 0)
-                if s > 0:
-                    context_mask[i, :s] = True
-                    has_context = True
-            # Optimize delta on context positions only (CAUSAL: no future info)
-            delta = torch.zeros(1, 1, H.shape[-1], device=device, dtype=H.dtype, requires_grad=True)
-            if has_context:
-                sopt = torch.optim.AdamW([delta], lr=args.slot_lr, betas=(0.3, 0.9), weight_decay=1e-8, eps=1e-5)
-                for _ in range(args.slot_steps):
-                    sopt.zero_grad()
-                    lg = eval_model.compute_logits((H + delta).to(torch.bfloat16)).float()
-                    nll_all = F.cross_entropy(lg.reshape(-1, lg.size(-1)), yb.reshape(-1), reduction="none").reshape(bsz, seq_s)
-                    ctx_nll = nll_all[context_mask]
-                    if ctx_nll.numel() > 0:
-                        loss_c = ctx_nll.mean()
-                        loss_c.backward()
-                        sopt.step()
-            # Score new positions with adapted delta
+                wl = wls[i]
+                s = 0 if ws == 0 else max(wl - slot_stride, 0)
+                if s > focal_start:
+                    opt_mask[i, focal_start:s] = True
+                    has_opt = True
+            # L-BFGS logit-space delta: [1, 1, vocab_size] broadcast across batch
+            delta = torch.zeros(1, 1, V, device=device, dtype=torch.float32, requires_grad=True)
+            if _delta_warmstart is not None:
+                with torch.no_grad():
+                    delta.data.copy_(_delta_warmstart)
+            if has_opt:
+                lbfgs = torch.optim.LBFGS(
+                    [delta], lr=1.0, max_iter=LBFGS_MAX_ITER,
+                    history_size=LBFGS_HISTORY, line_search_fn='strong_wolfe',
+                    tolerance_change=1e-9, tolerance_grad=1e-7,
+                )
+                def _closure():
+                    lbfgs.zero_grad()
+                    lg = logits_base + delta
+                    nll_all = F.cross_entropy(
+                        lg.reshape(-1, lg.size(-1)), yb.reshape(-1),
+                        reduction="none"
+                    ).reshape(bsz, seq_s)
+                    loss = nll_all[opt_mask].mean()
+                    loss.backward()
+                    return loss
+                lbfgs.step(_closure)
+                with torch.no_grad():
+                    delta.data.clamp_(-DELTA_CLIP, DELTA_CLIP)
+                _delta_warmstart = delta.detach().clone()
+            # Score new positions with optimized logit delta
             with torch.no_grad():
-                lg = eval_model.compute_logits((H + delta.detach()).to(torch.bfloat16)).float()
+                lg = logits_base + delta.detach()
             nll = F.cross_entropy(lg.reshape(-1, lg.size(-1)), yb.reshape(-1), reduction="none").reshape(bsz, seq_s)
             for i, ws in enumerate(bws):
                 wl = wls[i]; s = 0 if ws == 0 else max(wl - slot_stride, 0)
@@ -2300,8 +2329,9 @@ def main() -> None:
                 tb = base_bytes_lut[tgt].to(torch.float64)
                 tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                 sl_bc += tb.sum()
+            del logits_base
             if batch_idx % 500 == 0 or batch_idx == num_batches - 1:
-                log0(f"  causal_slot:batch {batch_idx+1}/{num_batches} "
+                log0(f"  causal_slot_lbfgs:batch {batch_idx+1}/{num_batches} "
                      f"time:{time.perf_counter()-t_slot:.1f}s"); sys.stdout.flush()
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(sl_loss, op=dist.ReduceOp.SUM)
