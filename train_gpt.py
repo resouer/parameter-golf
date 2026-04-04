@@ -1348,6 +1348,37 @@ def _classify_param(name: str) -> str:
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
         return "attn"
     return "other"
+def magnitude_prune_state_dict(state_dict: dict[str, Tensor], prune_frac: float = 0.03,
+                                cats: set[str] | None = None) -> tuple[dict[str, Tensor], int]:
+    """Zero out the smallest `prune_frac` fraction of weights by magnitude (pre-quantization).
+    Only prunes 2D float tensors in the given categories (default: mlp+attn).
+    Returns the pruned state dict and count of pruned weights.
+    Reference: arXiv:2603.18426 — prune before quantize lets GPTQ compensate."""
+    if cats is None:
+        cats = {"mlp", "attn"}
+    all_abs = []
+    eligible_names = []
+    for name, t in state_dict.items():
+        cat = _classify_param(name)
+        if cat in cats and t.is_floating_point() and t.ndim == 2 and t.numel() > 65536:
+            all_abs.append(t.abs().flatten())
+            eligible_names.append(name)
+    if not all_abs:
+        return state_dict, 0
+    all_abs_cat = torch.cat(all_abs)
+    k = max(1, int(prune_frac * all_abs_cat.numel()))
+    threshold = float(torch.kthvalue(all_abs_cat, k).values.item())
+    pruned_sd = dict(state_dict)
+    total_pruned = 0
+    for name in eligible_names:
+        t = pruned_sd[name]
+        mask = t.abs() <= threshold
+        n_pruned = int(mask.sum().item())
+        if n_pruned > 0:
+            pruned_sd[name] = t.clone()
+            pruned_sd[name][mask] = 0.0
+            total_pruned += n_pruned
+    return pruned_sd, total_pruned
 def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -2183,6 +2214,15 @@ def main() -> None:
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
+    # Prune-then-Quantize: zero out smallest N% of weights BEFORE GPTQ.
+    # GPTQ's Hessian-aware error compensation can account for the pruned zeros,
+    # giving lower MSE than post-quantization pruning (arXiv:2603.18426).
+    prune_frac = float(os.environ.get("PRE_QUANT_PRUNE_FRAC", "0.03"))
+    if prune_frac > 0:
+        unbanked_sd, n_pruned = magnitude_prune_state_dict(unbanked_sd, prune_frac, cats={"mlp", "attn"})
+        total_eligible = sum(t.numel() for n, t in unbanked_sd.items()
+                            if _classify_param(n) in {"mlp", "attn"} and t.is_floating_point() and t.ndim == 2 and t.numel() > 65536)
+        log0(f"pre_quant_prune: zeroed {n_pruned}/{total_eligible} weights ({100*n_pruned/max(total_eligible,1):.1f}%) at frac={prune_frac}")
     # Full GPTQ: collect Hessians via a temporary non-banked model
     log0(f"gptq:building non-banked model for Hessian collection...")
     hessian_model = _HessianGPT(
