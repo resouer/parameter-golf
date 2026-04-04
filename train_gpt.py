@@ -107,7 +107,7 @@ class Hyperparameters:
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     ttt_cosine_decay = bool(int(os.environ.get("TTT_COSINE_DECAY", "1")))
     # Causal SLOT: per-batch delta optimization at last hidden layer (post-quantization)
-    slot_enabled = bool(int(os.environ.get("SLOT_ENABLED", "1")))
+    slot_enabled = bool(int(os.environ.get("SLOT_ENABLED", "0")))
     slot_lr = float(os.environ.get("SLOT_LR", 0.005))
     slot_steps = int(os.environ.get("SLOT_STEPS", 8))
 
