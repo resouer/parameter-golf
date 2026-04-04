@@ -98,6 +98,12 @@ class Hyperparameters:
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
+    # Post-TTT self-gen GPTQ calibration (hardcoded — env vars not forwarded)
+    selfgen_calib = True   # generate calibration data from TTT-adapted model
+    selfgen_num_seqs = 64
+    selfgen_seq_len = 2048
+    selfgen_temperature = 0.8
+    selfgen_batch_size = 8
     # TTT: AdamW test-time training (pre-quantization, on EMA model)
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
@@ -2057,6 +2063,53 @@ def main() -> None:
              f"eval_time:{1000.0 * (time.perf_counter() - t_ttt_diag):.0f}ms")
         if distributed:
             dist.barrier()
+    # Post-TTT self-gen: generate calibration data from TTT-adapted model
+    selfgen_tokens = None
+    if args.ttt_enabled and args.selfgen_calib:
+        log0("selfgen:generating calibration data from TTT-adapted model...")
+        t_selfgen = time.perf_counter()
+        selfgen_tokens = generate_autoregressive_calib(
+            base_model, device,
+            num_seqs=args.selfgen_num_seqs,
+            seq_len=args.selfgen_seq_len,
+            vocab_size=args.vocab_size,
+            temperature=args.selfgen_temperature,
+            batch_size=args.selfgen_batch_size,
+            seed=42 + rank,
+        )
+        selfgen_time = time.perf_counter() - t_selfgen
+        log0(f"selfgen:generated {len(selfgen_tokens)} seqs x {args.selfgen_seq_len} tokens "
+             f"in {selfgen_time:.1f}s")
+        # Perplexity sanity check on self-gen output
+        selfgen_loss_sum = 0.0
+        selfgen_token_count = 0
+        base_model.eval()
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for seq in selfgen_tokens:
+                x = seq[:, :-1].to(device)
+                y = seq[:, 1:].to(device)
+                loss = base_model(x, y)
+                selfgen_loss_sum += loss.item() * y.numel()
+                selfgen_token_count += y.numel()
+        selfgen_avg_loss = selfgen_loss_sum / selfgen_token_count
+        selfgen_ppl = math.exp(selfgen_avg_loss)
+        # Compare with training-data perplexity (8 batches)
+        train_loss_sum = 0.0
+        train_token_count = 0
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for _ in range(8):
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                loss = base_model(x, y)
+                train_loss_sum += loss.item() * y.numel()
+                train_token_count += y.numel()
+        train_avg_loss = train_loss_sum / train_token_count
+        train_ppl = math.exp(train_avg_loss)
+        ppl_ratio = selfgen_ppl / train_ppl
+        log0(f"selfgen:selfgen_loss={selfgen_avg_loss:.4f} selfgen_ppl={selfgen_ppl:.4f}")
+        log0(f"selfgen:train_loss={train_avg_loss:.4f} train_ppl={train_ppl:.4f}")
+        log0(f"selfgen:ppl_ratio={ppl_ratio:.2f}x (must be <2.0) time={selfgen_time:.1f}s (must be <30s)")
+        if distributed:
+            dist.barrier()
     full_state_dict = base_model.state_dict()
     export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
     excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
@@ -2091,10 +2144,15 @@ def main() -> None:
         {k: v.to(device) for k, v in unbanked_sd.items() if k in hessian_model.state_dict()},
         strict=False,
     )
-    # Training-data calibration (proven -0.0007 BPP vs AR self-gen)
-    log0(f"gptq:collecting hessians from training data ({args.gptq_calib_batches} batches)...")
-    hessians = collect_hessians(hessian_model, train_loader, args, device, grad_accum_steps, num_batches=args.gptq_calib_batches)
-    log0(f"gptq:collected hessians for {len(hessians)} layers (training data)")
+    # GPTQ calibration: use self-gen data if available, else training data
+    if selfgen_tokens is not None:
+        log0(f"gptq:collecting hessians from post-TTT self-gen data ({len(selfgen_tokens)} seqs)...")
+        hessians = collect_hessians_from_tokens(hessian_model, selfgen_tokens, device)
+        log0(f"gptq:collected hessians for {len(hessians)} layers (self-gen)")
+    else:
+        log0(f"gptq:collecting hessians from training data ({args.gptq_calib_batches} batches)...")
+        hessians = collect_hessians(hessian_model, train_loader, args, device, grad_accum_steps, num_batches=args.gptq_calib_batches)
+        log0(f"gptq:collected hessians for {len(hessians)} layers (training data)")
     del hessian_model
     torch.cuda.empty_cache()
     quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"}, hessians=hessians)
