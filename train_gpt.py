@@ -36,7 +36,7 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 4000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -78,8 +78,8 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
     trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default, risky)
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
@@ -98,6 +98,10 @@ class Hyperparameters:
     recur_layers = os.environ.get("RECUR_LAYERS", "4,5")  # comma-separated physical layer indices to repeat
     recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
+    # Multi-resolution sequence length
+    multires_enabled = bool(int(os.environ.get("MULTIRES_ENABLED", "1")))
+    multires_short_seq = int(os.environ.get("MULTIRES_SHORT_SEQ", 512))
+    multires_switch_frac = float(os.environ.get("MULTIRES_SWITCH_FRAC", 0.70))  # fraction of wallclock at short seq
     # TTT (test-time training)
     use_ttt = bool(int(os.environ.get("USE_TTT", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
@@ -1862,6 +1866,8 @@ def main() -> None:
     base_model.recur_layers = [int(x) for x in args.recur_layers.split(",") if x.strip()]
     log0(f"recur_layers:{base_model.recur_layers} recur_start_step:{args.recur_start_step}")
     log0(f"parallel_start_layer:{args.parallel_start_layer}")
+    if args.multires_enabled:
+        log0(f"multires:enabled short_seq={args.multires_short_seq} switch_frac={args.multires_switch_frac}")
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -2053,10 +2059,22 @@ def main() -> None:
         if hasattr(base_model, 'recur_layers') and base_model.recur_layers and not base_model._recurrence_active and step >= args.recur_start_step:
             base_model.set_recurrence_active(True)
             log0(f"recurrence:activated step:{step} layers:{base_model.recur_layers}")
+        # Multi-resolution seq len: short seq for first N% of wallclock, then full seq
+        if args.multires_enabled and max_wallclock_ms is not None:
+            switch_ms = args.multires_switch_frac * max_wallclock_ms
+            if elapsed_ms < switch_ms:
+                current_seq_len = args.multires_short_seq
+            else:
+                current_seq_len = args.train_seq_len
+        else:
+            current_seq_len = args.train_seq_len
+        if step == 0 or (args.multires_enabled and step > 0 and current_seq_len != getattr(main, '_prev_seq_len', current_seq_len)):
+            log0(f"multires:seq_len={current_seq_len} step:{step} elapsed_ms:{elapsed_ms:.0f}")
+        main._prev_seq_len = current_seq_len
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, current_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
