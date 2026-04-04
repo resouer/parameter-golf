@@ -42,7 +42,7 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.0))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -78,8 +78,8 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default, risky)
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
@@ -99,7 +99,7 @@ class Hyperparameters:
     recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
     # Multi-resolution sequence length
-    multires_enabled = bool(int(os.environ.get("MULTIRES_ENABLED", "1")))
+    multires_enabled = bool(int(os.environ.get("MULTIRES_ENABLED", "0")))
     multires_short_seq = int(os.environ.get("MULTIRES_SHORT_SEQ", 512))
     multires_switch_frac = float(os.environ.get("MULTIRES_SWITCH_FRAC", 0.70))  # fraction of wallclock at short seq
     # TTT (test-time training)
