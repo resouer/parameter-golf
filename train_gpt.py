@@ -27,6 +27,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -444,18 +450,32 @@ def load_data_shard(file: Path) -> Tensor:
 
 
 class TokenStream:
-    # Reads shards sequentially and wraps around forever. The training loop therefore
-    # has deterministic, simple streaming behavior with no sampling or workers.
+    # Reads shards with coprime stride for better data diversity.
+    # Instead of sequential 0,1,2,..., uses stride coprime with num_shards
+    # so all shards are visited before any repeat, but in a shuffled order.
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        n = len(self.files)
+        self.stride = self._coprime_stride(n)
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
 
+    @staticmethod
+    def _coprime_stride(n: int) -> int:
+        if n <= 1:
+            return 1
+        target = max(1, int(n * 0.618033988749895))
+        for d in range(n):
+            for c in (target + d, target - d):
+                if 1 <= c < n and math.gcd(c, n) == 1:
+                    return c
+        return 1
+
     def _advance_file(self) -> None:
-        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.file_idx = (self.file_idx + self.stride) % len(self.files)
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -591,15 +611,18 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        if HAS_FLASH_ATTN:
+            # FA2 expects (B, S, H, D); handles GQA natively
+            y = flash_attn_func(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=True
+            )
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+            y = y.transpose(1, 2)
+        y = y.contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
@@ -849,11 +872,21 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    # Per-layer discriminative Muon LRs: early layers 0.7x, mid 1.0x, late 1.3x
+    n_layers = args.num_layers
+    third = n_layers // 3
+    layer_lr_mult = [0.7 if i < third else (1.0 if i < 2 * third else 1.3) for i in range(n_layers)]
+    matrix_param_groups = []
+    for layer_idx in range(n_layers):
+        prefix = f"{layer_idx}."
+        layer_params = [
+            p for name, p in block_named_params
+            if name.startswith(prefix) and p.ndim == 2
+            and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
+        ]
+        if layer_params:
+            lr = args.matrix_lr * layer_lr_mult[layer_idx]
+            matrix_param_groups.append({"params": layer_params, "lr": lr, "base_lr": lr})
     scalar_params = [
         p
         for name, p in block_named_params
@@ -869,13 +902,11 @@ def main() -> None:
         fused=True,
     )
     optimizer_muon = Muon(
-        matrix_params,
+        matrix_param_groups,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
     )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -895,13 +926,15 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"attention_backend:{'flash_attn' if HAS_FLASH_ATTN else 'sdpa'}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(f"discriminative_muon_lr: {[f'L{i}={args.matrix_lr * layer_lr_mult[i]:.4f}' for i in range(n_layers)]}")
+    log0(f"coprime_stride:{TokenStream._coprime_stride(len(list(Path(args.data_path).resolve().glob('fineweb_train_*.bin'))))}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
