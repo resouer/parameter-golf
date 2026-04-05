@@ -457,6 +457,7 @@ class NgramTracker:
             ctx_c = self.ctx_counts[k - 1][h.ravel()].reshape(B, n).astype(np.float32)
             pair_c = self.pair_counts[k - 1][pair_h.ravel()].reshape(B, n).astype(np.float32)
             probs = np.divide(pair_c, ctx_c, out=np.zeros_like(pair_c), where=ctx_c > 0)
+            np.clip(probs, 0.0, 1.0, out=probs)  # clamp: hash collisions can cause ratio > 1
             np.maximum(max_probs[:, k - 1:S], probs, out=max_probs[:, k - 1:S])
         return (1.0 - alpha * max_probs).astype(np.float32)
 
