@@ -107,19 +107,19 @@ if [ -f "$CACHE_DIR/.download_complete" ]; then
     export TOKENIZER_PATH=${TOKENIZER_PATH:-$CACHE_DIR/tokenizers/fineweb_1024_bpe.model}
 else
     python data/cached_challenge_fineweb.py --train-shards 80
-    mkdir -p $CACHE_DIR && cp -r datasets tokenizers $CACHE_DIR/ && touch $CACHE_DIR/.download_complete
-    export DATA_PATH=${DATA_PATH:-./datasets/fineweb10B_sp1024}
-    export TOKENIZER_PATH=${TOKENIZER_PATH:-./tokenizers/fineweb_1024_bpe.model}
+    mkdir -p $CACHE_DIR && cp -r data/datasets data/tokenizers $CACHE_DIR/ && touch $CACHE_DIR/.download_complete
+    export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp1024}
+    export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}
 fi
 """
     else:
         data_setup = """
-if [ ! -f "datasets/.download_complete" ]; then
+if [ ! -f "data/datasets/.download_complete" ]; then
     python data/cached_challenge_fineweb.py --train-shards 80
-    touch datasets/.download_complete
+    touch data/datasets/.download_complete
 fi
-export DATA_PATH=${DATA_PATH:-./datasets/fineweb10B_sp1024}
-export TOKENIZER_PATH=${TOKENIZER_PATH:-./tokenizers/fineweb_1024_bpe.model}
+export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp1024}
+export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}
 """
 
     clone_setup = f"""
