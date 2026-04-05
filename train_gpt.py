@@ -32,14 +32,14 @@ class Hyperparameters():
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
 
     # Training length
-    iterations = int(os.environ.get('ITERATIONS', 20000))
+    iterations = int(os.environ.get('ITERATIONS', 200))
     warmdown_frac = float(os.environ.get('WARMDOWN_FRAC', 0.667))
     warmup_steps = int(os.environ.get('WARMUP_STEPS', 20))
     train_batch_tokens = int(os.environ.get('TRAIN_BATCH_TOKENS', 2048 * 48 * 8))
     train_seq_len = int(os.environ.get('TRAIN_SEQ_LEN', 2048))
     eval_seq_len = int(os.environ.get('EVAL_SEQ_LEN', 2048))
     max_wallclock_seconds = float(os.environ.get('MAX_WALLCLOCK_SECONDS', 600.0))
-    train_log_every = int(os.environ.get('TRAIN_LOG_EVERY', 500))
+    train_log_every = int(os.environ.get('TRAIN_LOG_EVERY', 10))
 
     # Validation/Evals
     val_batch_tokens = int(os.environ.get('VAL_BATCH_TOKENS', 2048 * 32 * 8))
@@ -89,6 +89,11 @@ class Hyperparameters():
     muon_wd = float(os.environ.get('MUON_WD', 0.085))
     embed_wd = float(os.environ.get('EMBED_WD', 0.085))
     ema_decay = float(os.environ.get('EMA_DECAY', 0.997))
+
+    # Complementary Training (CompTrain)
+    comptrain_enabled = bool(int(os.environ.get('COMPTRAIN_ENABLED', '1')))
+    comptrain_alpha = float(os.environ.get('COMPTRAIN_ALPHA', '0.5'))
+    comptrain_max_order = int(os.environ.get('COMPTRAIN_MAX_ORDER', '7'))
 
     # Compression
     compressor = os.environ.get('COMPRESSOR', 'brotli')  #(lzma or brotli)
@@ -395,6 +400,63 @@ class DistributedTokenLoader:
         self._batches_built += 1
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
+
+class NgramTracker:
+    """Hash-based n-gram count tracker for CompTrain loss reweighting.
+    Maintains count tables for n-gram orders 1..max_order. For each order k,
+    tracks context counts C(ctx) and pair counts C(ctx, token) to compute
+    P(token | ctx) = C(ctx, token) / C(ctx).
+    """
+    PRIME = np.int64(2654435761)
+
+    def __init__(self, max_order: int = 7, hash_bits: int = 20):
+        self.max_order = max_order
+        self.hash_size = 1 << hash_bits
+        self.mask = np.int64(self.hash_size - 1)
+        self.ctx_counts = [np.zeros(self.hash_size, dtype=np.int32) for _ in range(max_order)]
+        self.pair_counts = [np.zeros(self.hash_size, dtype=np.int32) for _ in range(max_order)]
+
+    def update_batch(self, x_np: np.ndarray, y_np: np.ndarray) -> None:
+        """Update n-gram counts from batch. x_np, y_np: (B, S) int arrays."""
+        B, S = x_np.shape
+        x64 = x_np.astype(np.int64)
+        y64 = y_np.astype(np.int64)
+        for k in range(1, self.max_order + 1):
+            n = S - k + 1
+            if n <= 0:
+                continue
+            h = np.zeros((B, n), dtype=np.int64)
+            for i in range(k):
+                h = ((h * self.PRIME) + x64[:, i:i + n]) & self.mask
+            targets = y64[:, k - 1:S]
+            pair_h = ((h * self.PRIME) + targets) & self.mask
+            self.ctx_counts[k - 1] += np.bincount(h.ravel(), minlength=self.hash_size).astype(np.int32)
+            self.pair_counts[k - 1] += np.bincount(pair_h.ravel(), minlength=self.hash_size).astype(np.int32)
+
+    def compute_weights(self, x_np: np.ndarray, y_np: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+        """Compute CompTrain weights. Returns (B, S) float32 array.
+        w = 1 - alpha * max_k P(y|ctx_k) where k ranges over 1..max_order.
+        """
+        B, S = x_np.shape
+        x64 = x_np.astype(np.int64)
+        y64 = y_np.astype(np.int64)
+        max_probs = np.zeros((B, S), dtype=np.float32)
+        for k in range(1, self.max_order + 1):
+            n = S - k + 1
+            if n <= 0:
+                continue
+            h = np.zeros((B, n), dtype=np.int64)
+            for i in range(k):
+                h = ((h * self.PRIME) + x64[:, i:i + n]) & self.mask
+            targets = y64[:, k - 1:S]
+            pair_h = ((h * self.PRIME) + targets) & self.mask
+            ctx_c = self.ctx_counts[k - 1][h.ravel()].reshape(B, n).astype(np.float32)
+            pair_c = self.pair_counts[k - 1][pair_h.ravel()].reshape(B, n).astype(np.float32)
+            probs = np.divide(pair_c, ctx_c, out=np.zeros_like(pair_c), where=ctx_c > 0)
+            np.maximum(max_probs[:, k - 1:S], probs, out=max_probs[:, k - 1:S])
+        return (1.0 - alpha * max_probs).astype(np.float32)
+
+
 # ----------------------------------------
 # Model Architecture
 # ----------------------------------------
@@ -670,10 +732,15 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, token_weights: Tensor | None = None) -> Tensor:
         logits = self.forward_logits(input_ids)
-        return F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="mean")
+        flat_logits = logits.reshape(-1, logits.size(-1)).float()
+        flat_targets = target_ids.reshape(-1)
+        if token_weights is not None:
+            per_token = F.cross_entropy(flat_logits, flat_targets, reduction='none')
+            w = token_weights.reshape(-1)
+            return (per_token * w).sum() / w.sum()
+        return F.cross_entropy(flat_logits, flat_targets, reduction="mean")
 
 
 def classify_param(name: str) -> str:
@@ -1408,6 +1475,11 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     optimizers = Optimizers(h, base_model)
     train_loader = DistributedTokenLoader( h.train_files, h.rank, h.world_size, device)
 
+    # CompTrain: n-gram tracker for loss reweighting
+    ngram_tracker = NgramTracker(max_order=h.comptrain_max_order) if h.comptrain_enabled else None
+    if ngram_tracker is not None:
+        log(f"comptrain:enabled alpha={h.comptrain_alpha} max_order={h.comptrain_max_order}")
+
     # Helper functions for training
     max_wallclock_ms = 1000.0 * h.max_wallclock_seconds if h.max_wallclock_seconds > 0 else None
     if h.gptq_enabled and max_wallclock_ms is not None:
@@ -1434,8 +1506,18 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
             if h.distributed:
                 model.require_backward_grad_sync = micro_step == h.grad_accum_steps - 1
             x, y = train_loader.next_batch(h.train_batch_tokens, h.train_seq_len, h.grad_accum_steps)
+
+            # CompTrain: compute n-gram weights from historical counts
+            token_weights = None
+            if ngram_tracker is not None:
+                x_np = x.cpu().numpy()
+                y_np = y.cpu().numpy()
+                w_np = ngram_tracker.compute_weights(x_np, y_np, h.comptrain_alpha)
+                token_weights = torch.from_numpy(w_np).to(device=device, dtype=torch.float32)
+                ngram_tracker.update_batch(x_np, y_np)
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y, token_weights)
             train_loss += loss.detach()
             (loss / h.grad_accum_steps).backward()
         train_loss /= h.grad_accum_steps
