@@ -1,5 +1,6 @@
 import copy
 import glob
+import importlib.util
 import io
 import lzma
 import math
@@ -51,6 +52,7 @@ class Hyperparameters():
     val_batch_tokens = int(os.environ.get('VAL_BATCH_TOKENS', 2048 * 32 * 8))
     val_loss_every = int(os.environ.get('VAL_LOSS_EVERY', 4000))
     sliding_window_enabled = bool(int(os.environ.get('SLIDING_WINDOW_ENABLED', '1')))
+    ngram_agreement_enabled = bool(int(os.environ.get('NGRAM_AGREEMENT_ENABLED', '1')))
 
     # Model architecture
     vocab_size = int(os.environ.get('VOCAB_SIZE', 4096))
@@ -1694,6 +1696,16 @@ def timed_eval(label: str, fn, *args, **kwargs) -> tuple[float, float]:
     return val_loss, val_bpb
 
 
+def _load_online_best_agree_eval():
+    helper_path = Path(__file__).resolve().parent / "online_best_agree_eval.py"
+    spec = importlib.util.spec_from_file_location("online_best_agree_eval", helper_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load module from {helper_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def run_evals(
     h: Hyperparameters,
     device: torch.device,
@@ -1707,6 +1719,33 @@ def run_evals(
     timed_eval("final_int6_roundtrip", eval_val, h, device, val_data, compiled_model)
     if h.sliding_window_enabled:
         timed_eval("final_int6_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
+    if h.ngram_agreement_enabled:
+        torch.cuda.synchronize()
+        t_online = time.perf_counter()
+        ngram_mod = _load_online_best_agree_eval()
+        online_val_loss, online_val_bpb, online_timings = ngram_mod.eval_val_sliding_online_best_agree(
+            args=h,
+            base_model=eval_model,
+            rank=h.rank,
+            world_size=h.world_size,
+            device=device,
+            val_tokens=val_data.val_tokens,
+            base_bytes_lut=val_data.base_bytes_lut,
+            has_leading_space_lut=val_data.has_leading_space_lut,
+            is_boundary_token_lut=val_data.is_boundary_token_lut,
+            stride=h.eval_stride,
+            batch_seqs=32,
+            eval_seq_len=h.eval_seq_len,
+            log0=log,
+        )
+        torch.cuda.synchronize()
+        online_elapsed_ms = 1000.0 * (time.perf_counter() - t_online)
+        log(f"final_int6_ngram_agreement val_loss:{online_val_loss:.8f} val_bpb:{online_val_bpb:.8f} "
+            f"eval_time:{online_elapsed_ms:.0f}ms")
+        log(f"online_best_agree_compare "
+            f"llm_bpb:{online_timings['llm_bpb']:.8f} "
+            f"best_agree_bpb:{online_timings['best_agree_bpb']:.8f} "
+            f"gain_bpb:{online_timings['gain_bpb']:.8f}")
     if h.ttt_enabled:
         # TTT needs fresh model with clean tensors (no inference_mode)
         ttt_model = GPT(h).to(device).bfloat16()
