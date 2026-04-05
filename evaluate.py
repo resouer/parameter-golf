@@ -95,7 +95,7 @@ def _parse_job_metadata(output):
 # Job command template
 # ---------------------------------------------------------------------------
 
-def _make_job_command(commit_sha):
+def _make_job_command(commit_sha, branch=None):
     owner, repo = _parse_repo_owner_and_name(REPO_URL)
 
     if LOCAL_VOLUME:
@@ -106,7 +106,7 @@ if [ -f "$CACHE_DIR/.download_complete" ]; then
     export DATA_PATH=${DATA_PATH:-$CACHE_DIR/datasets/fineweb10B_sp1024}
     export TOKENIZER_PATH=${TOKENIZER_PATH:-$CACHE_DIR/tokenizers/fineweb_1024_bpe.model}
 else
-    python cached_challenge_fineweb.py --train-shards 80
+    python data/cached_challenge_fineweb.py --train-shards 80
     mkdir -p $CACHE_DIR && cp -r datasets tokenizers $CACHE_DIR/ && touch $CACHE_DIR/.download_complete
     export DATA_PATH=${DATA_PATH:-./datasets/fineweb10B_sp1024}
     export TOKENIZER_PATH=${TOKENIZER_PATH:-./tokenizers/fineweb_1024_bpe.model}
@@ -115,7 +115,7 @@ fi
     else:
         data_setup = """
 if [ ! -f "datasets/.download_complete" ]; then
-    python cached_challenge_fineweb.py --train-shards 80
+    python data/cached_challenge_fineweb.py --train-shards 80
     touch datasets/.download_complete
 fi
 export DATA_PATH=${DATA_PATH:-./datasets/fineweb10B_sp1024}
@@ -136,6 +136,7 @@ pip install -q sentencepiece huggingface-hub tiktoken zstandard flash-attn --no-
 
 {clone_setup}
 cd /workspace/pgolf
+git fetch origin {f'{branch}' if branch else '--all'}
 git checkout {commit_sha}
 
 export PYTHONUNBUFFERED=1
@@ -150,7 +151,7 @@ torchrun --nproc_per_node=8 train_gpt.py
 # Job creation
 # ---------------------------------------------------------------------------
 
-def _create_job(commit_sha, node_group=None):
+def _create_job(commit_sha, node_group=None, branch=None):
     """Create a Lepton job. Returns (job_name, job_id)."""
     ng = node_group or os.environ.get("PGOLF_NODE_GROUP", "")
     short_sha = commit_sha[:7]
@@ -175,7 +176,7 @@ def _create_job(commit_sha, node_group=None):
 
     ts = int(time.time()) % 100000
     job_name = f"{prefix}-{short_sha}-{ts}"
-    command = _make_job_command(commit_sha)
+    command = _make_job_command(commit_sha, branch=branch)
 
     lep_cmd = [
         *shlex.split(LEP_CLI), "job", "create",
@@ -475,7 +476,7 @@ def main():
 
     # 2. Create job
     try:
-        job_name, job_id = _create_job(commit, node_group=args.node_group)
+        job_name, job_id = _create_job(commit, node_group=args.node_group, branch=branch)
     except RuntimeError as e:
         _output(False, error=str(e))
 
@@ -553,7 +554,8 @@ def _run_seed(seed, commit, node_group, timeout):
         os.environ["PGOLF_SEED"] = str(seed)
         os.environ["PGOLF_JOB_PREFIX"] = f"pgolf-s{seed}"
         _log(f"[seed-{seed}] Starting on {node_group}")
-        job_name, job_id = _create_job(commit, node_group)
+        branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True).stdout.strip()
+        job_name, job_id = _create_job(commit, node_group, branch=branch)
     log_file = _log_path(job_id)
     _log(f"[seed-{seed}] Job {job_name} ({job_id})")
 
@@ -832,7 +834,7 @@ def preflight(node_group=None, commit=None):
 
     # Run single job (default seed 1337)
     os.environ["PGOLF_JOB_PREFIX"] = "pgolf-preflight"
-    job_name, job_id = _create_job(commit, ng)
+    job_name, job_id = _create_job(commit, ng, branch=branch)
     log_file = _log_path(job_id)
     _log(f"Job: {job_name} ({job_id})")
 
