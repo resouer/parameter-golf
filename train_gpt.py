@@ -120,7 +120,7 @@ class Hyperparameters():
     gptq_reserve_seconds = float(os.environ.get('GPTQ_RESERVE_SECONDS', 10.0))
 
     # CompTrain
-    comptrain_enabled = bool(int(os.environ.get('COMPTRAIN_ENABLED', '1')))
+    comptrain_enabled = bool(int(os.environ.get('COMPTRAIN_ENABLED', '0')))
     comptrain_alpha = float(os.environ.get('COMPTRAIN_ALPHA', '0.5'))
 
     # Distributed setup
