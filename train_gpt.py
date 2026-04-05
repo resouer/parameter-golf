@@ -1820,13 +1820,13 @@ def eval_val_lora_ttt(
         chunk_start = ci * ttt_chunk
         chunk_end = min((ci + 1) * ttt_chunk, total_tokens)
 
-        # --- Phase 1: SCORE chunk under inference_mode (predictions FINALIZED) ---
+        # --- Phase 1: SCORE chunk under no_grad (predictions FINALIZED) ---
         my_s = (len(windows) * rank) // world_size
         my_e = (len(windows) * (rank + 1)) // world_size
         my_windows = windows[my_s:my_e]
 
         base_model.eval()
-        with torch.inference_mode():
+        with torch.no_grad():
             for bi in range(0, len(my_windows), batch_seqs):
                 batch_ws = my_windows[bi:bi + batch_seqs]
                 bsz = len(batch_ws)
