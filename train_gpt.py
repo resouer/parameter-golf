@@ -103,15 +103,17 @@ class Hyperparameters():
     # Parallel Residuals (Modification 5)
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
 
-    # TTT (Modification 4)
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    # TTT (Modification 4) — LoRA TTT (score-first, discriminative LR)
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 4))
+    ttt_lora_layers = int(os.environ.get("TTT_LORA_LAYERS", 4))
 
     # Compression
     compressor = os.environ.get('COMPRESSOR', 'brotli')  #(lzma or brotli)
@@ -1681,6 +1683,236 @@ def eval_val_ttt(
 
 
 # ----------------------------------------
+# LoRA TTT (Score-first, discriminative LR)
+# ----------------------------------------
+
+class LoRALinear(nn.Module):
+    """Low-Rank Adaptation wrapper for an existing linear layer.
+    Output = base(x) + x @ A^T @ B^T. B is zero-initialized so LoRA starts as identity."""
+    def __init__(self, base: nn.Module, rank: int, device=None, dtype=None):
+        super().__init__()
+        self.base = base
+        device = device or base.weight.device
+        dtype = dtype or torch.bfloat16
+        in_f = base.in_features
+        out_f = base.out_features
+        self.lora_A = nn.Parameter(torch.randn(rank, in_f, device=device, dtype=dtype) * (1.0 / math.sqrt(in_f)))
+        self.lora_B = nn.Parameter(torch.zeros(out_f, rank, device=device, dtype=dtype))
+
+    def forward(self, x: Tensor) -> Tensor:
+        base_out = self.base(x)
+        return base_out + F.linear(F.linear(x, self.lora_A), self.lora_B)
+
+    @property
+    def in_features(self):
+        return self.base.in_features
+
+    @property
+    def out_features(self):
+        return self.base.out_features
+
+    @property
+    def weight(self):
+        return self.base.weight
+
+
+def attach_lora_adapters(model: nn.Module, target_block_indices: list[int],
+                         rank: int, device=None, dtype=None) -> dict[int, list[nn.Parameter]]:
+    """Attach LoRA adapters to Q/K/V/O projections of specified blocks.
+    Returns dict mapping block_idx -> list of LoRA parameters."""
+    lora_params = {}
+    for bi in target_block_indices:
+        block = model.blocks[bi]
+        params = []
+        for attr_name in ['c_q', 'c_k', 'c_v', 'proj']:
+            base_linear = getattr(block.attn, attr_name)
+            lora_linear = LoRALinear(base_linear, rank, device=device, dtype=dtype)
+            setattr(block.attn, attr_name, lora_linear)
+            params.extend([lora_linear.lora_A, lora_linear.lora_B])
+        lora_params[bi] = params
+    return lora_params
+
+
+def eval_val_lora_ttt(
+    h: Hyperparameters,
+    base_model: nn.Module,
+    device: torch.device,
+    val_data: ValidationData,
+    log_fn=None,
+) -> tuple[float, float]:
+    """Score-first LoRA TTT with discriminative per-block LR.
+    For each chunk: score under inference_mode (finalized), then train LoRA on scored tokens.
+    Legal per PR #549 pattern. Uses SGD (NOT AdamW — diverges on quantized models)."""
+    seq_len = h.eval_seq_len
+    stride = h.eval_stride
+    total_tokens = val_data.val_tokens.numel() - 1
+    ttt_chunk = h.ttt_chunk_tokens
+    rank = h.rank
+    world_size = h.world_size
+    if log_fn is None:
+        log_fn = lambda msg: None
+
+    # --- Attach LoRA adapters to last N layers ---
+    num_blocks = len(base_model.blocks)
+    num_lora_layers = min(h.ttt_lora_layers, num_blocks)
+    target_blocks = list(range(num_blocks - num_lora_layers, num_blocks))
+    lora_params_by_block = attach_lora_adapters(
+        base_model, target_blocks, h.ttt_lora_rank, device=device, dtype=torch.bfloat16)
+
+    # --- Freeze ALL base model params, only LoRA trains ---
+    for p in base_model.parameters():
+        p.requires_grad_(False)
+    all_lora_params = []
+    for bi, params in sorted(lora_params_by_block.items()):
+        for p in params:
+            p.requires_grad_(True)
+            all_lora_params.append(p)
+
+    lora_param_count = sum(p.numel() for p in all_lora_params)
+    log_fn(f"lora_ttt:start rank={h.ttt_lora_rank} layers={target_blocks} "
+           f"lora_params={lora_param_count} total_tokens={total_tokens}")
+
+    # --- Build optimizer with per-block discriminative LR ---
+    # blocks 0-3: frozen (no LoRA), 4-7: 0.6x, 8-10: 1.0x
+    param_groups = []
+    for bi, params in sorted(lora_params_by_block.items()):
+        if bi <= 3:
+            lr_scale = 0.0
+        elif bi <= 7:
+            lr_scale = 0.6
+        else:
+            lr_scale = 1.0
+        if lr_scale > 0:
+            param_groups.append({
+                'params': params,
+                'lr': h.ttt_lr * lr_scale,
+                '_lr_scale': lr_scale,
+            })
+    optimizer = torch.optim.SGD(param_groups, lr=h.ttt_lr, momentum=h.ttt_momentum)
+
+    # --- Build chunk-window mapping (same as eval_val_ttt) ---
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
+    num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
+    chunk_windows: list[list[int]] = [[] for _ in range(num_chunks)]
+    for ws in window_starts:
+        end = min(ws + seq_len, total_tokens)
+        wlen = end - ws
+        s = 0 if ws == 0 else max(wlen - stride, 0)
+        scored_start = ws + s
+        ci = min(scored_start // ttt_chunk, num_chunks - 1)
+        chunk_windows[ci].append(ws)
+
+    log_fn(f"lora_ttt:chunks={num_chunks} chunk_tokens={ttt_chunk} "
+           f"total_windows={len(window_starts)} stride={stride} "
+           f"ttt_lr={h.ttt_lr} ttt_epochs={h.ttt_epochs}")
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    batch_seqs = h.ttt_batch_seqs
+    t0 = time.perf_counter()
+
+    for ci in range(num_chunks):
+        windows = chunk_windows[ci]
+        if not windows:
+            continue
+        chunk_start = ci * ttt_chunk
+        chunk_end = min((ci + 1) * ttt_chunk, total_tokens)
+
+        # --- Phase 1: SCORE chunk under inference_mode (predictions FINALIZED) ---
+        my_s = (len(windows) * rank) // world_size
+        my_e = (len(windows) * (rank + 1)) // world_size
+        my_windows = windows[my_s:my_e]
+
+        base_model.eval()
+        with torch.inference_mode():
+            for bi in range(0, len(my_windows), batch_seqs):
+                batch_ws = my_windows[bi:bi + batch_seqs]
+                bsz = len(batch_ws)
+                x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                wlens: list[int] = []
+                for i, ws in enumerate(batch_ws):
+                    end = min(ws + seq_len, total_tokens)
+                    wlen = end - ws
+                    wlens.append(wlen)
+                    chunk_tok = val_data.val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                    x_batch[i, :wlen] = chunk_tok[:-1]
+                    y_batch[i, :wlen] = chunk_tok[1:]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = base_model.forward_logits(x_batch)
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1), reduction="none",
+                ).reshape(bsz, seq_len)
+                for i, ws in enumerate(batch_ws):
+                    wlen = wlens[i]
+                    s = 0 if ws == 0 else max(wlen - stride, 0)
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
+                    loss_sum += scored_nll.sum()
+                    token_count += float(wlen - s)
+                    tgt, prev = y_batch[i, s:wlen], x_batch[i, s:wlen]
+                    tb = val_data.base_bytes_lut[tgt].to(torch.float64)
+                    tb += (val_data.has_leading_space_lut[tgt] & ~val_data.is_boundary_token_lut[prev]).to(torch.float64)
+                    byte_count += tb.sum()
+
+        # --- Phase 2: TRAIN LoRA on this chunk (already scored = legal) ---
+        is_last_chunk = (ci == num_chunks - 1)
+        if not is_last_chunk and h.ttt_epochs > 0:
+            base_model.train()
+            chunk_seqs = (chunk_end - chunk_start) // seq_len
+            if chunk_seqs > 0:
+                # Cosine LR decay across chunks, scaled by per-block discriminative LR
+                cos_factor = 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+                for pg in optimizer.param_groups:
+                    pg['lr'] = h.ttt_lr * cos_factor * pg['_lr_scale']
+                my_seq_s = (chunk_seqs * rank) // world_size
+                my_seq_e = (chunk_seqs * (rank + 1)) // world_size
+                my_chunk_seqs = my_seq_e - my_seq_s
+                for _ep in range(h.ttt_epochs):
+                    for bs_idx in range(0, my_chunk_seqs, batch_seqs):
+                        be = min(bs_idx + batch_seqs, my_chunk_seqs)
+                        actual_bs = my_seq_s + bs_idx
+                        start_tok = chunk_start + actual_bs * seq_len
+                        end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
+                        if end_tok > val_data.val_tokens.numel():
+                            continue
+                        local = val_data.val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
+                        x = local[:-1].reshape(-1, seq_len)
+                        y = local[1:].reshape(-1, seq_len)
+                        optimizer.zero_grad(set_to_none=True)
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            loss = base_model(x, y)
+                        loss.backward()
+                        if world_size > 1:
+                            for p in all_lora_params:
+                                if p.grad is not None:
+                                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                        torch.nn.utils.clip_grad_norm_(all_lora_params, h.ttt_grad_clip)
+                        optimizer.step()
+
+        if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
+            elapsed = time.perf_counter() - t0
+            rl = loss_sum.item() / max(token_count.item(), 1)
+            rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
+            log_fn(f"  lora_ttt [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
+
+    base_model.eval()
+    log_fn(f"lora_ttt:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
+           f"elapsed={time.perf_counter() - t0:.1f}s")
+    return val_loss, val_bpb
+
+
+# ----------------------------------------
 # Eval orchestration
 # ----------------------------------------
 
@@ -1715,7 +1947,10 @@ def run_evals(
         if hasattr(ttt_model, 'set_recurrence_active'):
             ttt_model.set_recurrence_active(True)
         del ttt_sd
-        timed_eval("final_int6_ttt", eval_val_ttt, h, ttt_model, device, val_data, log_fn=log)
+        if h.ttt_lora_rank > 0:
+            timed_eval("final_int6_lora_ttt", eval_val_lora_ttt, h, ttt_model, device, val_data, log_fn=log)
+        else:
+            timed_eval("final_int6_ttt", eval_val_ttt, h, ttt_model, device, val_data, log_fn=log)
 
 # -----------------------------
 # Training
