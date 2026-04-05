@@ -23,9 +23,10 @@ from flash_attn_interface import flash_attn_func as flash_attn_3_func
 
 try:
     from fla.layers import GatedDeltaNet
-    HAS_FLA = True
 except ImportError:
-    HAS_FLA = False
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "fla"])
+    from fla.layers import GatedDeltaNet
+HAS_FLA = True
 
 # ----------------------------------------
 # Hyperparameters
@@ -1602,6 +1603,17 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
 
 
 def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
+    # Download SP4096 data if needed (evaluator only pre-downloads sp1024)
+    if h.vocab_size != 1024 and h.is_main_process and not os.path.exists(h.tokenizer_path):
+        log(f"Downloading sp{h.vocab_size} data...")
+        subprocess.run(
+            [sys.executable, "data/cached_challenge_fineweb.py",
+             "--train-shards", "80", "--variant", f"sp{h.vocab_size}"],
+            check=True,
+        )
+    if h.distributed:
+        dist.barrier()
+
     random.seed(h.seed)
     np.random.seed(h.seed)
     torch.manual_seed(h.seed)
