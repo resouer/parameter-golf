@@ -2254,9 +2254,9 @@ def main() -> None:
         sl_loss = torch.zeros((), device=device, dtype=torch.float64)
         sl_tc = torch.zeros((), device=device, dtype=torch.float64)
         sl_bc = torch.zeros((), device=device, dtype=torch.float64)
-        LBFGS_MAX_ITER = 30
+        LBFGS_MAX_ITER = 25
         LBFGS_HISTORY = 20
-        FOCAL_TOKENS = 128
+        FOCAL_TOKENS = 192
         DELTA_CLIP = 5.0
         focal_start = max(seq_s - FOCAL_TOKENS, 0)
         V = args.vocab_size
