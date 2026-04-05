@@ -116,7 +116,7 @@ class Hyperparameters():
     # LoRA TTT
     lora_rank = int(os.environ.get("LORA_RANK", 4))
     lora_layers = int(os.environ.get("LORA_LAYERS", 4))
-    lora_ttt_lr = float(os.environ.get("LORA_TTT_LR", 1e-3))
+    lora_ttt_lr = float(os.environ.get("LORA_TTT_LR", 2e-3))
 
     # Compression
     compressor = os.environ.get('COMPRESSOR', 'brotli')  #(lzma or brotli)
@@ -1614,7 +1614,7 @@ def eval_val_ttt(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    optimizer = torch.optim.AdamW(lora.params, lr=h.lora_ttt_lr, weight_decay=0.0)
+    optimizer = torch.optim.SGD(lora.params, lr=h.lora_ttt_lr, momentum=h.ttt_momentum)
     batch_seqs = h.ttt_batch_seqs
     t0 = time.perf_counter()
 
@@ -1668,6 +1668,9 @@ def eval_val_ttt(
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
+                cos_lr = h.lora_ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+                for pg in optimizer.param_groups:
+                    pg['lr'] = cos_lr
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
