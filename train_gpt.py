@@ -80,6 +80,7 @@ class Hyperparameters():
     tied_embed_lr = float(os.environ.get('TIED_EMBED_LR', 0.03))
     tied_embed_init_std = float(os.environ.get('TIED_EMBED_INIT_STD', 0.005))
     matrix_lr = float(os.environ.get('MATRIX_LR', 0.02))
+    matrix_lr_late = float(os.environ.get('MATRIX_LR_LATE', 0.024))
     scalar_lr = float(os.environ.get('SCALAR_LR', 0.02))
     muon_momentum = float(os.environ.get('MUON_MOMENTUM', 0.99))
     muon_backend_steps = int(os.environ.get('MUON_BACKEND_STEPS', 5))
@@ -565,7 +566,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
+        return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.9).square())
 
 
 class Block(nn.Module):
@@ -871,12 +872,15 @@ class Muon(torch.optim.Optimizer):
 class Optimizers():
     def __init__(self, h: Hyperparameters, base_model: GPT):
         block_named_params = list(base_model.blocks.named_parameters())
-        matrix_params = [
-            p
-            for name, p in block_named_params
-            if p.ndim == 2 and not any(pattern in name for pattern in
-                                       CONTROL_TENSOR_NAME_PATTERNS)
-        ]
+        early_matrix_params = []
+        late_matrix_params = []
+        for name, p in block_named_params:
+            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                layer_idx = int(name.split('.')[0])
+                if layer_idx <= 5:
+                    early_matrix_params.append(p)
+                else:
+                    late_matrix_params.append(p)
         scalar_params = [
             p
             for name, p in block_named_params
@@ -895,7 +899,7 @@ class Optimizers():
         if base_model.ve_shared is not None:
             tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
             if base_model.ve_shared.proj is not None:
-                matrix_params.append(base_model.ve_shared.proj.weight)
+                late_matrix_params.append(base_model.ve_shared.proj.weight)
             scalar_params.append(base_model.ve_shared.scale)
             for s in base_model.ve_layer_scales:
                 scalar_params.append(s)
@@ -908,14 +912,17 @@ class Optimizers():
             fused=True,
         )
         self.optimizer_muon = Muon(
-            matrix_params,
+            [
+                {"params": early_matrix_params, "lr": h.matrix_lr},
+                {"params": late_matrix_params, "lr": h.matrix_lr_late},
+            ],
             lr=h.matrix_lr,
             momentum=h.muon_momentum,
             backend_steps=h.muon_backend_steps,
             weight_decay=h.muon_wd,
         )
         for group in self.optimizer_muon.param_groups:
-            group["base_lr"] = h.matrix_lr
+            group["base_lr"] = group["lr"]
         self.optimizer_scalar = torch.optim.AdamW(
             [{"params": scalar_params, "lr": h.scalar_lr, "base_lr": h.scalar_lr}],
             betas=(h.beta1, h.beta2),
