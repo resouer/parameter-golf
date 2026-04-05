@@ -101,7 +101,7 @@ class Hyperparameters:
     # TTT: AdamW test-time training (pre-quantization, on EMA model)
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 0))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
@@ -2413,7 +2413,7 @@ def main() -> None:
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
     # --- Score-first backward-looking AdamW TTT (post-quant, in-memory only) ---
     # Sanity check: run on first 10 chunks to see if loss decreases
-    SCORE_FIRST_TTT_ENABLED = True
+    SCORE_FIRST_TTT_ENABLED = False
     SCORE_FIRST_TTT_MAX_CHUNKS = 50  # 0 = all chunks (full eval)
     if SCORE_FIRST_TTT_ENABLED and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
