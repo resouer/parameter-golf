@@ -105,7 +105,7 @@ class Hyperparameters():
 
     # TTT (Modification 4) — LoRA TTT (score-first, discriminative LR)
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
-    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.004))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
@@ -114,6 +114,7 @@ class Hyperparameters():
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 4))
     ttt_lora_layers = int(os.environ.get("TTT_LORA_LAYERS", 4))
+    ttt_lora_alpha = float(os.environ.get("TTT_LORA_ALPHA", 1.0))
 
     # Compression
     compressor = os.environ.get('COMPRESSOR', 'brotli')  #(lzma or brotli)
@@ -1688,10 +1689,11 @@ def eval_val_ttt(
 
 class LoRALinear(nn.Module):
     """Low-Rank Adaptation wrapper for an existing linear layer.
-    Output = base(x) + x @ A^T @ B^T. B is zero-initialized so LoRA starts as identity."""
-    def __init__(self, base: nn.Module, rank: int, device=None, dtype=None):
+    Output = base(x) + (alpha/rank) * x @ A^T @ B^T. B is zero-initialized so LoRA starts as identity."""
+    def __init__(self, base: nn.Module, rank: int, alpha: float = 1.0, device=None, dtype=None):
         super().__init__()
         self.base = base
+        self.scaling = alpha / rank
         device = device or base.weight.device
         dtype = dtype or torch.bfloat16
         in_f = base.in_features
@@ -1701,7 +1703,7 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         base_out = self.base(x)
-        return base_out + F.linear(F.linear(x, self.lora_A), self.lora_B)
+        return base_out + self.scaling * F.linear(F.linear(x, self.lora_A), self.lora_B)
 
     @property
     def in_features(self):
@@ -1717,7 +1719,7 @@ class LoRALinear(nn.Module):
 
 
 def attach_lora_adapters(model: nn.Module, target_block_indices: list[int],
-                         rank: int, device=None, dtype=None) -> dict[int, list[nn.Parameter]]:
+                         rank: int, alpha: float = 1.0, device=None, dtype=None) -> dict[int, list[nn.Parameter]]:
     """Attach LoRA adapters to Q/K/V/O projections of specified blocks.
     Returns dict mapping block_idx -> list of LoRA parameters."""
     lora_params = {}
@@ -1726,7 +1728,7 @@ def attach_lora_adapters(model: nn.Module, target_block_indices: list[int],
         params = []
         for attr_name in ['c_q', 'c_k', 'c_v', 'proj']:
             base_linear = getattr(block.attn, attr_name)
-            lora_linear = LoRALinear(base_linear, rank, device=device, dtype=dtype)
+            lora_linear = LoRALinear(base_linear, rank, alpha=alpha, device=device, dtype=dtype)
             setattr(block.attn, attr_name, lora_linear)
             params.extend([lora_linear.lora_A, lora_linear.lora_B])
         lora_params[bi] = params
@@ -1757,7 +1759,8 @@ def eval_val_lora_ttt(
     num_lora_layers = min(h.ttt_lora_layers, num_blocks)
     target_blocks = list(range(num_blocks - num_lora_layers, num_blocks))
     lora_params_by_block = attach_lora_adapters(
-        base_model, target_blocks, h.ttt_lora_rank, device=device, dtype=torch.bfloat16)
+        base_model, target_blocks, h.ttt_lora_rank, alpha=h.ttt_lora_alpha,
+        device=device, dtype=torch.bfloat16)
 
     # --- Freeze ALL base model params, only LoRA trains ---
     for p in base_model.parameters():
