@@ -24,8 +24,15 @@ from flash_attn_interface import flash_attn_func as flash_attn_3_func
 try:
     from fla.layers import GatedDeltaNet
 except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
-                           "flash-linear-attention"])
+    # FLA not in base container — rank 0 installs, others wait
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+        print("[GDN] Installing flash-linear-attention...", flush=True)
+        subprocess.check_call([sys.executable, "-m", "pip", "install",
+                               "flash-linear-attention==0.4.2", "einops",
+                               "--no-deps", "-q"])
+        print("[GDN] FLA installed", flush=True)
+    import time as _t; _t.sleep(10)  # wait for rank 0 install
+    import importlib; importlib.invalidate_caches()
     from fla.layers import GatedDeltaNet
 HAS_FLA = True
 
