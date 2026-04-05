@@ -114,12 +114,18 @@ fi
 """
     else:
         data_setup = """
-if [ ! -f "data/datasets/.download_complete" ]; then
-    python data/cached_challenge_fineweb.py --train-shards 80
-    touch data/datasets/.download_complete
+# Auto-detect vocab size from train_gpt.py (default sp1024, supports sp4096+)
+VOCAB=$(grep -oP "VOCAB_SIZE['\"],\\s*\\K[0-9]+" train_gpt.py 2>/dev/null || echo "1024")
+[ "$VOCAB" = "" ] && VOCAB=1024
+SHARDS=80
+[ "$VOCAB" -gt 1024 ] && SHARDS=143
+echo "data_setup: vocab=$VOCAB shards=$SHARDS"
+if [ ! -f "data/datasets/.download_complete_sp${VOCAB}" ]; then
+    python data/cached_challenge_fineweb.py --variant sp${VOCAB} --train-shards $SHARDS
+    touch "data/datasets/.download_complete_sp${VOCAB}"
 fi
-export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp1024}
-export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}
+export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp${VOCAB}}
+export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_${VOCAB}_bpe.model}
 """
 
     clone_setup = f"""
