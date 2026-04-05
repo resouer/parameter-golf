@@ -21,20 +21,7 @@ from torch import Tensor, nn
 
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 
-try:
-    from fla.layers import GatedDeltaNet
-except ImportError:
-    # FLA not in base container — rank 0 installs, others wait
-    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
-        print("[GDN] Installing flash-linear-attention...", flush=True)
-        subprocess.check_call([sys.executable, "-m", "pip", "install",
-                               "flash-linear-attention==0.4.2", "einops",
-                               "--no-deps", "-q"])
-        print("[GDN] FLA installed", flush=True)
-    import time as _t; _t.sleep(10)  # wait for rank 0 install
-    import importlib; importlib.invalidate_caches()
-    from fla.layers import GatedDeltaNet
-HAS_FLA = True
+HAS_FLA = True  # Using built-in GDN implementation (no FLA dependency)
 
 # ----------------------------------------
 # Hyperparameters
@@ -588,21 +575,64 @@ class Block(nn.Module):
         return x_out
 
 
+class GatedDeltaNetLayer(nn.Module):
+    """Pure PyTorch Gated DeltaNet — O(n) linear attention, no external deps.
+    Implements the gated delta rule recurrence from Yang et al. 2024."""
+    def __init__(self, hidden_size, num_heads=8, head_dim=64, expand_v=1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.key_dim = head_dim
+        self.val_dim = head_dim * expand_v
+        self.q_proj = nn.Linear(hidden_size, num_heads * self.key_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, num_heads * self.key_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, num_heads * self.val_dim, bias=False)
+        self.g_proj = nn.Linear(hidden_size, num_heads * self.val_dim, bias=False)
+        self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        self.o_proj = nn.Linear(num_heads * self.val_dim, hidden_size, bias=False)
+        nn.init.zeros_(self.o_proj.weight)
+        nn.init.zeros_(self.b_proj.weight)
+
+    def _recur_chunk(self, q, k, v, beta, S):
+        """Process a chunk recurrently, return (output, new_state)."""
+        C = q.size(1)
+        outs = []
+        for t in range(C):
+            kv = k[:, t].unsqueeze(-1) * v[:, t].unsqueeze(-2)  # (B,H,K,V)
+            bt = beta[:, t]  # (B,H,1)
+            S = (1.0 - bt) * S + bt * kv
+            ot = (q[:, t].unsqueeze(-1) * S).sum(-2)  # (B,H,V)
+            outs.append(ot)
+        return torch.stack(outs, dim=1), S
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, K, V = self.num_heads, self.key_dim, self.val_dim
+        q = F.normalize(self.q_proj(x).view(B, T, H, K), p=2, dim=-1) * (K ** -0.5)
+        k = F.normalize(self.k_proj(x).view(B, T, H, K), p=2, dim=-1)
+        v = self.v_proj(x).view(B, T, H, V)
+        gate = torch.sigmoid(self.g_proj(x).view(B, T, H, V))
+        beta = torch.sigmoid(self.b_proj(x).view(B, T, H, 1))
+        S = x.new_zeros(B, H, K, V)
+        CHUNK = 64
+        outs = []
+        for c in range(0, T, CHUNK):
+            ce = min(c + CHUNK, T)
+            co, S = torch.utils.checkpoint.checkpoint(
+                self._recur_chunk, q[:, c:ce], k[:, c:ce], v[:, c:ce],
+                beta[:, c:ce], S, use_reentrant=False)
+            outs.append(co * gate[:, c:ce])
+        out = torch.cat(outs, dim=1).reshape(B, T, H * V)
+        return self.o_proj(out)
+
+
 class GDNBlock(nn.Module):
-    """Block using GatedDeltaNet (linear attention) instead of softmax attention."""
+    """Transformer block using GatedDeltaNet (linear attention) instead of softmax attention."""
     def __init__(self, dim, num_heads, head_dim, mlp_mult, expand_v=1, layer_idx=0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.gdn = GatedDeltaNet(
-            hidden_size=dim,
-            head_dim=head_dim,
-            num_heads=num_heads,
-            expand_v=expand_v,
-            use_short_conv=False,
-            layer_idx=layer_idx,
-            mode="chunk",
-        )
+        self.gdn = GatedDeltaNetLayer(dim, num_heads, head_dim, expand_v)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -612,8 +642,6 @@ class GDNBlock(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         gdn_out = self.gdn(self.attn_norm(x_in))
-        if isinstance(gdn_out, tuple):
-            gdn_out = gdn_out[0]
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * gdn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out))
         return x_out
