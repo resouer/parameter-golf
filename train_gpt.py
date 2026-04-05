@@ -1866,6 +1866,11 @@ def eval_val_lora_ttt(
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
+                # Reset momentum buffer between chunks to prevent accumulation
+                # (with ~1000 chunks, momentum=0.9 would amplify updates ~10x)
+                for state in optimizer.state.values():
+                    if 'momentum_buffer' in state:
+                        state['momentum_buffer'].zero_()
                 # Cosine LR decay across chunks, scaled by per-block discriminative LR
                 cos_factor = 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
                 for pg in optimizer.param_groups:
