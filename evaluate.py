@@ -140,7 +140,7 @@ GIT_TERMINAL_PROMPT=0 git clone --quiet "$CLONE_URL" /workspace/pgolf
 """
 
     return f"""set -e
-pip install -q sentencepiece huggingface-hub tiktoken zstandard flash-attn --no-build-isolation 2>/dev/null || true
+pip install -q sentencepiece huggingface-hub tiktoken zstandard brotli flash-attn --no-build-isolation 2>/dev/null || true
 
 {clone_setup}
 cd /workspace/pgolf
