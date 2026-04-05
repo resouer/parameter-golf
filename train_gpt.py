@@ -24,7 +24,8 @@ from flash_attn_interface import flash_attn_func as flash_attn_3_func
 try:
     from fla.layers import GatedDeltaNet
 except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "fla"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                           "flash-linear-attention"])
     from fla.layers import GatedDeltaNet
 HAS_FLA = True
 

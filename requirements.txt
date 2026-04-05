@@ -8,4 +8,4 @@ typing-extensions==4.15.0
 datasets
 tiktoken
 sentencepiece
-fla>=0.4
+flash-linear-attention
