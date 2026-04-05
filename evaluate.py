@@ -101,25 +101,19 @@ def _make_job_command(commit_sha, branch=None):
     if LOCAL_VOLUME:
         data_setup = """
 CACHE_DIR=/mnt/pgolf-data/pgolf-cache
-if [ -f "$CACHE_DIR/.download_complete" ]; then
-    echo "Using cached data from node-local volume"
-    export DATA_PATH=${DATA_PATH:-$CACHE_DIR/datasets/fineweb10B_sp1024}
-    export TOKENIZER_PATH=${TOKENIZER_PATH:-$CACHE_DIR/tokenizers/fineweb_1024_bpe.model}
+if [ -f "$CACHE_DIR/.download_complete_sp4096" ]; then
+    echo "Using cached SP4096 data from node-local volume"
 else
-    python data/cached_challenge_fineweb.py --train-shards 80
-    mkdir -p $CACHE_DIR && cp -r data/datasets data/tokenizers $CACHE_DIR/ && touch $CACHE_DIR/.download_complete
-    export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp1024}
-    export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}
+    python data/cached_challenge_fineweb.py --train-shards 80 --tokenizer sp4096
+    mkdir -p $CACHE_DIR && cp -r data/datasets data/tokenizers $CACHE_DIR/ && touch $CACHE_DIR/.download_complete_sp4096
 fi
 """
     else:
         data_setup = """
-if [ ! -f "data/datasets/.download_complete" ]; then
-    python data/cached_challenge_fineweb.py --train-shards 80
-    touch data/datasets/.download_complete
+if [ ! -f "data/datasets/.download_complete_sp4096" ]; then
+    python data/cached_challenge_fineweb.py --train-shards 80 --tokenizer sp4096
+    touch data/datasets/.download_complete_sp4096
 fi
-export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp1024}
-export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}
 """
 
     clone_setup = f"""
