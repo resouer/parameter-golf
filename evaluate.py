@@ -104,14 +104,14 @@ CACHE_DIR=/mnt/pgolf-data/pgolf-cache
 if [ -f "$CACHE_DIR/.download_complete_sp4096" ]; then
     echo "Using cached SP4096 data from node-local volume"
 else
-    python data/cached_challenge_fineweb.py --train-shards 80 --tokenizer sp4096
+    python data/cached_challenge_fineweb.py --train-shards 80 --variant sp4096
     mkdir -p $CACHE_DIR && cp -r data/datasets data/tokenizers $CACHE_DIR/ && touch $CACHE_DIR/.download_complete_sp4096
 fi
 """
     else:
         data_setup = """
 if [ ! -f "data/datasets/.download_complete_sp4096" ]; then
-    python data/cached_challenge_fineweb.py --train-shards 80 --tokenizer sp4096
+    python data/cached_challenge_fineweb.py --train-shards 80 --variant sp4096
     touch data/datasets/.download_complete_sp4096
 fi
 """
