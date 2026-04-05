@@ -101,38 +101,25 @@ def _make_job_command(commit_sha, branch=None):
     if LOCAL_VOLUME:
         data_setup = """
 CACHE_DIR=/mnt/pgolf-data/pgolf-cache
-VOCAB=$(grep -oP "VOCAB_SIZE['\"],\\s*\\K[0-9]+" train_gpt.py 2>/dev/null || echo "1024")
-[ "$VOCAB" = "" ] && VOCAB=1024
-if [ "$VOCAB" -gt 1024 ]; then
-    export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
-fi
-if [ -f "$CACHE_DIR/.download_complete_sp${VOCAB}" ]; then
-    echo "Using cached sp${VOCAB} data from node-local volume"
-    mkdir -p data/datasets data/tokenizers
-    cp -rn $CACHE_DIR/datasets/* data/datasets/ 2>/dev/null || true
-    cp -rn $CACHE_DIR/tokenizers/* data/tokenizers/ 2>/dev/null || true
+if [ -f "$CACHE_DIR/.download_complete" ]; then
+    echo "Using cached data from node-local volume"
+    export DATA_PATH=${DATA_PATH:-$CACHE_DIR/datasets/fineweb10B_sp1024}
+    export TOKENIZER_PATH=${TOKENIZER_PATH:-$CACHE_DIR/tokenizers/fineweb_1024_bpe.model}
 else
-    [ "$VOCAB" -gt 1024 ] && rm -f data/datasets/manifest.json data/manifest.json
-    python data/cached_challenge_fineweb.py --train-shards 80 --variant sp${VOCAB}
-    mkdir -p $CACHE_DIR/datasets $CACHE_DIR/tokenizers
-    cp -r data/datasets/* $CACHE_DIR/datasets/ 2>/dev/null || true
-    cp -r data/tokenizers/* $CACHE_DIR/tokenizers/ 2>/dev/null || true
-    touch "$CACHE_DIR/.download_complete_sp${VOCAB}"
+    python data/cached_challenge_fineweb.py --train-shards 80
+    mkdir -p $CACHE_DIR && cp -r data/datasets data/tokenizers $CACHE_DIR/ && touch $CACHE_DIR/.download_complete
+    export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp1024}
+    export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}
 fi
 """
     else:
         data_setup = """
 # Auto-detect vocab size from train_gpt.py (default sp1024, supports sp4096+)
-VOCAB=$(grep -oP "VOCAB_SIZE['\"],\\s*\\K[0-9]+" train_gpt.py 2>/dev/null || echo "1024")
-[ "$VOCAB" = "" ] && VOCAB=1024
+VOCAB=$(python3 -c "import re; f=open('train_gpt.py').read(); m=re.search(r'VOCAB_SIZE.*?,\s*(\d+)', f); print(m.group(1) if m else '1024')")
+[ -z "$VOCAB" ] && VOCAB=1024
 SHARDS=80
-# sp4096 data is on kevclark/parameter-golf, not the default repo
-if [ "$VOCAB" -gt 1024 ]; then
-    export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
-    SHARDS=80
-    rm -f data/datasets/manifest.json data/manifest.json
-fi
-echo "data_setup: vocab=$VOCAB shards=$SHARDS repo=${MATCHED_FINEWEB_REPO_ID:-default}"
+[ "$VOCAB" -gt 1024 ] && SHARDS=143
+echo "data_setup: vocab=$VOCAB shards=$SHARDS"
 if [ ! -f "data/datasets/.download_complete_sp${VOCAB}" ]; then
     python data/cached_challenge_fineweb.py --variant sp${VOCAB} --train-shards $SHARDS
     touch "data/datasets/.download_complete_sp${VOCAB}"
