@@ -115,16 +115,13 @@ fi
     else:
         data_setup = """
 # Auto-detect vocab size from train_gpt.py (default sp1024, supports sp4096+)
-VOCAB=$(python3 -c "import re; f=open('train_gpt.py').read(); m=re.search(r'VOCAB_SIZE.*?,\s*(\d+)', f); print(m.group(1) if m else '1024')")
+VOCAB=$(python3 -c "import re; f=open('train_gpt.py').read(); m=re.search(r'VOCAB_SIZE.*?,\\s*(\\d+)', f); print(m.group(1) if m else '1024')")
 [ -z "$VOCAB" ] && VOCAB=1024
 SHARDS=80
-# sp4096 data lives on kevclark/parameter-golf, not the default repo
-if [ "$VOCAB" -gt 1024 ]; then
-    export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
-    rm -f data/datasets/manifest.json data/manifest.json
-    SHARDS=80
-fi
-echo "data_setup: vocab=$VOCAB shards=$SHARDS repo=${MATCHED_FINEWEB_REPO_ID:-default}"
+[ "$VOCAB" -gt 1024 ] && SHARDS=143
+echo "data_setup: vocab=$VOCAB shards=$SHARDS"
+# SP4096 data hosted on kevclark's HuggingFace repo, not the default
+[ "$VOCAB" -gt 1024 ] && export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
 if [ ! -f "data/datasets/.download_complete_sp${VOCAB}" ]; then
     python data/cached_challenge_fineweb.py --variant sp${VOCAB} --train-shards $SHARDS
     touch "data/datasets/.download_complete_sp${VOCAB}"
@@ -143,7 +140,7 @@ GIT_TERMINAL_PROMPT=0 git clone --quiet "$CLONE_URL" /workspace/pgolf
 """
 
     return f"""set -e
-pip install -q sentencepiece huggingface-hub tiktoken zstandard flash-attn --no-build-isolation 2>/dev/null || true
+pip install -q sentencepiece huggingface-hub tiktoken zstandard brotli flash-attn --no-build-isolation 2>/dev/null || true
 
 {clone_setup}
 cd /workspace/pgolf
