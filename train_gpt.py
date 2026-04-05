@@ -21,6 +21,12 @@ from torch import Tensor, nn
 
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 
+try:
+    from fla.layers import GatedDeltaNet
+    HAS_FLA = True
+except ImportError:
+    HAS_FLA = False
+
 # ----------------------------------------
 # Hyperparameters
 # ----------------------------------------
@@ -66,6 +72,11 @@ class Hyperparameters():
     ve_dim = int(os.environ.get('VE_DIM', 128))
     ve_layers = os.environ.get('VE_LAYERS', '9,10')
     qk_gain_init = float(os.environ.get('QK_GAIN_INIT', 4.0))
+
+    # GDN Hybrid (Gated DeltaNet replaces attention in first N layers)
+    num_gdn_layers = int(os.environ.get('NUM_GDN_LAYERS', '9'))
+    gdn_head_dim = int(os.environ.get('GDN_HEAD_DIM', '64'))
+    gdn_expand_v = int(os.environ.get('GDN_EXPAND_V', '1'))
 
     # Optimizer
     min_lr = float(os.environ.get('MIN_LR', 0.0))
@@ -568,6 +579,37 @@ class Block(nn.Module):
         return x_out
 
 
+class GDNBlock(nn.Module):
+    """Block using GatedDeltaNet (linear attention) instead of softmax attention."""
+    def __init__(self, dim, num_heads, head_dim, mlp_mult, expand_v=1, layer_idx=0):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.gdn = GatedDeltaNet(
+            hidden_size=dim,
+            head_dim=head_dim,
+            num_heads=num_heads,
+            expand_v=expand_v,
+            use_short_conv=False,
+            layer_idx=layer_idx,
+            mode="chunk",
+        )
+        self.mlp = MLP(dim, mlp_mult)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+
+    def forward(self, x, x0, v_embed=None):
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        gdn_out = self.gdn(self.attn_norm(x_in))
+        if isinstance(gdn_out, tuple):
+            gdn_out = gdn_out[0]
+        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * gdn_out
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out))
+        return x_out
+
+
 class GPT(nn.Module):
     def __init__(self, h: Hyperparameters):
         super().__init__()
@@ -589,16 +631,24 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
-        self.blocks = nn.ModuleList([
-            Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult, h.rope_base,
-                  h.qk_gain_init, h.train_seq_len, layer_idx=i, ln_scale=h.ln_scale)
-            for i in range(h.num_layers)
-        ])
+        self.blocks = nn.ModuleList()
+        gdn_num_heads = h.model_dim // h.gdn_head_dim
+        for i in range(h.num_layers):
+            if i < h.num_gdn_layers and HAS_FLA:
+                self.blocks.append(GDNBlock(
+                    h.model_dim, gdn_num_heads, h.gdn_head_dim,
+                    h.mlp_mult, expand_v=h.gdn_expand_v, layer_idx=i))
+            else:
+                self.blocks.append(Block(
+                    h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult,
+                    h.rope_base, h.qk_gain_init, h.train_seq_len,
+                    layer_idx=i, ln_scale=h.ln_scale))
         if h.rope_dims > 0:
             head_dim = h.model_dim // h.num_heads
             for block in self.blocks:
-                block.attn.rope_dims = h.rope_dims
-                block.attn.rotary = Rotary(head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
+                if hasattr(block, 'attn'):
+                    block.attn.rope_dims = h.rope_dims
+                    block.attn.rotary = Rotary(head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
         self.ve_layer_indices = [int(x) for x in h.ve_layers.split(",") if x.strip()] if h.ve_enabled else []
         kv_dim = self._ve_target_dim
         if self.ve_layer_indices:
@@ -616,7 +666,8 @@ class GPT(nn.Module):
             self.lm_head._zero_init = True
         if h.xsa_last_n > 0:
             for i in range(max(0, h.num_layers - h.xsa_last_n), h.num_layers):
-                self.blocks[i].attn.use_xsa = True
+                if hasattr(self.blocks[i], 'attn'):
+                    self.blocks[i].attn.use_xsa = True
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -624,6 +675,8 @@ class GPT(nn.Module):
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
+                if '.gdn.' in name:
+                    continue  # FLA handles own init
                 if getattr(module, "_zero_init", False):
                     nn.init.zeros_(module.weight)
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
@@ -681,7 +734,7 @@ def classify_param(name: str) -> str:
         return "embed"
     if ".mlp." in name:
         return "mlp"
-    if ".attn." in name or (".proj." in name and ".mlp." not in name):
+    if ".attn." in name or ".gdn." in name or (".proj." in name and ".mlp." not in name):
         return "attn"
     return "other"
 
