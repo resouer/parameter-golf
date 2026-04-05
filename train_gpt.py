@@ -152,6 +152,9 @@ class Muon(torch.optim.Optimizer):
                 shard_B = padded_B // ws
                 tail = p.shape[1:]
                 dev = p.device
+                lr_mult = getattr(p, '_lr_mult', None)
+                if lr_mult is not None:
+                    lr_mult = lr_mult.to(device=dev, dtype=torch.bfloat16)
                 self._bank_meta.append({
                     'p': p,
                     'B': B,
@@ -160,6 +163,7 @@ class Muon(torch.optim.Optimizer):
                     'shard_mom': torch.zeros(shard_B, *tail, device=dev, dtype=torch.bfloat16),
                     'full_update': torch.zeros(padded_B, *tail, device=dev, dtype=torch.bfloat16),
                     'scale': max(1, p.shape[-2] / p.shape[-1]) ** 0.5,
+                    'lr_mult': lr_mult,
                 })
         # Sort by size descending -- launch biggest reduce-scatters first
         self._bank_meta.sort(key=lambda m: -m['p'].numel())
@@ -216,6 +220,9 @@ class Muon(torch.optim.Optimizer):
                     prev_ag_handle.wait()
                     pp = prev_m['p']
                     upd = prev_m['full_update'][:prev_m['B']]
+                    if prev_m['lr_mult'] is not None:
+                        lm = prev_m['lr_mult'][:prev_m['B']].view(-1, *([1] * (upd.ndim - 1)))
+                        upd = upd * lm
                     if wd > 0.0:
                         pp.data.mul_(1.0 - lr * wd)
                     pp.add_(upd.to(dtype=pp.dtype), alpha=-lr * prev_m['scale'])
@@ -246,12 +253,18 @@ class Muon(torch.optim.Optimizer):
                 else:
                     if wd > 0.0:
                         p.data.mul_(1.0 - lr * wd)
+                    if m['lr_mult'] is not None:
+                        lm = m['lr_mult'][:update.shape[0]].view(-1, *([1] * (update.ndim - 1)))
+                        update = update * lm
                     p.add_(update.to(dtype=p.dtype), alpha=-lr * m['scale'])
 
             if prev_ag_handle is not None:
                 prev_ag_handle.wait()
                 pp = prev_m['p']
                 upd = prev_m['full_update'][:prev_m['B']]
+                if prev_m['lr_mult'] is not None:
+                    lm = prev_m['lr_mult'][:prev_m['B']].view(-1, *([1] * (upd.ndim - 1)))
+                    upd = upd * lm
                 if wd > 0.0:
                     pp.data.mul_(1.0 - lr * wd)
                 pp.add_(upd.to(dtype=pp.dtype), alpha=-lr * prev_m['scale'])
@@ -490,11 +503,23 @@ class TokenStream:
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        n = len(self.files)
+        self.stride = self._coprime_stride(n)
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
+    @staticmethod
+    def _coprime_stride(n: int) -> int:
+        if n <= 1:
+            return 1
+        target = max(1, int(n * 0.618033988749895))
+        for d in range(n):
+            for c in (target + d, target - d):
+                if 1 <= c < n and math.gcd(c, n) == 1:
+                    return c
+        return 1
     def _advance_file(self) -> None:
-        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.file_idx = (self.file_idx + self.stride) % len(self.files)
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
     def take(self, n: int) -> Tensor:
@@ -1653,6 +1678,17 @@ def main() -> None:
     base_model.kv_bank.data = base_model.kv_bank.data.float()
     base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
     base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
+    # Per-layer discriminative Muon LRs: early layers 0.7x, mid 1.0x, late 1.3x
+    n_layers = args.num_layers
+    third = n_layers // 3
+    layer_lr = [0.7 if i < third else (1.0 if i < 2 * third else 1.3) for i in range(n_layers)]
+    # qo_bank/kv_bank: rows [0..n) = Q/K per layer, rows [n..2n) = O/V per layer
+    qo_kv_lr = torch.tensor(layer_lr + layer_lr, dtype=torch.float32)
+    mlp_lr = torch.tensor(layer_lr, dtype=torch.float32)
+    base_model.qo_bank._lr_mult = qo_kv_lr
+    base_model.kv_bank._lr_mult = qo_kv_lr.clone()
+    base_model.mlp_up_bank._lr_mult = mlp_lr
+    base_model.mlp_down_bank._lr_mult = mlp_lr.clone()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1742,6 +1778,8 @@ def main() -> None:
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+    log0(f"discriminative_muon_lr:[{','.join(f'L{i}={args.matrix_lr*layer_lr[i]:.4f}' for i in range(n_layers))}]")
+    log0(f"coprime_stride:{TokenStream._coprime_stride(len(list(Path(args.data_path).resolve().glob('fineweb_train_*.bin'))))}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
