@@ -599,7 +599,7 @@ class GatedDeltaNetLayer(nn.Module):
         outs = []
         for t in range(C):
             kv = k[:, t].unsqueeze(-1) * v[:, t].unsqueeze(-2)  # (B,H,K,V)
-            bt = beta[:, t]  # (B,H,1)
+            bt = beta[:, t].unsqueeze(-1)  # (B,H,1,1)
             S = (1.0 - bt) * S + bt * kv
             ot = (q[:, t].unsqueeze(-1) * S).sum(-2)  # (B,H,V)
             outs.append(ot)
