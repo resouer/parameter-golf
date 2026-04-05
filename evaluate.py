@@ -101,21 +101,31 @@ def _make_job_command(commit_sha, branch=None):
     if LOCAL_VOLUME:
         data_setup = """
 CACHE_DIR=/mnt/pgolf-data/pgolf-cache
-if [ -f "$CACHE_DIR/.download_complete_sp4096" ]; then
-    echo "Using cached SP4096 data from node-local volume"
-    ln -sf $CACHE_DIR/datasets ./data/datasets 2>/dev/null || true
-    ln -sf $CACHE_DIR/tokenizers ./data/tokenizers 2>/dev/null || true
+if [ -f "$CACHE_DIR/.download_complete" ]; then
+    echo "Using cached data from node-local volume"
+    export DATA_PATH=${DATA_PATH:-$CACHE_DIR/datasets/fineweb10B_sp1024}
+    export TOKENIZER_PATH=${TOKENIZER_PATH:-$CACHE_DIR/tokenizers/fineweb_1024_bpe.model}
 else
-    python data/cached_challenge_fineweb.py --train-shards 80 --tokenizer-family sp4096
-    mkdir -p $CACHE_DIR && cp -r data/datasets data/tokenizers $CACHE_DIR/ && touch $CACHE_DIR/.download_complete_sp4096
+    python data/cached_challenge_fineweb.py --train-shards 80
+    mkdir -p $CACHE_DIR && cp -r data/datasets data/tokenizers $CACHE_DIR/ && touch $CACHE_DIR/.download_complete
+    export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp1024}
+    export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}
 fi
 """
     else:
         data_setup = """
-if [ ! -f "data/datasets/.download_complete_sp4096" ]; then
-    python data/cached_challenge_fineweb.py --train-shards 80 --tokenizer-family sp4096
-    touch data/datasets/.download_complete_sp4096
+# Auto-detect vocab size from train_gpt.py (default sp1024, supports sp4096+)
+VOCAB=$(grep -oP "VOCAB_SIZE['\"],\\s*\\K[0-9]+" train_gpt.py 2>/dev/null || echo "1024")
+[ "$VOCAB" = "" ] && VOCAB=1024
+SHARDS=80
+[ "$VOCAB" -gt 1024 ] && SHARDS=143
+echo "data_setup: vocab=$VOCAB shards=$SHARDS"
+if [ ! -f "data/datasets/.download_complete_sp${VOCAB}" ]; then
+    python data/cached_challenge_fineweb.py --variant sp${VOCAB} --train-shards $SHARDS
+    touch "data/datasets/.download_complete_sp${VOCAB}"
 fi
+export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp${VOCAB}}
+export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_${VOCAB}_bpe.model}
 """
 
     clone_setup = f"""
