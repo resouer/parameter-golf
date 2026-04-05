@@ -38,18 +38,18 @@ class Hyperparameters():
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
 
     # Training length
-    iterations = int(os.environ.get('ITERATIONS', 20000))
+    iterations = int(os.environ.get('ITERATIONS', 200))
     warmdown_frac = float(os.environ.get('WARMDOWN_FRAC', 0.667))
     warmup_steps = int(os.environ.get('WARMUP_STEPS', 20))
     train_batch_tokens = int(os.environ.get('TRAIN_BATCH_TOKENS', 2048 * 48 * 8))
     train_seq_len = int(os.environ.get('TRAIN_SEQ_LEN', 2048))
     eval_seq_len = int(os.environ.get('EVAL_SEQ_LEN', 2048))
     max_wallclock_seconds = float(os.environ.get('MAX_WALLCLOCK_SECONDS', 600.0))
-    train_log_every = int(os.environ.get('TRAIN_LOG_EVERY', 500))
+    train_log_every = int(os.environ.get('TRAIN_LOG_EVERY', 10))
 
     # Validation/Evals
     val_batch_tokens = int(os.environ.get('VAL_BATCH_TOKENS', 2048 * 32 * 8))
-    val_loss_every = int(os.environ.get('VAL_LOSS_EVERY', 4000))
+    val_loss_every = int(os.environ.get('VAL_LOSS_EVERY', 200))
     sliding_window_enabled = bool(int(os.environ.get('SLIDING_WINDOW_ENABLED', '1')))
 
     # Model architecture
@@ -115,9 +115,13 @@ class Hyperparameters():
 
     # Compression
     compressor = os.environ.get('COMPRESSOR', 'brotli')  #(lzma or brotli)
-    gptq_enabled = bool(int(os.environ.get('GPTQ_ENABLED', '1')))
+    gptq_enabled = bool(int(os.environ.get('GPTQ_ENABLED', '0')))
     gptq_calibration_batches = int(os.environ.get('GPTQ_CALIBRATION_BATCHES', 64))
     gptq_reserve_seconds = float(os.environ.get('GPTQ_RESERVE_SECONDS', 10.0))
+
+    # CompTrain
+    comptrain_enabled = bool(int(os.environ.get('COMPTRAIN_ENABLED', '1')))
+    comptrain_alpha = float(os.environ.get('COMPTRAIN_ALPHA', '0.5'))
 
     # Distributed setup
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -591,6 +595,19 @@ class Block(nn.Module):
         return x_out
 
 
+def build_bigram_table(train_files: str, vocab_size: int, device: torch.device) -> Tensor:
+    files = sorted(glob.glob(train_files))[:3]
+    counts = torch.zeros(vocab_size * vocab_size, dtype=torch.float32)
+    for f in files:
+        tokens = load_data_shard(Path(f)).long()
+        prev = tokens[:-1]
+        curr = tokens[1:]
+        flat_idx = prev * vocab_size + curr
+        counts.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.float32))
+    counts = counts.reshape(vocab_size, vocab_size)
+    row_sums = counts.sum(dim=1, keepdim=True).clamp(min=1.0)
+    return (counts / row_sums).to(device)
+
 class GPT(nn.Module):
     def __init__(self, h: Hyperparameters):
         super().__init__()
@@ -652,6 +669,8 @@ class GPT(nn.Module):
         else:
             self.lane_merge = None
 
+        self._bigram_table = None
+        self._comptrain_alpha = 0.5
         self._init_weights()
 
     def set_recurrence_active(self, active: bool) -> None:
@@ -774,10 +793,18 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor):
         logits = self.forward_logits(input_ids)
-        return F.cross_entropy(
+        if self._bigram_table is not None:
+            per_token = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="none")
+            ctrl_loss = per_token.detach().mean()
+            w = 1.0 - self._comptrain_alpha * self._bigram_table[input_ids.reshape(-1), target_ids.reshape(-1)]
+            weighted_loss = (per_token * w).sum() / w.sum()
+            return weighted_loss, ctrl_loss
+        loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="mean")
+        return loss, loss.detach()
 
 
 def classify_param(name: str) -> str:
@@ -1724,6 +1751,12 @@ def run_evals(
 def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationData) -> None:
     # Set up model
     base_model = GPT(h).to(device).bfloat16()
+    if h.comptrain_enabled:
+        log("comptrain:building bigram table from first 3 shards")
+        bigram_table = build_bigram_table(h.train_files, h.vocab_size, device)
+        base_model._bigram_table = bigram_table
+        base_model._comptrain_alpha = h.comptrain_alpha
+        log(f"comptrain:enabled alpha={h.comptrain_alpha} mean_bigram_prob={bigram_table.mean().item():.6f}")
     restore_fp32_params(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     if h.distributed:
@@ -1758,15 +1791,18 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     def step_fn(step, lr_scale):
         optimizers.zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        weighted_loss_accum = torch.zeros((), device=device)
         for micro_step in range(h.grad_accum_steps):
             if h.distributed:
                 model.require_backward_grad_sync = micro_step == h.grad_accum_steps - 1
             x, y = train_loader.next_batch(h.train_batch_tokens, h.train_seq_len, h.grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
+                loss, ctrl_loss = model(x, y)
+            train_loss += ctrl_loss
+            weighted_loss_accum += loss.detach()
             (loss / h.grad_accum_steps).backward()
         train_loss /= h.grad_accum_steps
+        weighted_loss_accum /= h.grad_accum_steps
 
         frac = min(step / h.muon_momentum_warmup_steps, 1.0) if h.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * h.muon_momentum_warmup_start + frac * h.muon_momentum
@@ -1781,7 +1817,7 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), h.grad_clip_norm)
 
         optimizers.step()
-        return train_loss
+        return train_loss, weighted_loss_accum
 
     # Model warmup
     if h.warmup_steps > 0:
@@ -1839,7 +1875,7 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         frac = training_frac(step, elapsed_ms)
         scale = lr_mul(frac)
-        train_loss = step_fn(step, scale)
+        train_loss, weighted_loss = step_fn(step, scale)
 
         with torch.no_grad():
             for name, t in base_model.state_dict().items():
@@ -1855,8 +1891,9 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
         if should_log_train:
             tok_per_sec = step * h.train_batch_tokens / (approx_training_time_ms / 1000.0)
             log(
-                f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} "
-                f"train_time: {approx_training_time_ms / 60000:.1f}m tok/s: {tok_per_sec:.0f}"
+                f"{step}/{h.iterations} train_loss:{train_loss.item():.4f} "
+                f"weighted_loss:{weighted_loss.item():.4f} "
+                f"train_time:{approx_training_time_ms / 60000:.1f}m tok/s:{tok_per_sec:.0f}"
             )
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
