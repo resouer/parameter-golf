@@ -101,7 +101,7 @@ class Hyperparameters:
     # TTT: AdamW test-time training (pre-quantization, on EMA model)
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 0))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
@@ -2414,7 +2414,7 @@ def main() -> None:
     # --- Score-first backward-looking AdamW TTT (post-quant, in-memory only) ---
     # Sanity check: run on first 10 chunks to see if loss decreases
     SCORE_FIRST_TTT_ENABLED = True
-    SCORE_FIRST_TTT_MAX_CHUNKS = 10  # 0 = all chunks (full eval)
+    SCORE_FIRST_TTT_MAX_CHUNKS = 50  # 0 = all chunks (full eval)
     if SCORE_FIRST_TTT_ENABLED and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
         t_sf_ttt = time.perf_counter()
@@ -2447,7 +2447,7 @@ def main() -> None:
         sl_loss = torch.zeros((), device=device, dtype=torch.float64)
         sl_tc = torch.zeros((), device=device, dtype=torch.float64)
         sl_bc = torch.zeros((), device=device, dtype=torch.float64)
-        LBFGS_MAX_ITER = 30
+        LBFGS_MAX_ITER = 25
         LBFGS_HISTORY = 20
         FOCAL_TOKENS = 128
         DELTA_CLIP = 5.0
