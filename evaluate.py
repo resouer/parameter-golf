@@ -118,8 +118,13 @@ fi
 VOCAB=$(python3 -c "import re; f=open('train_gpt.py').read(); m=re.search(r'VOCAB_SIZE.*?,\s*(\d+)', f); print(m.group(1) if m else '1024')")
 [ -z "$VOCAB" ] && VOCAB=1024
 SHARDS=80
-[ "$VOCAB" -gt 1024 ] && SHARDS=143
-echo "data_setup: vocab=$VOCAB shards=$SHARDS"
+# sp4096 data lives on kevclark/parameter-golf, not the default repo
+if [ "$VOCAB" -gt 1024 ]; then
+    export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
+    rm -f data/datasets/manifest.json data/manifest.json
+    SHARDS=80
+fi
+echo "data_setup: vocab=$VOCAB shards=$SHARDS repo=${MATCHED_FINEWEB_REPO_ID:-default}"
 if [ ! -f "data/datasets/.download_complete_sp${VOCAB}" ]; then
     python data/cached_challenge_fineweb.py --variant sp${VOCAB} --train-shards $SHARDS
     touch "data/datasets/.download_complete_sp${VOCAB}"
