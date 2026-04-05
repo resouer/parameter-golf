@@ -101,7 +101,7 @@ class Hyperparameters:
     # TTT: AdamW test-time training (pre-quantization, on EMA model)
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 0))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
@@ -2416,7 +2416,7 @@ def main() -> None:
         sl_loss = torch.zeros((), device=device, dtype=torch.float64)
         sl_tc = torch.zeros((), device=device, dtype=torch.float64)
         sl_bc = torch.zeros((), device=device, dtype=torch.float64)
-        LBFGS_MAX_ITER = 25
+        LBFGS_MAX_ITER = 35
         LBFGS_HISTORY = 20
         FOCAL_TOKENS = 128
         DELTA_CLIP = 5.0
