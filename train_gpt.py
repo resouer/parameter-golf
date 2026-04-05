@@ -104,14 +104,19 @@ class Hyperparameters():
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
 
     # TTT (Modification 4)
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+
+    # LoRA TTT
+    lora_rank = int(os.environ.get("LORA_RANK", 4))
+    lora_layers = int(os.environ.get("LORA_LAYERS", 4))
+    lora_ttt_lr = float(os.environ.get("LORA_TTT_LR", 1e-3))
 
     # Compression
     compressor = os.environ.get('COMPRESSOR', 'brotli')  #(lzma or brotli)
@@ -1518,6 +1523,48 @@ def eval_val_sliding(
 # TTT (Test-Time Training) - Legal Score-First
 # ----------------------------------------
 
+class LoRAAdapters:
+    """LoRA adapters attached to attention projections via forward hooks.
+    Only LoRA params are trainable; base model stays frozen."""
+
+    def __init__(self, model: nn.Module, rank: int, num_adapt_layers: int):
+        self.adapters: list[tuple[nn.Parameter, nn.Parameter]] = []
+        self.hooks: list = []
+        self.params: list[nn.Parameter] = []
+
+        total_layers = len(model.blocks)
+        start = max(0, total_layers - num_adapt_layers)
+
+        for li in range(start, total_layers):
+            block = model.blocks[li]
+            for proj in (block.attn.c_q, block.attn.c_k, block.attn.c_v, block.attn.proj):
+                out_f, in_f = proj.weight.shape
+                device = proj.weight.device
+                A = nn.Parameter(torch.randn(rank, in_f, device=device, dtype=torch.float32) * 0.01)
+                B = nn.Parameter(torch.zeros(out_f, rank, device=device, dtype=torch.float32))
+
+                def _make_hook(a, b):
+                    def hook(_module, inp, out):
+                        x = inp[0].float()
+                        return out + F.linear(F.linear(x, a), b).to(out.dtype)
+                    return hook
+
+                h = proj.register_forward_hook(_make_hook(A, B))
+                self.adapters.append((A, B))
+                self.hooks.append(h)
+                self.params.extend([A, B])
+
+    def reset(self):
+        for A, B in self.adapters:
+            nn.init.normal_(A, std=0.01)
+            nn.init.zeros_(B)
+
+    def remove(self):
+        for h in self.hooks:
+            h.remove()
+        self.hooks.clear()
+
+
 def eval_val_ttt(
     h: Hyperparameters,
     base_model: nn.Module,
@@ -1525,8 +1572,9 @@ def eval_val_ttt(
     val_data: ValidationData,
     log_fn=None,
 ) -> tuple[float, float]:
-    """Legal score-first TTT: score each chunk with sliding windows,
-    then train on it. Every token scored BEFORE any update that could use it."""
+    """Score-first LoRA TTT: score each chunk with sliding windows,
+    then train ONLY LoRA adapters on scored tokens. Legal: every token
+    scored BEFORE any LoRA update that could use it."""
     seq_len = h.eval_seq_len
     stride = h.eval_stride
     total_tokens = val_data.val_tokens.numel() - 1
@@ -1549,33 +1597,24 @@ def eval_val_ttt(
         ci = min(scored_start // ttt_chunk, num_chunks - 1)
         chunk_windows[ci].append(ws)
 
-    log_fn(f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
-           f"total_windows={len(window_starts)} stride={stride} "
-           f"ttt_lr={h.ttt_lr} ttt_epochs={h.ttt_epochs} "
-           f"freeze_blocks={h.ttt_freeze_blocks}")
+    # Freeze ALL base model params — only LoRA will be trainable
+    for p in base_model.parameters():
+        p.requires_grad_(False)
+
+    # Attach LoRA adapters to last N layers' attention Q/K/V/O
+    lora = LoRAAdapters(base_model, rank=h.lora_rank, num_adapt_layers=h.lora_layers)
+    lora_param_count = sum(p.numel() for p in lora.params)
+
+    log_fn(f"lora_ttt:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
+           f"windows={len(window_starts)} stride={stride} "
+           f"rank={h.lora_rank} layers={h.lora_layers} params={lora_param_count} "
+           f"lr={h.lora_ttt_lr} epochs={h.ttt_epochs}")
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    frozen_block_ids = set(range(min(h.ttt_freeze_blocks, len(base_model.blocks))))
-    ttt_params = []
-    for name, p in base_model.named_parameters():
-        freeze = False
-        for bi in frozen_block_ids:
-            if f"blocks.{bi}." in name:
-                freeze = True
-                break
-        if freeze:
-            p.requires_grad_(False)
-        else:
-            p.requires_grad_(True)
-            ttt_params.append(p)
-
-    log_fn(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
-           f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
-
-    optimizer = torch.optim.SGD(ttt_params, lr=h.ttt_lr, momentum=h.ttt_momentum)
+    optimizer = torch.optim.AdamW(lora.params, lr=h.lora_ttt_lr, weight_decay=0.0)
     batch_seqs = h.ttt_batch_seqs
     t0 = time.perf_counter()
 
@@ -1586,7 +1625,7 @@ def eval_val_ttt(
         chunk_start = ci * ttt_chunk
         chunk_end = min((ci + 1) * ttt_chunk, total_tokens)
 
-        # --- Phase 1: SCORE this chunk's windows (no_grad for TTT compat) ---
+        # --- Phase 1: SCORE this chunk (no_grad, predictions finalized) ---
         my_s = (len(windows) * rank) // world_size
         my_e = (len(windows) * (rank + 1)) // world_size
         my_windows = windows[my_s:my_e]
@@ -1623,15 +1662,12 @@ def eval_val_ttt(
                     tb += (val_data.has_leading_space_lut[tgt] & ~val_data.is_boundary_token_lut[prev]).to(torch.float64)
                     byte_count += tb.sum()
 
-        # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
+        # --- Phase 2: TRAIN LoRA on already-scored chunk (legal) ---
         is_last_chunk = (ci == num_chunks - 1)
         if not is_last_chunk and h.ttt_epochs > 0:
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
-                cos_lr = h.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
-                for pg in optimizer.param_groups:
-                    pg['lr'] = cos_lr
                 my_seq_s = (chunk_seqs * rank) // world_size
                 my_seq_e = (chunk_seqs * (rank + 1)) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
@@ -1651,17 +1687,17 @@ def eval_val_ttt(
                             loss = base_model(x, y)
                         loss.backward()
                         if world_size > 1:
-                            for p in ttt_params:
+                            for p in lora.params:
                                 if p.grad is not None:
                                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-                        torch.nn.utils.clip_grad_norm_(ttt_params, h.ttt_grad_clip)
+                        torch.nn.utils.clip_grad_norm_(lora.params, h.ttt_grad_clip)
                         optimizer.step()
 
         if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
             elapsed = time.perf_counter() - t0
             rl = loss_sum.item() / max(token_count.item(), 1)
             rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
-            log_fn(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+            log_fn(f"  lora_ttt [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
@@ -1671,11 +1707,13 @@ def eval_val_ttt(
     val_loss = (loss_sum / token_count).item()
     val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
 
+    # Cleanup: remove hooks, restore requires_grad
+    lora.remove()
     for p in base_model.parameters():
         p.requires_grad_(True)
     base_model.eval()
 
-    log_fn(f"ttt_sliding:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
+    log_fn(f"lora_ttt:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
            f"elapsed={time.perf_counter() - t0:.1f}s")
     return val_loss, val_bpb
 
