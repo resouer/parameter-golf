@@ -38,7 +38,7 @@ class Hyperparameters():
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
 
     # Training length
-    iterations = int(os.environ.get('ITERATIONS', 200))
+    iterations = int(os.environ.get('ITERATIONS', 20000))
     warmdown_frac = float(os.environ.get('WARMDOWN_FRAC', 0.667))
     warmup_steps = int(os.environ.get('WARMUP_STEPS', 20))
     train_batch_tokens = int(os.environ.get('TRAIN_BATCH_TOKENS', 2048 * 48 * 8))
