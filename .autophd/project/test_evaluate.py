@@ -279,40 +279,51 @@ class TestOutputResultFile(unittest.TestCase):
         self.assertAlmostEqual(data["details"]["val_bpb"], 1.084)
 
 
-class TestBuildRemoteScript(unittest.TestCase):
-    """Test that _build_remote_script generates valid shell."""
+class TestRemoteScript(unittest.TestCase):
+    """Test that _make_job_command generates valid shell."""
+
+    def _get_script(self):
+        fn = _ns.get("_make_job_command")
+        if fn is None:
+            self.skipTest("_make_job_command not found")
+        return fn("abc1234", branch="exp/test")
 
     def test_script_has_torchrun(self):
-        fn = _ns.get("_build_remote_script")
-        if fn is None:
-            self.skipTest("_build_remote_script not found")
-        script = fn("abc1234", node_group="test", branch="exp/test")
+        script = self._get_script()
         self.assertIn("torchrun --nproc_per_node=8 train_gpt.py", script)
 
     def test_script_has_results_json_collector(self):
-        fn = _ns.get("_build_remote_script")
-        if fn is None:
-            self.skipTest("_build_remote_script not found")
-        script = fn("abc1234", node_group="test", branch="exp/test")
+        script = self._get_script()
         self.assertIn("results_json", script, "post-training result collector should be in script")
 
     def test_script_has_vocab_detection(self):
-        fn = _ns.get("_build_remote_script")
-        if fn is None:
-            self.skipTest("_build_remote_script not found")
-        script = fn("abc1234", node_group="test", branch="exp/test")
+        script = self._get_script()
         self.assertIn("VOCAB", script)
+
+    def test_script_no_duplicate_closing_paren(self):
+        """The vocab detection python3 -c block must end with exactly one ")."""
+        script = self._get_script()
+        # Find the python3 -c block for vocab detection
+        import re
+        # After print(found...) there should be exactly one ")
+        m = re.search(r'print\(found[^\n]*\n("\))\n', script)
+        self.assertIsNotNone(m, "Should find closing \") after print(found...)")
+        # Check no double ")
+        self.assertNotIn('")\n")', script, "Duplicate closing paren in vocab detection script")
 
     def test_script_no_fstring_braces_error(self):
         """Embedded Python must not have unescaped {} inside f-strings."""
-        fn = _ns.get("_build_remote_script")
-        if fn is None:
-            self.skipTest("_build_remote_script not found")
-        # This should NOT raise — if it does, there's an f-string escaping bug
         try:
-            script = fn("abc1234", node_group="test", branch="exp/test")
+            script = self._get_script()
         except (KeyError, ValueError) as e:
-            self.fail(f"f-string escaping error in _build_remote_script: {e}")
+            self.fail(f"f-string escaping error in _make_job_command: {e}")
+
+    def test_script_shell_syntax_valid(self):
+        """Generated script should pass bash -n syntax check."""
+        script = self._get_script()
+        import subprocess
+        r = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, f"Shell syntax error: {r.stderr[:500]}")
 
 
 if __name__ == "__main__":
