@@ -858,6 +858,11 @@ class GPT(nn.Module):
             m = self.lane_merge.to(dtype=lane0.dtype)
             x = m * lane0 + (1 - m) * lane1
 
+        # Ensure recur_mlps participate in gradient graph even before recurrence activates (DDP requirement)
+        if self.recur_mlps is not None and not self._recurrence_active:
+            dummy = sum(p.sum() for p in self.recur_mlps.parameters()) * 0.0
+            x = x + dummy
+
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
