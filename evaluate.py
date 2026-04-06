@@ -119,6 +119,7 @@ VOCAB=$(python3 -c "import re; f=open('train_gpt.py').read(); m=re.search(r'VOCA
 [ -z "$VOCAB" ] && VOCAB=1024
 SHARDS=80
 [ "$VOCAB" -gt 1024 ] && SHARDS=143
+[ "$VOCAB" -gt 4096 ] && SHARDS=128
 echo "data_setup: vocab=$VOCAB shards=$SHARDS"
 # Non-default vocab: use kevclark's HF repo + delete stale manifest (SP8192 not in default manifest)
 [ "$VOCAB" -gt 1024 ] && export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
