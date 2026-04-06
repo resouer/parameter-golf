@@ -108,7 +108,7 @@ class Hyperparameters():
     bigram_dim = int(os.environ.get('BIGRAM_DIM', '112'))
 
     # PROTEUS: Untied MLP for recurrence layers
-    recur_untie_mlp = bool(int(os.environ.get('RECUR_UNTIE_MLP', '1')))
+    recur_untie_mlp = bool(int(os.environ.get('RECUR_UNTIE_MLP', '0')))
 
     # TTT (Modification 4)
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
