@@ -114,6 +114,15 @@ class Block(nn.Module):
 		mix=self.resid_mix.to(dtype=x.dtype);x_in=mix[0][None,None,:]*x+mix[1][None,None,:]*x0
 		if self.parallel:normed=self.attn_norm(x_in)*self.ln_scale_factor;attn_out=self.attn(normed);mlp_out=self.mlp(normed);return x_in+self.attn_scale.to(dtype=x_in.dtype)[None,None,:]*attn_out+self.mlp_scale.to(dtype=x_in.dtype)[None,None,:]*mlp_out
 		attn_out=self.attn(self.attn_norm(x_in)*self.ln_scale_factor);x_out=x_in+self.attn_scale.to(dtype=x_in.dtype)[None,None,:]*attn_out;x_out=x_out+self.mlp_scale.to(dtype=x_out.dtype)[None,None,:]*self.mlp(self.mlp_norm(x_out)*self.ln_scale_factor);return x_out
+class HashedSuffixExpert(nn.Module):
+	def __init__(self,model_dim,orders=(2,3,4),table_size=4096,proj_dim=64):super().__init__();self.orders=orders;self.table_size=table_size;self.tables=nn.ParameterList([nn.Parameter(torch.zeros(table_size,proj_dim))for _ in orders]);self.projs=nn.ModuleList([CastedLinear(proj_dim,model_dim,bias=False)for _ in orders])
+	def forward(self,x,input_ids):
+		B,T,_=x.shape;res=torch.zeros_like(x);ids=input_ids.long()
+		for i,k in enumerate(self.orders):
+			h=torch.zeros(B,T,dtype=torch.long,device=x.device)
+			for j in range(k):shift=k-1-j;shifted=F.pad(ids[:,:T-shift],(shift,0),value=0)if shift>0 else ids;h=(h*257+shifted)%self.table_size
+			res=res+self.projs[i](F.embedding(h,self.tables[i]))
+		return x+res
 class GPT(nn.Module):
 	def __init__(self,h):
 		super().__init__()
@@ -137,7 +146,7 @@ class GPT(nn.Module):
 			for _ in range(h.num_loops+1):all_indices.extend(loop_seg)
 			all_indices.extend(range(h.loop_end+1,h.num_layers));num_enc=len(all_indices)//2;self.encoder_indices=all_indices[:num_enc];self.decoder_indices=all_indices[num_enc:]
 		else:self.encoder_indices=list(range(self.num_encoder_layers));self.decoder_indices=list(range(self.num_encoder_layers,h.num_layers))
-		self.num_skip_weights=min(len(self.encoder_indices),len(self.decoder_indices));self.skip_weights=nn.Parameter(torch.ones(self.num_skip_weights,h.model_dim,dtype=torch.float32));self.skip_gates=nn.Parameter(torch.zeros(self.num_skip_weights,h.model_dim,dtype=torch.float32))if h.skip_gates_enabled else None;self._init_weights()
+		self.num_skip_weights=min(len(self.encoder_indices),len(self.decoder_indices));self.skip_weights=nn.Parameter(torch.ones(self.num_skip_weights,h.model_dim,dtype=torch.float32));self.skip_gates=nn.Parameter(torch.zeros(self.num_skip_weights,h.model_dim,dtype=torch.float32))if h.skip_gates_enabled else None;self.suffix_expert=HashedSuffixExpert(h.model_dim);self._init_weights()
 	def _init_weights(self):
 		if self.tie_embeddings:nn.init.normal_(self.tok_emb.weight,mean=.0,std=self.tied_embed_init_std)
 		for(name,module)in self.named_modules():
@@ -156,6 +165,7 @@ class GPT(nn.Module):
 				else:x=x+scaled_skip
 			x=self.blocks[i](x,x0)
 		x=self.final_norm(x)
+		if self.suffix_expert is not None:x=self.suffix_expert(x,input_ids)
 		if self.head_proj is not None:x=self.head_proj(x)
 		if self.tie_embeddings:logits_proj=F.linear(x,self.tok_emb.weight)
 		else:logits_proj=self.lm_head(x)
@@ -210,6 +220,7 @@ class Optimizers:
 		self.optimizer_scalar=torch.optim.AdamW([{'params':scalar_params,'lr':h.scalar_lr,'base_lr':h.scalar_lr}],betas=(h.beta1,h.beta2),eps=h.adam_eps,weight_decay=h.adam_wd,fused=True);self.optimizers=[self.optimizer_tok,self.optimizer_muon,self.optimizer_scalar]
 		if base_model.lm_head is not None:self.optimizer_head=torch.optim.Adam([{'params':[base_model.lm_head.weight],'lr':h.head_lr,'base_lr':h.head_lr}],betas=(h.beta1,h.beta2),eps=h.adam_eps,fused=True);self.optimizers.insert(1,self.optimizer_head)
 		else:self.optimizer_head=None
+		if hasattr(base_model,'suffix_expert')and base_model.suffix_expert is not None:self.optimizer_scalar.add_param_group({'params':list(base_model.suffix_expert.parameters()),'lr':h.scalar_lr,'base_lr':h.scalar_lr})
 	def __iter__(self):return iter(self.optimizers)
 	def zero_grad_all(self):
 		for opt in self.optimizers:opt.zero_grad(set_to_none=True)
@@ -262,7 +273,10 @@ def gptq_mixed_quantize(state_dict,hessians,h):
 	for(name,tensor)in state_dict.items():
 		t=tensor.detach().cpu().contiguous()
 		if not t.is_floating_point()or t.numel()<=65536:result[name]=t.to(torch.float16)if t.is_floating_point()else t;meta[name]='passthrough (float16)';continue
-		cs=h.embed_clip_sigmas if'tok_emb'in name else h.matrix_clip_sigmas;bits=h.embed_bits if'tok_emb'in name else h.matrix_bits;q,s=gptq_quantize_weight(t,hessians[name],clip_sigmas=cs,clip_range=2**(bits-1)-1);result[name+'.q']=q;result[name+'.scale']=s;meta[name]=f"gptq (int{bits})"
+		cs=h.embed_clip_sigmas if'tok_emb'in name else h.matrix_clip_sigmas;bits=h.embed_bits if'tok_emb'in name else h.matrix_bits;cr=2**(bits-1)-1
+		if name in hessians:q,s=gptq_quantize_weight(t,hessians[name],clip_sigmas=cs,clip_range=cr)
+		else:W=t.float();rs=W.std(dim=1).clamp_min(1e-10);s=(cs*rs/cr).clamp_min(1e-10).to(torch.float16);q=torch.clamp(torch.round(W/s.float().unsqueeze(1)),-cr,cr).to(torch.int8)
+		result[name+'.q']=q;result[name+'.scale']=s;meta[name]=f"{'gptq'if name in hessians else'rtn'} (int{bits})"
 	categories=collections.defaultdict(set)
 	for(name,cat)in meta.items():short=re.sub('\\.\\d+$','',re.sub('blocks\\.\\d+','blocks',name));categories[cat].add(short)
 	log('Quantized weights:')
