@@ -1,0 +1,15 @@
+{
+  "track": "10min_16mb",
+  "val_bpb_mean": 1.08286,
+  "val_bpb_std": 0.00070,
+  "seeds": [1337, 42, 2025],
+  "results": {
+    "1337": {"val_bpb": 1.08254749, "val_loss": 2.79633260, "bytes_total": 15988547},
+    "42": {"val_bpb": 1.08237395, "val_loss": 2.79588432, "bytes_total": 15990325},
+    "2025": {"val_bpb": 1.08365966, "val_loss": 2.79920546, "bytes_total": 15989566}
+  },
+  "base_pr": 1394,
+  "hardware": "8xH100 SXM",
+  "training_time_seconds": 588,
+  "eval_method": "legal_score_first_ttt"
+}
