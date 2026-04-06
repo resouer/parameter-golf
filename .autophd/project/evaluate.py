@@ -170,8 +170,7 @@ if [ -n "$PGOLF_GIT_TOKEN" ]; then
 else
     CLONE_URL="{REPO_URL}"
 fi
-# Shallow clone with only the needed branch — avoids pulling 100s of records/ files
-GIT_TERMINAL_PROMPT=0 git clone --quiet --depth 1 --single-branch -b {branch or 'main'} "$CLONE_URL" /workspace/pgolf
+GIT_TERMINAL_PROMPT=0 git clone --quiet "$CLONE_URL" /workspace/pgolf
 """
 
     return f"""set -e
@@ -179,11 +178,8 @@ pip install -q sentencepiece huggingface-hub tiktoken zstandard brotli 2>/dev/nu
 
 {clone_setup}
 cd /workspace/pgolf
-# For shallow clones, fetch the exact commit if not already at HEAD
-CURRENT=$(git rev-parse HEAD)
-if [ "$CURRENT" != "{commit_sha}" ] && [ "${{CURRENT:0:7}}" != "{commit_sha[:7]}" ]; then
-    git fetch --depth 1 origin {commit_sha} 2>/dev/null && git checkout {commit_sha} || echo "Already at correct commit"
-fi
+git fetch origin {f'{branch}' if branch else '--all'}
+git checkout {commit_sha}
 
 export PYTHONUNBUFFERED=1
 
