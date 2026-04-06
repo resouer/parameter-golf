@@ -194,16 +194,12 @@ if [ -d logs ]; then
     python3 -c "
 import re, json, sys, glob, os
 log = open('$LOGFILE').read()
-r = {}
-# Find last val_bpb (any format: val_bpb:X or val_bpb=X or val_bpb X)
+r = dict()
 for m in re.finditer(r'val_bpb[=: ]+(\d+\.\d+)', log): r['val_bpb'] = float(m.group(1))
 for m in re.finditer(r'val_loss[=: ]+(\d+\.\d+)', log): r['val_loss'] = float(m.group(1))
-# Find artifact size
 for m in re.finditer(r'Total submission size[^:]*:\s*(\d+)', log): r['bytes_total'] = int(m.group(1))
-# Find peak memory
 for m in re.finditer(r'peak memory allocated:\s*(\d+)\s*MiB', log): r['peak_memory_mib'] = int(m.group(1))
-if r.get('val_bpb'):
-    print(f'results_json: {json.dumps(r)}')
+if r.get('val_bpb'): print('results_json: ' + json.dumps(r))
 " 2>/dev/null || true
   fi
 fi
