@@ -566,6 +566,14 @@ def main():
     if not branch or branch == "HEAD":
         _output(False, error="cannot detect git branch")
 
+    # Guard: submission/ branches are for PRs only, not GPU evaluation.
+    # They fork from upstream/main and include the full repo (100s of files),
+    # causing clone failures on remote GPU containers.
+    if branch.startswith("submission/"):
+        _output(False, error=f"branch '{branch}' is a submission branch (for PRs only). "
+                f"Use an exp/ branch for GPU evaluation. "
+                f"Submission branches include the full upstream repo and will fail on remote.")
+
     _log(f"Pushing {branch}...")
     r = subprocess.run(["git", "push", "origin", branch, "--force"], capture_output=True, text=True)
     if r.returncode != 0:
