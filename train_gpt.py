@@ -407,20 +407,29 @@ def build_ngram_extension():
 		from fused_expert_ext import ContextMixer;return True
 	except ImportError:pass
 	subprocess.check_call([sys.executable,'-m','pip','install','-q','nanobind','cmake'])
-	src_dir=os.path.dirname(os.path.abspath(__file__));cpp=os.path.join(src_dir,'fused_expert_blend.cpp')
+	import sysconfig as _sc;src_dir=os.path.dirname(os.path.abspath(__file__));cpp=os.path.join(src_dir,'fused_expert_blend.cpp')
 	if not os.path.exists(cpp):log('ngram:cpp source not found');return False
 	bd=os.path.join(src_dir,'_ngram_build');os.makedirs(bd,exist_ok=True)
-	with open(os.path.join(bd,'CMakeLists.txt'),'w')as f:f.write(f'cmake_minimum_required(VERSION 3.15)\nproject(fe)\nfind_package(Python 3.8 REQUIRED COMPONENTS Interpreter Development.Module)\nfind_package(nanobind CONFIG REQUIRED)\nnanobind_add_module(fused_expert_ext {cpp})\n')
+	import nanobind;nb_dir=os.path.dirname(nanobind.__file__);nb_inc=nanobind.include_dir();py_inc=_sc.get_path('include');suffix=_sc.get_config_var('EXT_SUFFIX')or'.so';out=os.path.join(bd,f'fused_expert_ext{suffix}');nb_src=os.path.join(nb_dir,'src','nb_combined.cpp')
 	try:
-		import nanobind;nbd=nanobind.cmake_dir()
-		subprocess.check_call(['cmake','-S',bd,'-B',bd,f'-DCMAKE_PREFIX_PATH={nbd}','-DCMAKE_BUILD_TYPE=Release'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-		subprocess.check_call(['cmake','--build',bd,'--config','Release'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+		r=subprocess.run(['g++','-O2','-shared','-fPIC','-std=c++17','-fvisibility=hidden','-I',nb_inc,'-I',py_inc,nb_src,cpp,'-o',out],capture_output=True,text=True)
+		if r.returncode!=0:log(f'ngram:g++ failed: {r.stderr[:500]}');raise RuntimeError('g++ failed')
+		if bd not in sys.path:sys.path.insert(0,bd)
+		from fused_expert_ext import ContextMixer;log('ngram:C++ extension built OK (g++)');return True
+	except Exception as e:log(f'ngram:g++ method failed: {e}')
+	try:
+		nbd=nanobind.cmake_dir()
+		with open(os.path.join(bd,'CMakeLists.txt'),'w')as f:f.write(f'cmake_minimum_required(VERSION 3.15)\nproject(fe)\nfind_package(Python 3.8 REQUIRED COMPONENTS Interpreter Development.Module)\nfind_package(nanobind CONFIG REQUIRED)\nnanobind_add_module(fused_expert_ext {cpp})\n')
+		r1=subprocess.run(['cmake','-S',bd,'-B',bd,f'-DCMAKE_PREFIX_PATH={nbd}','-DCMAKE_BUILD_TYPE=Release'],capture_output=True,text=True)
+		if r1.returncode!=0:log(f'ngram:cmake configure failed: {r1.stderr[:500]}');return False
+		r2=subprocess.run(['cmake','--build',bd,'--config','Release'],capture_output=True,text=True)
+		if r2.returncode!=0:log(f'ngram:cmake build failed: {r2.stderr[:500]}');return False
 		for fn in os.listdir(bd):
 			if fn.startswith('fused_expert_ext')and('.so'in fn or'.pyd'in fn):
 				if bd not in sys.path:sys.path.insert(0,bd)
 				break
-		from fused_expert_ext import ContextMixer;log('ngram:C++ extension built OK');return True
-	except Exception as e:log(f'ngram:C++ build failed: {e}');return False
+		from fused_expert_ext import ContextMixer;log('ngram:C++ extension built OK (cmake)');return True
+	except Exception as e:log(f'ngram:cmake method failed: {e}');return False
 def precompute_ngram_hints(h,val_data,device):
 	total_tokens=val_data.val_tokens.numel()-1;all_hints=np.zeros(total_tokens+1,dtype=np.int32);all_betas=np.zeros(total_tokens+1,dtype=np.float64);t0=time.perf_counter()
 	if h.is_main_process:
