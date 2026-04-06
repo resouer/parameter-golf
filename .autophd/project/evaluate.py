@@ -121,7 +121,20 @@ f=open('train_gpt.py').read()
 # Method 1: regex on raw source (unpacked code or header comments)
 m=re.search(r'VOCAB_SIZE.*?,\s*(\d+)',f)
 if m: print(m.group(1)); sys.exit()
-# Method 2: decompress lzma+base85 packed code, then regex
+# Method 2: try to exec packed code in a sandbox to extract Hyperparameters
+# Works for ANY packing scheme (lzma, zstd, gzip, custom) as long as exec() works.
+try:
+  import importlib,types
+  # Patch heavy imports to no-ops so exec is fast and doesn't need CUDA
+  for mod in ['torch','numpy','sentencepiece','flash_attn_3']:
+    if mod not in sys.modules: sys.modules[mod]=types.ModuleType(mod)
+  ns={'__builtins__':__builtins__,'os':__import__('os')}
+  exec(compile(f,'train_gpt.py','exec'),ns)
+  for v in ns.values():
+    if hasattr(v,'vocab_size'):
+      print(int(v.vocab_size)); sys.exit()
+except: pass
+# Method 3: decompress lzma+base85 specifically, then regex
 try:
   import lzma,base64
   m2=re.search(r\"b85decode\(b'(.+?)'\)\",f,re.DOTALL)
@@ -170,6 +183,32 @@ export PYTHONUNBUFFERED=1
 {data_setup}
 
 torchrun --nproc_per_node=8 train_gpt.py
+RC=$?
+
+# Post-training: emit structured results_json from log file if available.
+# This decouples evaluate.py parsing from train_gpt.py output format.
+# Works with ANY base code that writes val_bpb somewhere in its log.
+if [ -d logs ]; then
+  LOGFILE=$(ls -t logs/*.txt 2>/dev/null | head -1)
+  if [ -n "$LOGFILE" ]; then
+    python3 -c "
+import re, json, sys, glob, os
+log = open('$LOGFILE').read()
+r = {}
+# Find last val_bpb (any format: val_bpb:X or val_bpb=X or val_bpb X)
+for m in re.finditer(r'val_bpb[=: ]+(\d+\.\d+)', log): r['val_bpb'] = float(m.group(1))
+for m in re.finditer(r'val_loss[=: ]+(\d+\.\d+)', log): r['val_loss'] = float(m.group(1))
+# Find artifact size
+for m in re.finditer(r'Total submission size[^:]*:\s*(\d+)', log): r['bytes_total'] = int(m.group(1))
+# Find peak memory
+for m in re.finditer(r'peak memory allocated:\s*(\d+)\s*MiB', log): r['peak_memory_mib'] = int(m.group(1))
+if r.get('val_bpb'):
+    print(f'results_json: {json.dumps(r)}')
+" 2>/dev/null || true
+  fi
+fi
+
+exit $RC
 """
 
 
