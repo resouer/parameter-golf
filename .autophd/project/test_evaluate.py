@@ -300,16 +300,12 @@ class TestRemoteScript(unittest.TestCase):
         script = self._get_script()
         self.assertIn("VOCAB", script)
 
-    def test_script_no_duplicate_closing_paren(self):
-        """The vocab detection python3 -c block must end with exactly one ")."""
+    def test_script_vocab_detection_complete(self):
+        """Vocab detection block must produce a VOCAB variable."""
         script = self._get_script()
-        # Find the python3 -c block for vocab detection
-        import re
-        # After print(found...) there should be exactly one ")
-        m = re.search(r'print\(found[^\n]*\n("\))\n', script)
-        self.assertIsNotNone(m, "Should find closing \") after print(found...)")
-        # Check no double ")
-        self.assertNotIn('")\n")', script, "Duplicate closing paren in vocab detection script")
+        self.assertIn("VOCAB=", script, "Script must set VOCAB variable")
+        # No duplicate closing ") (from old python3 -c pattern)
+        self.assertNotIn('")\n")', script, "Duplicate closing paren in script")
 
     def test_script_no_fstring_braces_error(self):
         """Embedded Python must not have unescaped {} inside f-strings."""
