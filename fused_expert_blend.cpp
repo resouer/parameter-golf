@@ -1,5 +1,5 @@
-#include <torch/extension.h>
-#include <pybind11/numpy.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #include <sys/mman.h>
 #endif
 
-namespace py = pybind11;
+namespace nb = nanobind;
 
 static constexpr uint64_t PRIMES[] = {
     36313ULL,   27191ULL,   51647ULL,   81929ULL,   131071ULL,  196613ULL,
@@ -354,14 +354,14 @@ public:
         word_table_.init(20);
     }
 
-    void set_tokens(py::array_t<int64_t, py::array::c_style> t) {
+    void set_tokens(nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> t) {
         tokens_ = t.data(); n_tokens_ = int64_t(t.shape(0));
     }
 
     void set_luts(
-        py::array_t<int16_t, py::array::c_style> bb,
-        py::array_t<uint8_t, py::array::c_style> ls,
-        py::array_t<uint8_t, py::array::c_style> bd) {
+        nb::ndarray<const int16_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> bb,
+        nb::ndarray<const uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> ls,
+        nb::ndarray<const uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> bd) {
         base_bytes_ = bb.data(); has_ls_ = ls.data(); is_bnd_ = bd.data();
     }
 
@@ -375,14 +375,14 @@ public:
     }
 
     void get_hints_batch(
-        py::array_t<int64_t, py::array::c_style> positions,
-        py::array_t<int32_t, py::array::c_style> out_hints,
-        py::array_t<double, py::array::c_style> out_betas) {
+        nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> positions,
+        nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_hints,
+        nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_betas) {
 
         const int n = int(positions.shape(0));
         const int64_t* pos = positions.data();
-        int32_t* hints = out_hints.mutable_data();
-        double* betas = out_betas.mutable_data();
+        int32_t* hints = out_hints.data();
+        double* betas = out_betas.data();
 
         uint64_t hashes[OPEN_MAX];
         uint64_t next_hashes[OPEN_MAX];
@@ -448,20 +448,20 @@ public:
 
 };
 
-PYBIND11_MODULE(fused_expert_ext, m) {
+NB_MODULE(fused_expert_ext, m) {
     m.doc() = "N-gram hint generator with open-addressing (orders 8-16 + within-word + word-start)";
 
-    py::class_<ContextMixer>(m, "ContextMixer")
-        .def(py::init<double, double, double, double, double, double, int, double, int>(),
-             py::arg("base_beta") = 1.0, py::arg("agree_bonus") = 0.5,
-             py::arg("within_threshold") = 0.80, py::arg("within_beta") = 0.75,
-             py::arg("word_threshold") = 0.80, py::arg("word_beta") = 0.50,
-             py::arg("open_table_bits") = 22, py::arg("token_threshold_scale") = 1.0,
-             py::arg("order_stride") = 1)
-        .def("set_tokens", &ContextMixer::set_tokens, py::arg("tokens"))
+    nb::class_<ContextMixer>(m, "ContextMixer")
+        .def(nb::init<double, double, double, double, double, double, int, double, int>(),
+             nb::arg("base_beta") = 1.0, nb::arg("agree_bonus") = 0.5,
+             nb::arg("within_threshold") = 0.80, nb::arg("within_beta") = 0.75,
+             nb::arg("word_threshold") = 0.80, nb::arg("word_beta") = 0.50,
+             nb::arg("open_table_bits") = 22, nb::arg("token_threshold_scale") = 1.0,
+             nb::arg("order_stride") = 1)
+        .def("set_tokens", &ContextMixer::set_tokens, nb::arg("tokens"))
         .def("set_luts", &ContextMixer::set_luts,
-             py::arg("base_bytes"), py::arg("has_leading_space"), py::arg("is_boundary"))
+             nb::arg("base_bytes"), nb::arg("has_leading_space"), nb::arg("is_boundary"))
         .def("reset", &ContextMixer::reset)
         .def("get_hints_batch", &ContextMixer::get_hints_batch,
-             py::arg("positions"), py::arg("out_hints"), py::arg("out_betas"));
+             nb::arg("positions"), nb::arg("out_hints"), nb::arg("out_betas"))
 }
