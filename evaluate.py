@@ -115,7 +115,39 @@ fi
     else:
         data_setup = """
 # Auto-detect vocab size from train_gpt.py (default sp1024, supports sp4096+)
-VOCAB=$(python3 -c "import re; f=open('train_gpt.py').read(); m=re.search(r'VOCAB_SIZE.*?,\\s*(\\d+)', f); print(m.group(1) if m else '1024')")
+VOCAB=$(python3 -c "
+import re,sys,io
+f=open('train_gpt.py').read()
+found=None
+# Method 1: regex on raw source (unpacked code or header comments)
+m=re.search(r'VOCAB_SIZE.*?,\s*(\d+)',f)
+if m: found=m.group(1)
+# Method 2: exec sandbox (any packing scheme)
+if not found:
+  try:
+    import types
+    for mod in ['torch','numpy','sentencepiece','flash_attn_3']:
+      if mod not in sys.modules: sys.modules[mod]=types.ModuleType(mod)
+    ns={'__builtins__':__builtins__,'os':__import__('os')}
+    old=sys.stdout; sys.stdout=io.StringIO()
+    try: exec(compile(f,'train_gpt.py','exec'),ns)
+    except SystemExit: pass
+    finally: sys.stdout=old
+    for v in ns.values():
+      if hasattr(v,'vocab_size'): found=str(int(v.vocab_size)); break
+  except Exception: pass
+# Method 3: decompress lzma+base85 then regex
+if not found:
+  try:
+    import lzma,base64
+    m2=re.search(r\"b85decode\(b'(.+?)'\)\",f,re.DOTALL)
+    if m2:
+      code=lzma.decompress(base64.b85decode(m2.group(1))).decode()
+      m3=re.search(r'VOCAB_SIZE.*?,\s*(\d+)',code)
+      if m3: found=m3.group(1)
+  except Exception: pass
+print(found or '1024')
+")
 [ -z "$VOCAB" ] && VOCAB=1024
 SHARDS=80
 [ "$VOCAB" -gt 1024 ] && SHARDS=143
@@ -154,6 +186,28 @@ export PYTHONUNBUFFERED=1
 {data_setup}
 
 torchrun --nproc_per_node=8 train_gpt.py
+RC=$?
+
+# Post-training: emit structured results_json from log file if available.
+# This decouples evaluate.py parsing from train_gpt.py output format.
+# Works with ANY base code that writes val_bpb somewhere in its log.
+if [ -d logs ]; then
+  LOGFILE=$(ls -t logs/*.txt 2>/dev/null | head -1)
+  if [ -n "$LOGFILE" ]; then
+    python3 -c "
+import re, json, sys, glob, os
+log = open('$LOGFILE').read()
+r = dict()
+for m in re.finditer(r'val_bpb[=: ]+(\d+\.\d+)', log): r['val_bpb'] = float(m.group(1))
+for m in re.finditer(r'val_loss[=: ]+(\d+\.\d+)', log): r['val_loss'] = float(m.group(1))
+for m in re.finditer(r'Total submission size[^:]*:\s*(\d+)', log): r['bytes_total'] = int(m.group(1))
+for m in re.finditer(r'peak memory allocated:\s*(\d+)\s*MiB', log): r['peak_memory_mib'] = int(m.group(1))
+if r.get('val_bpb'): print('results_json: ' + json.dumps(r))
+" 2>/dev/null || true
+  fi
+fi
+
+exit $RC
 """
 
 
@@ -283,7 +337,7 @@ def _log_has_results(log_file):
         return False
     with open(log_file) as f:
         content = f.read()
-    return "results_json" in content or "final_int8" in content or "final_int6" in content
+    return "results_json" in content or ("eval_time" in content and "val_bpb" in content)
 
 
 def _stream_job_logs(job_id, log_file):
@@ -391,7 +445,7 @@ def _robust_log_capture(job_id, log_file, retries=10):
                      and not l.startswith("Selected replica")
                      and l.strip() != "Connection stopped."]
             text = "\n".join(lines).strip()
-            if "results_json" in text or "final_int8" in text or "final_int6" in text:
+            if "results_json" in text or ("eval_time" in text and "val_bpb" in text):
                 with open(log_file, "a") as f:
                     f.write(text + "\n")
                 return
@@ -418,11 +472,15 @@ def _extract_results(logs):
                 continue
             except (json.JSONDecodeError, IndexError):
                 pass
-        if "final_int8_zlib_roundtrip_exact" in line or "final_int6" in line:
-            m = re.search(r"val_bpb:(\d+\.\d+)", line)
+        # Match any eval result line: has val_bpb AND eval_time (or ttt done marker).
+        # This covers all eval methods (roundtrip, sliding, TTT, future) without keyword updates.
+        # Training checkpoints (e.g., "4000/20000 val_bpb: 1.13") lack eval_time so are excluded.
+        # Last match wins — TTT result (run last) overrides sliding which overrides roundtrip.
+        if ("eval_time" in line or "ttt_sliding:done" in line) and re.search(r"val_bpb[=:]", line):
+            m = re.search(r"val_bpb[=:](\d+\.\d+)", line)
             if m:
                 results["val_bpb"] = float(m.group(1))
-            m = re.search(r"val_loss:(\d+\.\d+)", line)
+            m = re.search(r"val_loss[=:](\d+\.\d+)", line)
             if m:
                 results["val_loss"] = float(m.group(1))
         if "Total submission size" in line:
@@ -452,6 +510,13 @@ def _output(pass_val, score=None, details=None, error=None):
         result["details"] = details
     if error:
         result["error"] = error
+    # Persist result to file BEFORE stdout — survives parent process kill.
+    result_file = os.path.join(WORKSPACE, "last_result.json")
+    try:
+        with open(result_file, "w") as f:
+            json.dump(result, f)
+    except Exception:
+        pass
     print(json.dumps(result))
     sys.exit(0)
 
@@ -462,11 +527,36 @@ def _output(pass_val, score=None, details=None, error=None):
 
 def main():
     import argparse
+    import signal
     parser = argparse.ArgumentParser(description="Parameter Golf evaluator (self-contained)")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     parser.add_argument("--node-group", default=os.environ.get("AUTORESEARCH_NODE_GROUP", "heimdall-dev"))
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     args = parser.parse_args()
+
+    # Signal handler: on SIGTERM/SIGINT, attempt final log capture before dying.
+    # This catches the case where the calling Bash shell kills us (e.g., 10-min timeout).
+    _main_state = {"job_id": None, "log_file": None}
+
+    def _signal_handler(signum, frame):
+        if _main_state["job_id"] and _main_state["log_file"]:
+            _log(f"Signal {signum} received — attempting final log capture...")
+            try:
+                _robust_log_capture(_main_state["job_id"], _main_state["log_file"])
+                log_content = open(_main_state["log_file"]).read()
+                results = _extract_results(log_content)
+                if results.get("val_bpb"):
+                    _log(f"Saved partial results: val_bpb={results['val_bpb']}")
+                    result_file = os.path.join(WORKSPACE, "last_result.json")
+                    with open(result_file, "w") as f:
+                        json.dump({"pass": False, "error": f"killed by signal {signum}",
+                                   "score": -results["val_bpb"], "details": results}, f)
+            except Exception as e:
+                _log(f"Final capture failed: {e}")
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
 
     # 1. Detect and push branch
     branch = os.environ.get("AUTORESEARCH_BRANCH")
@@ -492,6 +582,8 @@ def main():
 
     # 3. Start log streaming in background thread
     log_file = _log_path(job_id)
+    _main_state["job_id"] = job_id
+    _main_state["log_file"] = log_file
     log_thread = threading.Thread(target=_stream_job_logs, args=(job_id, log_file), daemon=True)
     log_thread.start()
 
