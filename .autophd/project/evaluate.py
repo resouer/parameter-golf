@@ -116,34 +116,38 @@ fi
         data_setup = """
 # Auto-detect vocab size from train_gpt.py (default sp1024, supports sp4096+)
 VOCAB=$(python3 -c "
-import re,sys
+import re,sys,io
 f=open('train_gpt.py').read()
+found=None
 # Method 1: regex on raw source (unpacked code or header comments)
 m=re.search(r'VOCAB_SIZE.*?,\s*(\d+)',f)
-if m: print(m.group(1)); sys.exit()
-# Method 2: try to exec packed code in a sandbox to extract Hyperparameters
-# Works for ANY packing scheme (lzma, zstd, gzip, custom) as long as exec() works.
-try:
-  import importlib,types
-  # Patch heavy imports to no-ops so exec is fast and doesn't need CUDA
-  for mod in ['torch','numpy','sentencepiece','flash_attn_3']:
-    if mod not in sys.modules: sys.modules[mod]=types.ModuleType(mod)
-  ns={'__builtins__':__builtins__,'os':__import__('os')}
-  exec(compile(f,'train_gpt.py','exec'),ns)
-  for v in ns.values():
-    if hasattr(v,'vocab_size'):
-      print(int(v.vocab_size)); sys.exit()
-except: pass
-# Method 3: decompress lzma+base85 specifically, then regex
-try:
-  import lzma,base64
-  m2=re.search(r\"b85decode\(b'(.+?)'\)\",f,re.DOTALL)
-  if m2:
-    code=lzma.decompress(base64.b85decode(m2.group(1))).decode()
-    m3=re.search(r'VOCAB_SIZE.*?,\s*(\d+)',code)
-    if m3: print(m3.group(1)); sys.exit()
-except: pass
-print('1024')
+if m: found=m.group(1)
+# Method 2: exec sandbox (any packing scheme)
+if not found:
+  try:
+    import types
+    for mod in ['torch','numpy','sentencepiece','flash_attn_3']:
+      if mod not in sys.modules: sys.modules[mod]=types.ModuleType(mod)
+    ns={'__builtins__':__builtins__,'os':__import__('os')}
+    old=sys.stdout; sys.stdout=io.StringIO()
+    try: exec(compile(f,'train_gpt.py','exec'),ns)
+    except SystemExit: pass
+    finally: sys.stdout=old
+    for v in ns.values():
+      if hasattr(v,'vocab_size'): found=str(int(v.vocab_size)); break
+  except Exception: pass
+# Method 3: decompress lzma+base85 then regex
+if not found:
+  try:
+    import lzma,base64
+    m2=re.search(r\"b85decode\(b'(.+?)'\)\",f,re.DOTALL)
+    if m2:
+      code=lzma.decompress(base64.b85decode(m2.group(1))).decode()
+      m3=re.search(r'VOCAB_SIZE.*?,\s*(\d+)',code)
+      if m3: found=m3.group(1)
+  except Exception: pass
+print(found or '1024')
+")
 ")
 [ -z "$VOCAB" ] && VOCAB=1024
 SHARDS=80
