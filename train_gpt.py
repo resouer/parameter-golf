@@ -103,6 +103,13 @@ class Hyperparameters():
     # Parallel Residuals (Modification 5)
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
 
+    # BigramHash (from #1019 pattern)
+    bigram_vocab_size = int(os.environ.get('BIGRAM_VOCAB_SIZE', '3072'))
+    bigram_dim = int(os.environ.get('BIGRAM_DIM', '112'))
+
+    # PROTEUS: Untied MLP for recurrence layers
+    recur_untie_mlp = bool(int(os.environ.get('RECUR_UNTIE_MLP', '1')))
+
     # TTT (Modification 4)
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
@@ -556,6 +563,40 @@ class ValueEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 
+class SmearGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1 - g) * x + g * x_prev
+
+
+class BigramHashEmbedding(nn.Module):
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+    def bigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.bigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self.bigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
+
+
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
@@ -571,7 +612,7 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, train_seq_len: int,
-                 layer_idx: int = 0, ln_scale: bool = False):
+                 layer_idx: int = 0, ln_scale: bool = False, parallel: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -581,13 +622,18 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        self.parallel = parallel
+        if parallel:
+            self.resid_mix_mlp = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+            self.route = nn.Parameter(torch.tensor([1.0, 1.0, 1.0, 1.0]))
 
-    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None, mlp_override: nn.Module | None = None) -> Tensor:
+        mlp_fn = mlp_override if mlp_override is not None else self.mlp
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_fn(self.mlp_norm(x_out) * self.ln_scale_factor)
         return x_out
 
 
@@ -601,6 +647,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
+        self.bigram = BigramHashEmbedding(h.bigram_vocab_size, h.bigram_dim, h.model_dim) if h.bigram_vocab_size > 0 else None
+        self.smear = SmearGate(h.model_dim) if h.bigram_vocab_size > 0 else None
         if h.embedding_dim != h.model_dim:
             self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
             self.head_proj = CastedLinear(h.model_dim, h.embedding_dim, bias=False)
@@ -614,7 +662,8 @@ class GPT(nn.Module):
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
         self.blocks = nn.ModuleList([
             Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult, h.rope_base,
-                  h.qk_gain_init, h.train_seq_len, layer_idx=i, ln_scale=h.ln_scale)
+                  h.qk_gain_init, h.train_seq_len, layer_idx=i, ln_scale=h.ln_scale,
+                  parallel=(h.parallel_start_layer > 0 and i >= h.parallel_start_layer))
             for i in range(h.num_layers)
         ])
         if h.rope_dims > 0:
@@ -651,6 +700,17 @@ class GPT(nn.Module):
             self.lane_merge = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
         else:
             self.lane_merge = None
+
+        # PROTEUS: Untied MLP weights for recurrence layers
+        self.recur_untie_mlp = h.recur_untie_mlp
+        self._recur_layer_set = set(self.recur_layers)
+        if self.recur_layers and h.recur_untie_mlp:
+            self.recur_mlps = nn.ModuleDict({
+                str(lid): MLP(h.model_dim, h.mlp_mult)
+                for lid in self.recur_layers
+            })
+        else:
+            self.recur_mlps = None
 
         self._init_weights()
 
@@ -697,11 +757,21 @@ class GPT(nn.Module):
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
 
+    def _get_recur_mlp(self, phys_idx: int) -> nn.Module | None:
+        """Return untied MLP for recurrence pass, or None for normal pass."""
+        if self.recur_mlps is not None and str(phys_idx) in self.recur_mlps:
+            return self.recur_mlps[str(phys_idx)]
+        return None
+
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
             x = self.embed_proj(x)
+        if self.smear is not None:
+            x = self.smear(x)
         x0 = x
 
         virtual_layers = self._get_virtual_layers()
@@ -718,22 +788,36 @@ class GPT(nn.Module):
         lane0 = None  # attention lane
         lane1 = None  # MLP lane
 
+        # Track which physical layers have been visited (for recurrence detection)
+        visited_layers: set[int] = set()
+
         # Encoder phase
         for vi in range(num_enc):
             phys_idx = virtual_layers[vi]
+            is_recur_pass = phys_idx in visited_layers
             ve = self._get_ve(phys_idx, input_ids, ve_cache)
-            x = self.blocks[phys_idx](x, x0, v_embed=ve)
+            recur_mlp = self._get_recur_mlp(phys_idx) if is_recur_pass else None
+            x = self.blocks[phys_idx](x, x0, v_embed=ve, mlp_override=recur_mlp)
+            visited_layers.add(phys_idx)
             skips.append(x)
 
         # Decoder phase with U-Net skip connections
         for vi in range(num_dec):
             phys_idx = virtual_layers[num_enc + vi]
+            is_recur_pass = phys_idx in visited_layers
+
             if skips and vi < self.num_skip_weights:
-                scaled_skip = self.skip_weights[vi].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                if self.skip_gates is not None:
+                if is_parallel_mode:
+                    # In parallel mode, add skip to both lanes (per #1289 PROTEUS)
+                    scaled_skip = self.skip_weights[vi].to(dtype=lane0.dtype)[None, None, :] * skips.pop()
+                    lane0 = lane0 + scaled_skip
+                    lane1 = lane1 + scaled_skip
+                elif self.skip_gates is not None:
+                    scaled_skip = self.skip_weights[vi].to(dtype=x.dtype)[None, None, :] * skips.pop()
                     g = torch.sigmoid(self.skip_gates[vi].to(dtype=x.dtype))[None, None, :]
                     x = torch.lerp(scaled_skip, x, g)
                 else:
+                    scaled_skip = self.skip_weights[vi].to(dtype=x.dtype)[None, None, :] * skips.pop()
                     x = x + scaled_skip
 
             # Check if we should enter parallel mode
@@ -745,20 +829,29 @@ class GPT(nn.Module):
             if is_parallel_mode:
                 block = self.blocks[phys_idx]
                 ve = self._get_ve(phys_idx, input_ids, ve_cache)
+                recur_mlp = self._get_recur_mlp(phys_idx) if is_recur_pass else None
+                mlp_fn = recur_mlp if recur_mlp is not None else block.mlp
 
-                # Attention operates on lane0
-                mix = block.resid_mix.to(dtype=lane0.dtype)
-                attn_in = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
+                # PROTEUS routing: separate residual mixing for each lane
+                mix_attn = block.resid_mix.to(dtype=lane0.dtype)
+                attn_in = mix_attn[0][None, None, :] * lane0 + mix_attn[1][None, None, :] * x0
                 attn_out = block.attn(block.attn_norm(attn_in) * block.ln_scale_factor, v_embed=ve)
-                lane0 = attn_in + block.attn_scale.to(dtype=attn_in.dtype)[None, None, :] * attn_out
+                attn_delta = block.attn_scale.to(dtype=attn_in.dtype)[None, None, :] * attn_out
 
-                # MLP operates on lane1
-                mlp_in = block.mlp_norm(lane1) * block.ln_scale_factor
-                mlp_out = block.mlp(mlp_in)
-                lane1 = lane1 + block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_out
+                mix_mlp = block.resid_mix_mlp.to(dtype=lane1.dtype)
+                mlp_in = mix_mlp[0][None, None, :] * lane1 + mix_mlp[1][None, None, :] * x0
+                mlp_delta = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_fn(block.mlp_norm(mlp_in) * block.ln_scale_factor)
+
+                # 4-way routing
+                r = block.route.to(dtype=lane0.dtype)
+                lane0 = lane0 + r[0] * attn_delta + r[2] * mlp_delta
+                lane1 = lane1 + r[1] * attn_delta + r[3] * mlp_delta
             else:
                 ve = self._get_ve(phys_idx, input_ids, ve_cache)
-                x = self.blocks[phys_idx](x, x0, v_embed=ve)
+                recur_mlp = self._get_recur_mlp(phys_idx) if is_recur_pass else None
+                x = self.blocks[phys_idx](x, x0, v_embed=ve, mlp_override=recur_mlp)
+
+            visited_layers.add(phys_idx)
 
         # Merge parallel lanes if active
         if is_parallel_mode:
@@ -783,7 +876,9 @@ class GPT(nn.Module):
 def classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
-    if ".mlp." in name:
+    if "bigram" in name or "smear" in name:
+        return "embed"
+    if "recur_mlps" in name or ".mlp." in name:
         return "mlp"
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
         return "attn"
@@ -890,8 +985,24 @@ class Optimizers():
         if base_model.lane_merge is not None:
             scalar_params.append(base_model.lane_merge)
 
+        # PROTEUS: recur_untie_mlp params
+        if base_model.recur_mlps is not None:
+            for name, p in base_model.recur_mlps.named_parameters():
+                if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                    matrix_params.append(p)
+                else:
+                    scalar_params.append(p)
+
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
+        # BigramHash params
+        if base_model.bigram is not None:
+            tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
+            if base_model.bigram.proj is not None:
+                matrix_params.append(base_model.bigram.proj.weight)
+            scalar_params.append(base_model.bigram.scale)
+        if base_model.smear is not None:
+            scalar_params.append(base_model.smear.gate)
         if base_model.ve_shared is not None:
             tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
             if base_model.ve_shared.proj is not None:
@@ -955,7 +1066,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,ve_layer_scales,ve_shared.scale,lane_merge",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,resid_mix_mlp,route,q_gain,skip_weight,skip_weights,skip_gates,ve_layer_scales,ve_shared.scale,lane_merge,bigram.scale,smear.gate",
     ).split(",")
     if pattern
 )
