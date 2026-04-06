@@ -115,24 +115,12 @@ fi
     else:
         data_setup = """
 # Auto-detect vocab size from train_gpt.py (default sp1024, supports sp4096+)
-VOCAB=$(python3 << 'PYEOF'
-import re, sys
-f = open('train_gpt.py').read()
-found = None
-m = re.search(r'VOCAB_SIZE.*?,\s*(\d+)', f)
-if m: found = m.group(1)
-if not found:
-    try:
-        import lzma, base64
-        m2 = re.search(r"b85decode\(b'(.+?)'\)", f, re.DOTALL)
-        if m2:
-            code = lzma.decompress(base64.b85decode(m2.group(1))).decode()
-            m3 = re.search(r'VOCAB_SIZE.*?,\s*(\d+)', code)
-            if m3: found = m3.group(1)
-    except Exception: pass
-print(found or '1024')
-PYEOF
-)
+# Uses remote_helper.py if available, falls back to simple regex
+if [ -f remote_helper.py ]; then
+    VOCAB=$(python3 remote_helper.py detect-vocab)
+else
+    VOCAB=$(python3 -c "import re;f=open('train_gpt.py').read();m=re.search(r'VOCAB_SIZE.*?,\s*(\d+)',f);print(m.group(1) if m else '1024')")
+fi
 [ -z "$VOCAB" ] && VOCAB=1024
 SHARDS=80
 [ "$VOCAB" -gt 1024 ] && SHARDS=143
@@ -179,16 +167,9 @@ RC=$?
 if [ -d logs ]; then
   LOGFILE=$(ls -t logs/*.txt 2>/dev/null | head -1)
   if [ -n "$LOGFILE" ]; then
-    python3 -c "
-import re, json, sys, glob, os
-log = open('$LOGFILE').read()
-r = dict()
-for m in re.finditer(r'val_bpb[=: ]+(\d+\.\d+)', log): r['val_bpb'] = float(m.group(1))
-for m in re.finditer(r'val_loss[=: ]+(\d+\.\d+)', log): r['val_loss'] = float(m.group(1))
-for m in re.finditer(r'Total submission size[^:]*:\s*(\d+)', log): r['bytes_total'] = int(m.group(1))
-for m in re.finditer(r'peak memory allocated:\s*(\d+)\s*MiB', log): r['peak_memory_mib'] = int(m.group(1))
-if r.get('val_bpb'): print('results_json: ' + json.dumps(r))
-" 2>/dev/null || true
+    if [ -f remote_helper.py ]; then
+        python3 remote_helper.py collect-results 2>/dev/null || true
+    fi
   fi
 fi
 

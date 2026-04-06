@@ -271,14 +271,16 @@ def setup_worker(worker, baseline_code, main_repo, dry_run=False):
     else:
         print(f"  WARNING: train_gpt.py not found and no baseline code available")
 
-    # Deploy latest evaluate.py from main repo
-    main_eval = os.path.join(main_repo, ".autophd", "project", "evaluate.py")
-    worker_eval = os.path.join(repo, "evaluate.py")
-    if os.path.exists(main_eval):
-        shutil.copy2(main_eval, worker_eval)
-        print(f"  evaluate.py: deployed from main repo")
-    else:
-        print(f"  WARNING: evaluate.py not found in main repo")
+    # Deploy latest infra scripts from main repo
+    infra_dir = os.path.join(main_repo, ".autophd", "project")
+    for script in ["evaluate.py", "remote_helper.py"]:
+        src = os.path.join(infra_dir, script)
+        dst = os.path.join(repo, script)
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            print(f"  {script}: deployed from main repo")
+        else:
+            print(f"  WARNING: {script} not found in main repo")
 
     # Verify base code
     if os.path.exists(train_path):
