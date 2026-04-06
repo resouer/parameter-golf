@@ -402,8 +402,8 @@ def train_and_eval(h,device):
 	if h.distributed:dist.barrier()
 	eval_model=deserialize(h,device)
 	if h.num_loops>0:eval_model.looping_active=True
-	compiled_model=torch.compile(eval_model,dynamic=False,fullgraph=True);timed_eval('quantized',eval_val,h,device,val_data,compiled_model)
-	if h.sliding_window_enabled:timed_eval('quantized_sliding_window',eval_val_sliding,h,device,val_data,eval_model)
+	compiled_model=torch.compile(eval_model,dynamic=False,fullgraph=True);timed_eval('final_int6_roundtrip_exact',eval_val,h,device,val_data,compiled_model)
+	if h.sliding_window_enabled:timed_eval('final_int6_sliding_window',eval_val_sliding,h,device,val_data,eval_model)
 def main():
 	world_size=int(os.environ.get('WORLD_SIZE','1'));local_rank=int(os.environ.get('LOCAL_RANK','0'));distributed='RANK'in os.environ and'WORLD_SIZE'in os.environ
 	if not torch.cuda.is_available():raise RuntimeError('CUDA is required')
