@@ -571,7 +571,7 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, train_seq_len: int,
-                 layer_idx: int = 0, ln_scale: bool = False):
+                 layer_idx: int = 0, ln_scale: bool = False, parallel: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -581,6 +581,10 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        self.parallel = parallel
+        if parallel:
+            self.resid_mix_mlp = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+            self.route = nn.Parameter(torch.tensor([1.0, 1.0, 1.0, 1.0]))
 
     def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -614,7 +618,8 @@ class GPT(nn.Module):
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
         self.blocks = nn.ModuleList([
             Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult, h.rope_base,
-                  h.qk_gain_init, h.train_seq_len, layer_idx=i, ln_scale=h.ln_scale)
+                  h.qk_gain_init, h.train_seq_len, layer_idx=i, ln_scale=h.ln_scale,
+                  parallel=(h.parallel_start_layer > 0 and i >= h.parallel_start_layer))
             for i in range(h.num_layers)
         ])
         if h.rope_dims > 0:
@@ -728,13 +733,6 @@ class GPT(nn.Module):
         # Decoder phase with U-Net skip connections
         for vi in range(num_dec):
             phys_idx = virtual_layers[num_enc + vi]
-            if skips and vi < self.num_skip_weights:
-                scaled_skip = self.skip_weights[vi].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                if self.skip_gates is not None:
-                    g = torch.sigmoid(self.skip_gates[vi].to(dtype=x.dtype))[None, None, :]
-                    x = torch.lerp(scaled_skip, x, g)
-                else:
-                    x = x + scaled_skip
 
             # Check if we should enter parallel mode
             if phys_idx >= parallel_start_physical and not is_parallel_mode:
@@ -743,20 +741,45 @@ class GPT(nn.Module):
                 is_parallel_mode = True
 
             if is_parallel_mode:
+                # Skip connections: apply to both lanes
+                if skips and vi < self.num_skip_weights:
+                    scaled_skip = self.skip_weights[vi].to(dtype=lane0.dtype)[None, None, :] * skips.pop()
+                    if self.skip_gates is not None:
+                        g = torch.sigmoid(self.skip_gates[vi].to(dtype=lane0.dtype))[None, None, :]
+                        lane0 = torch.lerp(scaled_skip, lane0, g)
+                        lane1 = torch.lerp(scaled_skip, lane1, g)
+                    else:
+                        lane0 = lane0 + scaled_skip
+                        lane1 = lane1 + scaled_skip
+
                 block = self.blocks[phys_idx]
                 ve = self._get_ve(phys_idx, input_ids, ve_cache)
 
-                # Attention operates on lane0
-                mix = block.resid_mix.to(dtype=lane0.dtype)
-                attn_in = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
-                attn_out = block.attn(block.attn_norm(attn_in) * block.ln_scale_factor, v_embed=ve)
-                lane0 = attn_in + block.attn_scale.to(dtype=attn_in.dtype)[None, None, :] * attn_out
+                # 4-way routing (PROTEUS from #1289)
+                r = block.route.to(dtype=lane0.dtype)
 
-                # MLP operates on lane1
-                mlp_in = block.mlp_norm(lane1) * block.ln_scale_factor
-                mlp_out = block.mlp(mlp_in)
-                lane1 = lane1 + block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_out
+                # Attention input with resid_mix (lane0)
+                mix_attn = block.resid_mix.to(dtype=lane0.dtype)
+                attn_in = mix_attn[0][None, None, :] * lane0 + mix_attn[1][None, None, :] * x0
+                attn_out = block.attn(block.attn_norm(attn_in) * block.ln_scale_factor, v_embed=ve)
+                attn_delta = block.attn_scale.to(dtype=lane0.dtype)[None, None, :] * attn_out
+
+                # MLP input with resid_mix_mlp (lane1)
+                mix_mlp = block.resid_mix_mlp.to(dtype=lane1.dtype)
+                mlp_in = mix_mlp[0][None, None, :] * lane1 + mix_mlp[1][None, None, :] * x0
+                mlp_delta = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(block.mlp_norm(mlp_in) * block.ln_scale_factor)
+
+                # 4-way route: both deltas go to both lanes
+                lane0 = lane0 + r[0] * attn_delta + r[2] * mlp_delta
+                lane1 = lane1 + r[1] * attn_delta + r[3] * mlp_delta
             else:
+                if skips and vi < self.num_skip_weights:
+                    scaled_skip = self.skip_weights[vi].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                    if self.skip_gates is not None:
+                        g = torch.sigmoid(self.skip_gates[vi].to(dtype=x.dtype))[None, None, :]
+                        x = torch.lerp(scaled_skip, x, g)
+                    else:
+                        x = x + scaled_skip
                 ve = self._get_ve(phys_idx, input_ids, ve_cache)
                 x = self.blocks[phys_idx](x, x0, v_embed=ve)
 
