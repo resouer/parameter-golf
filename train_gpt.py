@@ -104,7 +104,7 @@ class Hyperparameters():
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
 
     # BigramHash (from #1019 pattern)
-    bigram_vocab_size = int(os.environ.get('BIGRAM_VOCAB_SIZE', '2048'))
+    bigram_vocab_size = int(os.environ.get('BIGRAM_VOCAB_SIZE', '0'))
     bigram_dim = int(os.environ.get('BIGRAM_DIM', '112'))
 
     # PROTEUS: Untied MLP for recurrence layers
@@ -121,7 +121,7 @@ class Hyperparameters():
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 
     # Compression
-    compressor = os.environ.get('COMPRESSOR', 'lzma')  #(lzma or brotli)
+    compressor = os.environ.get('COMPRESSOR', 'brotli')  #(lzma or brotli)
     gptq_enabled = bool(int(os.environ.get('GPTQ_ENABLED', '1')))
     gptq_calibration_batches = int(os.environ.get('GPTQ_CALIBRATION_BATCHES', 64))
     gptq_reserve_seconds = float(os.environ.get('GPTQ_RESERVE_SECONDS', 10.0))
