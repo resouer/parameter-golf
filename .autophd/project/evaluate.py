@@ -148,7 +148,6 @@ if not found:
   except Exception: pass
 print(found or '1024')
 ")
-")
 [ -z "$VOCAB" ] && VOCAB=1024
 SHARDS=80
 [ "$VOCAB" -gt 1024 ] && SHARDS=143
