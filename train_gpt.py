@@ -107,7 +107,7 @@ class CausalSelfAttention(nn.Module):
 		y=y.reshape(bsz,seqlen,dim);return self.proj(y)
 class MLP(nn.Module):
 	def __init__(self,dim,mlp_mult):super().__init__();hidden=int(mlp_mult*dim);self.fc=CastedLinear(dim,hidden,bias=False);self.proj=CastedLinear(hidden,dim,bias=False);self.proj._zero_init=True
-	def forward(self,x):return self.proj(F.leaky_relu(self.fc(x),negative_slope=.9).square())
+	def forward(self,x):return self.proj(F.leaky_relu(self.fc(x),negative_slope=.5).square())
 class Block(nn.Module):
 	def __init__(self,dim,num_heads,num_kv_heads,mlp_mult,rope_base,qk_gain_init,train_seq_len,layer_idx=0,ln_scale=False):super().__init__();self.attn_norm=RMSNorm();self.mlp_norm=RMSNorm();self.attn=CausalSelfAttention(dim,num_heads,num_kv_heads,rope_base,qk_gain_init,train_seq_len);self.mlp=MLP(dim,mlp_mult);self.attn_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32));self.mlp_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32));self.resid_mix=nn.Parameter(torch.stack((torch.ones(dim),torch.zeros(dim))).float());self.ln_scale_factor=1./math.sqrt(layer_idx+1)if ln_scale else 1.;self.parallel=False
 	def forward(self,x,x0):
