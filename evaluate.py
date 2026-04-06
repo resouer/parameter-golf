@@ -120,8 +120,9 @@ VOCAB=$(python3 -c "import re; f=open('train_gpt.py').read(); m=re.search(r'VOCA
 SHARDS=80
 [ "$VOCAB" -gt 1024 ] && SHARDS=143
 echo "data_setup: vocab=$VOCAB shards=$SHARDS"
-# SP4096 data hosted on kevclark's HuggingFace repo, not the default
+# Non-default vocab: use kevclark's HF repo + delete stale manifest (SP8192 not in default manifest)
 [ "$VOCAB" -gt 1024 ] && export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
+[ "$VOCAB" -gt 1024 ] && rm -f data/manifest.json
 if [ ! -f "data/datasets/.download_complete_sp${VOCAB}" ]; then
     python data/cached_challenge_fineweb.py --variant sp${VOCAB} --train-shards $SHARDS
     touch "data/datasets/.download_complete_sp${VOCAB}"
