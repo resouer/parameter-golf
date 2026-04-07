@@ -1,5 +1,5 @@
-#include <nanobind/nanobind.h>
-#include <nanobind/ndarray.h>
+#include <torch/extension.h>
+#include <pybind11/numpy.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #include <sys/mman.h>
 #endif
 
-namespace nb = nanobind;
+namespace py = pybind11;
 
 static constexpr uint64_t PRIMES[] = {
     36313ULL,   27191ULL,   51647ULL,   81929ULL,   131071ULL,  196613ULL,
@@ -227,8 +227,8 @@ class ContextMixer {
         }
     }
 
-    void within_hint(int& out_tok, double& out_beta) {
-        if (within_len_ == 0) {
+    void within_hint(bool is_bnd, bool is_ws, int& out_tok, double& out_beta) {
+        if (is_bnd || is_ws || within_len_ == 0) {
             out_tok = -1; out_beta = 0.0; return;
         }
         uint64_t ctx = within_hash_ ^ (uint64_t(within_len_) * LEN_MIX);
@@ -266,8 +266,8 @@ class ContextMixer {
         return h;
     }
 
-    void word_hint(int& out_tok, double& out_beta) {
-        if (word_ring_fill_ < WORD_ORDER) {
+    void word_hint(bool is_ws, int& out_tok, double& out_beta) {
+        if (!is_ws || word_ring_fill_ < WORD_ORDER) {
             out_tok = -1; out_beta = 0.0; return;
         }
         uint64_t ctx = word_ctx_hash();
@@ -354,14 +354,14 @@ public:
         word_table_.init(20);
     }
 
-    void set_tokens(nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> t) {
+    void set_tokens(py::array_t<int64_t, py::array::c_style> t) {
         tokens_ = t.data(); n_tokens_ = int64_t(t.shape(0));
     }
 
     void set_luts(
-        nb::ndarray<const int16_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> bb,
-        nb::ndarray<const uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> ls,
-        nb::ndarray<const uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> bd) {
+        py::array_t<int16_t, py::array::c_style> bb,
+        py::array_t<uint8_t, py::array::c_style> ls,
+        py::array_t<uint8_t, py::array::c_style> bd) {
         base_bytes_ = bb.data(); has_ls_ = ls.data(); is_bnd_ = bd.data();
     }
 
@@ -375,22 +375,14 @@ public:
     }
 
     void get_hints_batch(
-        nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> positions,
-        nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_hints_tok,
-        nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_betas_tok,
-        nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_hints_within,
-        nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_betas_within,
-        nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_hints_word,
-        nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_betas_word) {
+        py::array_t<int64_t, py::array::c_style> positions,
+        py::array_t<int32_t, py::array::c_style> out_hints,
+        py::array_t<double, py::array::c_style> out_betas) {
 
         const int n = int(positions.shape(0));
         const int64_t* pos = positions.data();
-        int32_t* ht = out_hints_tok.data();
-        double* bt = out_betas_tok.data();
-        int32_t* hw = out_hints_within.data();
-        double* bw = out_betas_within.data();
-        int32_t* hd = out_hints_word.data();
-        double* bd = out_betas_word.data();
+        int32_t* hints = out_hints.mutable_data();
+        double* betas = out_betas.mutable_data();
 
         uint64_t hashes[OPEN_MAX];
         uint64_t next_hashes[OPEN_MAX];
@@ -406,57 +398,46 @@ public:
             int64_t p = pos[i];
             int max_avail = std::min(OPEN_MAX, int(p));
 
-            // HINT PHASE: prefix-only, no tokens_[p] read
-            int tok_hint_v, within_tok_v, word_tok_v;
-            double tok_beta_v, within_b_v, word_b_v;
+            // HINT PHASE: only token_hint (prefix-only, no tokens_[p] read)
+            int tok_hint_v; double tok_beta_v;
             token_hint(hashes, max_avail, tok_hint_v, tok_beta_v);
-            within_hint(within_tok_v, within_b_v);
-            word_hint(word_tok_v, word_b_v);
+            hints[i] = tok_hint_v;
+            betas[i] = tok_beta_v;
 
-            ht[i] = tok_hint_v; bt[i] = tok_beta_v;
-            hw[i] = within_tok_v; bw[i] = within_b_v;
-            hd[i] = word_tok_v; bd[i] = word_b_v;
-
-            // UPDATE PHASE: reads tokens_[p] — happens AFTER hints are emitted
+            // UPDATE PHASE: reads tokens_[p] AFTER hint is emitted
             auto tok = uint16_t(tokens_[p]);
             bool is_bnd = is_bnd_ && is_bnd_[tok];
             bool is_ws = has_ls_ && has_ls_[tok];
-
-            prefetch_open_updates(hashes, max_avail, tok);
             token_update(hashes, max_avail, tok);
             within_update(tok, is_bnd, is_ws);
             word_update(tok, is_bnd, is_ws);
 
-            // PREFETCH next position — AFTER current hints emitted and updates done
+            // PREFETCH next position (after hint emitted + update done)
             if (i + 1 < n) {
                 int64_t np = pos[i + 1];
                 compute_hashes(tokens_, np, OPEN_MAX, next_hashes);
-                int nma = std::min(OPEN_MAX, int(np));
-                prefetch_open_lookups(next_hashes, nma);
+                prefetch_open_lookups(next_hashes, std::min(OPEN_MAX, int(np)));
             }
-
             std::memcpy(hashes, next_hashes, sizeof(hashes));
         }
     }
 
 };
 
-NB_MODULE(fused_expert_ext, m) {
+PYBIND11_MODULE(fused_expert_ext, m) {
     m.doc() = "N-gram hint generator with open-addressing (orders 8-16 + within-word + word-start)";
 
-    nb::class_<ContextMixer>(m, "ContextMixer")
-        .def(nb::init<double, double, double, double, double, double, int, double, int>(),
-             nb::arg("base_beta") = 1.0, nb::arg("agree_bonus") = 0.5,
-             nb::arg("within_threshold") = 0.80, nb::arg("within_beta") = 0.75,
-             nb::arg("word_threshold") = 0.80, nb::arg("word_beta") = 0.50,
-             nb::arg("open_table_bits") = 22, nb::arg("token_threshold_scale") = 1.0,
-             nb::arg("order_stride") = 1)
-        .def("set_tokens", &ContextMixer::set_tokens, nb::arg("tokens"))
+    py::class_<ContextMixer>(m, "ContextMixer")
+        .def(py::init<double, double, double, double, double, double, int, double, int>(),
+             py::arg("base_beta") = 1.0, py::arg("agree_bonus") = 0.5,
+             py::arg("within_threshold") = 0.80, py::arg("within_beta") = 0.75,
+             py::arg("word_threshold") = 0.80, py::arg("word_beta") = 0.50,
+             py::arg("open_table_bits") = 22, py::arg("token_threshold_scale") = 1.0,
+             py::arg("order_stride") = 1)
+        .def("set_tokens", &ContextMixer::set_tokens, py::arg("tokens"))
         .def("set_luts", &ContextMixer::set_luts,
-             nb::arg("base_bytes"), nb::arg("has_leading_space"), nb::arg("is_boundary"))
+             py::arg("base_bytes"), py::arg("has_leading_space"), py::arg("is_boundary"))
         .def("reset", &ContextMixer::reset)
         .def("get_hints_batch", &ContextMixer::get_hints_batch,
-             nb::arg("positions"), nb::arg("out_hints_tok"), nb::arg("out_betas_tok"),
-             nb::arg("out_hints_within"), nb::arg("out_betas_within"),
-             nb::arg("out_hints_word"), nb::arg("out_betas_word"))
+             py::arg("positions"), py::arg("out_hints"), py::arg("out_betas"));
 }
