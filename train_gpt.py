@@ -361,11 +361,11 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride):
 	log(f"ttt_sliding:params unfrozen={sum(p.numel()for p in ttt_params)} frozen={sum(p.numel()for p in base_model.parameters()if not p.requires_grad)}")
 	num_blks=len(base_model.blocks);ttt_param_groups=[];block_pid=set()
 	for bi,blk in enumerate(base_model.blocks):
-		sc=0.3+0.7*(bi/max(num_blks-1,1));bp=[p for p in blk.parameters()if p.requires_grad]
+		sc=0.1+0.9*(bi/max(num_blks-1,1));bp=[p for p in blk.parameters()if p.requires_grad]
 		if bp:ttt_param_groups.append({'params':bp,'lr':h.ttt_lr*sc,'base_lr':h.ttt_lr*sc});block_pid.update(id(p)for p in bp)
 	other_p=[p for p in ttt_params if id(p)not in block_pid]
 	if other_p:ttt_param_groups.append({'params':other_p,'lr':h.ttt_lr,'base_lr':h.ttt_lr})
-	log(f"ttt_sliding:discriminative_lr groups={len(ttt_param_groups)} scale=0.3->1.0")
+	log(f"ttt_sliding:discriminative_lr groups={len(ttt_param_groups)} scale=0.1->1.0")
 	optimizer=torch.optim.SGD(ttt_param_groups,momentum=h.ttt_momentum);t0=time.perf_counter();batch_seqs=h.ttt_batch_seqs
 	for ci in range(num_chunks):
 		windows=chunk_windows[ci]
