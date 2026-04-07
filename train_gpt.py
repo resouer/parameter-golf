@@ -358,7 +358,15 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride):
 				if f"blocks.{bi}."in name:freeze=True;break
 			if freeze:p.requires_grad_(False)
 			else:p.requires_grad_(True);ttt_params.append(p)
-	log(f"ttt_sliding:params unfrozen={sum(p.numel()for p in ttt_params)} frozen={sum(p.numel()for p in base_model.parameters()if not p.requires_grad)}");optimizer=torch.optim.SGD(ttt_params,lr=h.ttt_lr,momentum=h.ttt_momentum);t0=time.perf_counter();batch_seqs=h.ttt_batch_seqs
+	log(f"ttt_sliding:params unfrozen={sum(p.numel()for p in ttt_params)} frozen={sum(p.numel()for p in base_model.parameters()if not p.requires_grad)}")
+	num_blks=len(base_model.blocks);ttt_param_groups=[];block_pid=set()
+	for bi,blk in enumerate(base_model.blocks):
+		sc=0.3+0.7*(bi/max(num_blks-1,1));bp=[p for p in blk.parameters()if p.requires_grad]
+		if bp:ttt_param_groups.append({'params':bp,'lr':h.ttt_lr*sc,'base_lr':h.ttt_lr*sc});block_pid.update(id(p)for p in bp)
+	other_p=[p for p in ttt_params if id(p)not in block_pid]
+	if other_p:ttt_param_groups.append({'params':other_p,'lr':h.ttt_lr,'base_lr':h.ttt_lr})
+	log(f"ttt_sliding:discriminative_lr groups={len(ttt_param_groups)} scale=0.3->1.0")
+	optimizer=torch.optim.SGD(ttt_param_groups,momentum=h.ttt_momentum);t0=time.perf_counter();batch_seqs=h.ttt_batch_seqs
 	for ci in range(num_chunks):
 		windows=chunk_windows[ci]
 		if not windows:continue
@@ -374,8 +382,8 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride):
 		if not is_last_chunk and h.ttt_epochs>0:
 			base_model.train();chunk_seqs=(chunk_end-chunk_start)//seq_len
 			if chunk_seqs>0:
-				cos_lr=h.ttt_lr*.5*(1.+math.cos(math.pi*ci/max(num_chunks-1,1)))
-				for pg in optimizer.param_groups:pg['lr']=cos_lr
+				cos_scale=.5*(1.+math.cos(math.pi*ci/max(num_chunks-1,1)))
+				for pg in optimizer.param_groups:pg['lr']=pg['base_lr']*cos_scale
 				my_seq_s=chunk_seqs*rank//world_size;my_seq_e=chunk_seqs*(rank+1)//world_size;my_chunk_seqs=my_seq_e-my_seq_s
 				for _ep in range(h.ttt_epochs):
 					for bs in range(0,my_chunk_seqs,batch_seqs):
