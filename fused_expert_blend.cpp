@@ -406,13 +406,6 @@ public:
             int64_t p = pos[i];
             int max_avail = std::min(OPEN_MAX, int(p));
 
-            if (i + 1 < n) {
-                int64_t np = pos[i + 1];
-                compute_hashes(tokens_, np, OPEN_MAX, next_hashes);
-                int nma = std::min(OPEN_MAX, int(np));
-                prefetch_open_lookups(next_hashes, nma);
-            }
-
             // HINT PHASE: prefix-only, no tokens_[p] read
             int tok_hint_v, within_tok_v, word_tok_v;
             double tok_beta_v, within_b_v, word_b_v;
@@ -433,6 +426,14 @@ public:
             token_update(hashes, max_avail, tok);
             within_update(tok, is_bnd, is_ws);
             word_update(tok, is_bnd, is_ws);
+
+            // PREFETCH next position — AFTER current hints emitted and updates done
+            if (i + 1 < n) {
+                int64_t np = pos[i + 1];
+                compute_hashes(tokens_, np, OPEN_MAX, next_hashes);
+                int nma = std::min(OPEN_MAX, int(np));
+                prefetch_open_lookups(next_hashes, nma);
+            }
 
             std::memcpy(hashes, next_hashes, sizeof(hashes));
         }

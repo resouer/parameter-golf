@@ -348,7 +348,9 @@ def _apply_tilt(snll,lr,tgt,ht_t,bt_t,ht_w,bt_w,ht_d,bt_d,bnd_lut,ws_lut,ab,ws,s
 	bnd_b=b0.to(torch.float64);bnd_a=(h0>=0).to(torch.float64)
 	ag_ws=((h0>=0)&(h2>=0)&(h0==h2)).to(torch.float64)*ab;wb0=b0.to(torch.float64)+ag_ws;wb2=b2.to(torch.float64)+ag_ws;uw=(h2>=0)&((wb2>wb0)|(h0<0));ws_h=torch.where(uw,h2,h0);ws_b=torch.where(uw,wb2,wb0);ws_a=(ws_h>=0).to(torch.float64)
 	ag_ot=((h0>=0)&(h1>=0)&(h0==h1)).to(torch.float64)*ab;ob0=b0.to(torch.float64)+ag_ot;ob1=b1.to(torch.float64)+ag_ot;uw2=(h1>=0)&((ob1>ob0)|(h0<0));ot_h=torch.where(uw2,h1,h0);ot_b=torch.where(uw2,ob1,ob0);ot_a=(ot_h>=0).to(torch.float64)
-	Z=1.+bnd_a*_ph(h0)*(bnd_b.exp()-1.)+ws_a*_ph(ws_h)*(ws_b.exp()-1.)+ot_a*_ph(ot_h)*(ot_b.exp()-1.)
+	h0_bnd=bnd_lut[h0.clamp(min=0)];h0_ws=ws_lut[h0.clamp(min=0)]&(~h0_bnd);wsh_bnd=bnd_lut[ws_h.clamp(min=0)];wsh_ws=ws_lut[ws_h.clamp(min=0)]&(~wsh_bnd);oth_bnd=bnd_lut[ot_h.clamp(min=0)];oth_ws=ws_lut[ot_h.clamp(min=0)]&(~oth_bnd)
+	Z_bnd=bnd_a*h0_bnd.to(torch.float64)*_ph(h0)*(bnd_b.exp()-1.);Z_ws=ws_a*wsh_ws.to(torch.float64)*_ph(ws_h)*(ws_b.exp()-1.);Z_ot=ot_a*(~oth_bnd&~oth_ws).to(torch.float64)*_ph(ot_h)*(ot_b.exp()-1.)
+	Z=1.+Z_bnd+Z_ws+Z_ot
 	tb=bnd_lut[tgt];tw=ws_lut[tgt]&(~tb);sel_h=torch.where(tb,h0,torch.where(tw,ws_h,ot_h));sel_b=torch.where(tb,bnd_b,torch.where(tw,ws_b,ot_b));ih=(tgt==sel_h).to(torch.float64);return snll+Z.log()-sel_b*ih
 def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride,tilt_data=None):
 	seq_len=h.eval_seq_len;total_tokens=val_data.val_tokens.numel()-1;ttt_chunk=h.ttt_chunk_tokens;context_size=seq_len-stride;window_starts=[ws for ws in range(0,total_tokens,stride)if ws+context_size<total_tokens];num_chunks=(total_tokens+ttt_chunk-1)//ttt_chunk;chunk_windows=[[]for _ in range(num_chunks)]
