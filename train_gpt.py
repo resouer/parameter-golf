@@ -258,10 +258,12 @@ def gptq_quantize_weight(w,H,clip_sigmas=3.,clip_range=63,block_size=128):
 		if i2<cols:W_work[:,i2:]-=Err@Hinv[i1:i2,i2:]
 	return Q[:,invperm],s
 def gptq_mixed_quantize(state_dict,hessians,h):
-	result={};meta={}
+	result={};meta={};num_blks=max((int(k.split('.')[1])for k in state_dict if k.startswith('blocks.')),default=0)+1;late_k_set=set(range(max(0,num_blks-2),num_blks))
 	for(name,tensor)in state_dict.items():
 		t=tensor.detach().cpu().contiguous()
 		if not t.is_floating_point()or t.numel()<=65536:result[name]=t.to(torch.float16)if t.is_floating_point()else t;meta[name]='passthrough (float16)';continue
+		is_late_k=name.endswith('attn.c_k.weight')and name.startswith('blocks.')and int(name.split('.')[1])in late_k_set
+		if is_late_k:result[name]=t.to(torch.float16);meta[name]='passthrough_fp16_late_k';log(f"  late-K fp16: {name}");continue
 		cs=h.embed_clip_sigmas if'tok_emb'in name else h.matrix_clip_sigmas;bits=h.embed_bits if'tok_emb'in name else h.matrix_bits;q,s=gptq_quantize_weight(t,hessians[name],clip_sigmas=cs,clip_range=2**(bits-1)-1);result[name+'.q']=q;result[name+'.scale']=s;meta[name]=f"gptq (int{bits})"
 	categories=collections.defaultdict(set)
 	for(name,cat)in meta.items():short=re.sub('\\.\\d+$','',re.sub('blocks\\.\\d+','blocks',name));categories[cat].add(short)
@@ -308,7 +310,12 @@ def _decompress(data,compressor):
 def serialize(h,base_model,code):
 	code_bytes=len(code.encode('utf-8'))
 	if h.is_main_process:torch.save(base_model.state_dict(),h.model_path);model_bytes=os.path.getsize(h.model_path);log(f"Serialized model: {model_bytes} bytes");log(f"Code size: {code_bytes} bytes")
-	sd_cpu={k:v.detach().cpu()for(k,v)in base_model.state_dict().items()};device=torch.device('cuda',h.local_rank);log('GPTQ:collecting Hessians from calibration data...');t0=time.perf_counter();calib_loader=ShuffledSequenceLoader(h,device);hessians=collect_hessians(base_model,calib_loader,h,device,n_calibration_batches=h.gptq_calibration_batches);log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter()-t0:.1f}s");quant_result,quant_meta=gptq_mixed_quantize(sd_cpu,hessians,h);quant_buf=io.BytesIO();torch.save({'w':quant_result,'m':quant_meta},quant_buf);quant_raw=quant_buf.getvalue();quant_blob=_compress(quant_raw,h.compressor);quant_file_bytes=len(quant_blob);bytes_total=quant_file_bytes+code_bytes
+	sd_cpu={k:v.detach().cpu()for(k,v)in base_model.state_dict().items()};device=torch.device('cuda',h.local_rank)
+	prune_frac=0.03;all_abs=torch.cat([v.abs().flatten()for v in sd_cpu.values()if v.is_floating_point()and v.numel()>65536]);thresh=torch.quantile(all_abs.float(),prune_frac);pruned_count=0;total_count=0
+	for k,v in sd_cpu.items():
+		if v.is_floating_point()and v.numel()>65536:mask=v.abs()<=thresh;pruned_count+=mask.sum().item();total_count+=v.numel();v[mask]=0.0
+	log(f"magnitude_prune: frac={prune_frac} thresh={thresh:.6f} pruned={pruned_count}/{total_count} ({100*pruned_count/max(total_count,1):.2f}%)")
+	log('GPTQ:collecting Hessians from calibration data...');t0=time.perf_counter();calib_loader=ShuffledSequenceLoader(h,device);hessians=collect_hessians(base_model,calib_loader,h,device,n_calibration_batches=h.gptq_calibration_batches);log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter()-t0:.1f}s");quant_result,quant_meta=gptq_mixed_quantize(sd_cpu,hessians,h);quant_buf=io.BytesIO();torch.save({'w':quant_result,'m':quant_meta},quant_buf);quant_raw=quant_buf.getvalue();quant_blob=_compress(quant_raw,h.compressor);quant_file_bytes=len(quant_blob);bytes_total=quant_file_bytes+code_bytes
 	if h.is_main_process:
 		with open(h.quantized_model_path,'wb')as f:f.write(quant_blob)
 		log(f"Serialized model quantized+{h.compressor}: {quant_file_bytes} bytes");log(f"Total submission size quantized+{h.compressor}: {bytes_total} bytes")
