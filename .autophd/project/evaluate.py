@@ -115,11 +115,25 @@ fi
     else:
         data_setup = """
 # Auto-detect vocab size from train_gpt.py (default sp1024, supports sp4096+)
-# Uses remote_helper.py if available, falls back to simple regex
 if [ -f remote_helper.py ]; then
     VOCAB=$(python3 remote_helper.py detect-vocab)
 else
-    VOCAB=$(python3 -c "import re;f=open('train_gpt.py').read();m=re.search(r'VOCAB_SIZE.*?,\s*(\d+)',f);print(m.group(1) if m else '1024')")
+    VOCAB=$(python3 << 'PYEOF'
+import re, sys
+f = open('train_gpt.py').read()
+m = re.search(r'VOCAB_SIZE.*?,\s*(\d+)', f)
+if m: print(m.group(1)); sys.exit()
+try:
+    import lzma, base64
+    m2 = re.search(r"b85decode\(b'(.+?)'\)", f, re.DOTALL)
+    if m2:
+        code = lzma.decompress(base64.b85decode(m2.group(1))).decode()
+        m3 = re.search(r'VOCAB_SIZE.*?,\s*(\d+)', code)
+        if m3: print(m3.group(1)); sys.exit()
+except Exception: pass
+print('1024')
+PYEOF
+)
 fi
 [ -z "$VOCAB" ] && VOCAB=1024
 SHARDS=80
