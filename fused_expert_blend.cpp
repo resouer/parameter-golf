@@ -227,8 +227,8 @@ class ContextMixer {
         }
     }
 
-    void within_hint(bool is_bnd, bool is_ws, int& out_tok, double& out_beta) {
-        if (is_bnd || is_ws || within_len_ == 0) {
+    void within_hint(int& out_tok, double& out_beta) {
+        if (within_len_ == 0) {
             out_tok = -1; out_beta = 0.0; return;
         }
         uint64_t ctx = within_hash_ ^ (uint64_t(within_len_) * LEN_MIX);
@@ -266,8 +266,8 @@ class ContextMixer {
         return h;
     }
 
-    void word_hint(bool is_ws, int& out_tok, double& out_beta) {
-        if (!is_ws || word_ring_fill_ < WORD_ORDER) {
+    void word_hint(int& out_tok, double& out_beta) {
+        if (word_ring_fill_ < WORD_ORDER) {
             out_tok = -1; out_beta = 0.0; return;
         }
         uint64_t ctx = word_ctx_hash();
@@ -376,13 +376,15 @@ public:
 
     void get_hints_batch(
         py::array_t<int64_t, py::array::c_style> positions,
-        py::array_t<int32_t, py::array::c_style> out_hints,
-        py::array_t<double, py::array::c_style> out_betas) {
+        py::array_t<int32_t, py::array::c_style> out_ht, py::array_t<double, py::array::c_style> out_bt,
+        py::array_t<int32_t, py::array::c_style> out_hw, py::array_t<double, py::array::c_style> out_bw,
+        py::array_t<int32_t, py::array::c_style> out_hd, py::array_t<double, py::array::c_style> out_bd) {
 
         const int n = int(positions.shape(0));
         const int64_t* pos = positions.data();
-        int32_t* hints = out_hints.mutable_data();
-        double* betas = out_betas.mutable_data();
+        int32_t* ht = out_ht.mutable_data(); double* bt = out_bt.mutable_data();
+        int32_t* hw = out_hw.mutable_data(); double* bw = out_bw.mutable_data();
+        int32_t* hd = out_hd.mutable_data(); double* bd = out_bd.mutable_data();
 
         uint64_t hashes[OPEN_MAX];
         uint64_t next_hashes[OPEN_MAX];
@@ -398,11 +400,15 @@ public:
             int64_t p = pos[i];
             int max_avail = std::min(OPEN_MAX, int(p));
 
-            // HINT PHASE: only token_hint (prefix-only, no tokens_[p] read)
-            int tok_hint_v; double tok_beta_v;
+            // HINT PHASE: all 3 experts, prefix-only, no tokens_[p] read
+            int tok_hint_v, within_tok_v, word_tok_v;
+            double tok_beta_v, within_b_v, word_b_v;
             token_hint(hashes, max_avail, tok_hint_v, tok_beta_v);
-            hints[i] = tok_hint_v;
-            betas[i] = tok_beta_v;
+            within_hint(within_tok_v, within_b_v);
+            word_hint(word_tok_v, word_b_v);
+            ht[i] = tok_hint_v; bt[i] = tok_beta_v;
+            hw[i] = within_tok_v; bw[i] = within_b_v;
+            hd[i] = word_tok_v; bd[i] = word_b_v;
 
             // UPDATE PHASE: reads tokens_[p] AFTER hint is emitted
             auto tok = uint16_t(tokens_[p]);
@@ -439,5 +445,6 @@ PYBIND11_MODULE(fused_expert_ext, m) {
              py::arg("base_bytes"), py::arg("has_leading_space"), py::arg("is_boundary"))
         .def("reset", &ContextMixer::reset)
         .def("get_hints_batch", &ContextMixer::get_hints_batch,
-             py::arg("positions"), py::arg("out_hints"), py::arg("out_betas"));
+             py::arg("positions"), py::arg("ht"), py::arg("bt"),
+             py::arg("hw"), py::arg("bw"), py::arg("hd"), py::arg("bd"));
 }
