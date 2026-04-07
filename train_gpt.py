@@ -343,23 +343,9 @@ def eval_val_sliding(h,device,val_data,base_model,batch_seqs=32):
 			for(i,ws)in enumerate(batch_ws):wlen=wlens[i];s=0 if ws==0 else context_size;scored_nll=nll[i,s:wlen].to(torch.float64);loss_sum+=scored_nll.sum();token_count+=float(wlen-s);tgt=y_batch[i,s:wlen];prev=x_batch[i,s:wlen];tb=val_data.base_bytes_lut[tgt].to(torch.float64);tb+=(val_data.has_leading_space_lut[tgt]&~val_data.is_boundary_token_lut[prev]).to(torch.float64);byte_count+=tb.sum()
 	if dist.is_available()and dist.is_initialized():dist.all_reduce(loss_sum,op=dist.ReduceOp.SUM);dist.all_reduce(token_count,op=dist.ReduceOp.SUM);dist.all_reduce(byte_count,op=dist.ReduceOp.SUM)
 	base_model.train();return _loss_bpb(loss_sum,token_count,byte_count)
-def _apply_tilt(snll,lr,tgt,ht_t,bt_t,ht_w,bt_w,ht_d,bt_d,bnd_lut,ws_lut,ab,ws,s,wlen,dev):
-	gp=torch.arange(ws+s+1,ws+wlen+1,device=dev,dtype=torch.int64)
-	h0=ht_t[gp];b0=bt_t[gp];h1=ht_w[gp];b1=bt_w[gp];h2=ht_d[gp];b2=bt_d[gp]
-	sl=lr.float();lse=snll+sl.gather(-1,tgt.unsqueeze(-1)).squeeze(-1).to(torch.float64)
-	def _ph(h):return(sl.gather(-1,h.clamp(min=0).unsqueeze(-1)).squeeze(-1).to(torch.float64)-lse).exp().clamp(0.,1.)
-	# Per-category best hint (with agree bonus)
-	ag_ws=((h0>=0)&(h2>=0)&(h0==h2)).to(torch.float64)*ab;wb0=b0.to(torch.float64)+ag_ws;wb2=b2.to(torch.float64)+ag_ws;uw=(h2>=0)&((wb2>wb0)|(h0<0));ws_h=torch.where(uw,h2,h0);ws_b=torch.where(uw,wb2,wb0)
-	ag_ot=((h0>=0)&(h1>=0)&(h0==h1)).to(torch.float64)*ab;ob0=b0.to(torch.float64)+ag_ot;ob1=b1.to(torch.float64)+ag_ot;uw2=(h1>=0)&((ob1>ob0)|(h0<0));ot_h=torch.where(uw2,h1,h0);ot_b=torch.where(uw2,ob1,ob0)
-	# Unified Z: each category contributes only if its best hint belongs to that category
-	bnd_ok=(h0>=0)&bnd_lut[h0.clamp(min=0)];Z_bnd=bnd_ok.to(torch.float64)*_ph(h0)*(b0.to(torch.float64).exp()-1.)
-	ws_ok=(ws_h>=0)&ws_lut[ws_h.clamp(min=0)]&(~bnd_lut[ws_h.clamp(min=0)]);Z_ws=ws_ok.to(torch.float64)*_ph(ws_h)*(ws_b.exp()-1.)
-	ot_ok=(ot_h>=0)&(~bnd_lut[ot_h.clamp(min=0)])&(~ws_lut[ot_h.clamp(min=0)]);Z_ot=ot_ok.to(torch.float64)*_ph(ot_h)*(ot_b.exp()-1.)
-	Z=1.+Z_bnd+Z_ws+Z_ot
-	# Target scoring: select hint for target's category
-	tb=bnd_lut[tgt];tw=ws_lut[tgt]&(~tb);sel_h=torch.where(tb,h0,torch.where(tw,ws_h,ot_h));sel_b=torch.where(tb,b0.to(torch.float64),torch.where(tw,ws_b,ot_b))
-	ih=(tgt==sel_h).to(torch.float64);sel_b_safe=torch.where(sel_h>=0,sel_b,torch.zeros_like(sel_b));return snll+Z.log()-sel_b_safe*ih
-def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride,tilt_data=None):
+def _apply_tilt(snll,lr,tgt,ht,bt,ws,s,wlen,dev):
+	gp=torch.arange(ws+s+1,ws+wlen+1,device=dev,dtype=torch.int64);h=ht[gp];b=bt[gp];hh=(h>=0).to(torch.float64);sl=lr.float();sh=h.clamp(min=0);lt=sl.gather(-1,tgt.unsqueeze(-1)).squeeze(-1).to(torch.float64);lh=sl.gather(-1,sh.unsqueeze(-1)).squeeze(-1).to(torch.float64);lse=snll+lt;ph=(lh-lse).exp().clamp(0.,1.);Z=1.+ph*(b.exp()-1.);ih=(tgt==h).to(torch.float64);return snll+hh*(Z.log()-b*ih)
+def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride,hints_t=None,betas_t=None):
 	seq_len=h.eval_seq_len;total_tokens=val_data.val_tokens.numel()-1;ttt_chunk=h.ttt_chunk_tokens;context_size=seq_len-stride;window_starts=[ws for ws in range(0,total_tokens,stride)if ws+context_size<total_tokens];num_chunks=(total_tokens+ttt_chunk-1)//ttt_chunk;chunk_windows=[[]for _ in range(num_chunks)]
 	for ws in window_starts:end=min(ws+seq_len,total_tokens);wlen=end-ws;s=0 if ws==0 else context_size;scored_start=ws+s;ci=min(scored_start//ttt_chunk,num_chunks-1);chunk_windows[ci].append(ws)
 	log(f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} total_windows={len(window_starts)} stride={stride} ttt_lr={h.ttt_lr} ttt_epochs={h.ttt_epochs} freeze_blocks={h.ttt_freeze_blocks} loop_only={h.ttt_loop_only}");compiled_logits=torch.compile(base_model.forward_logits,dynamic=False,fullgraph=True);loss_sum=torch.zeros((),device=device,dtype=torch.float64);token_count=torch.zeros((),device=device,dtype=torch.float64);byte_count=torch.zeros((),device=device,dtype=torch.float64);ttt_params=[]
@@ -388,11 +374,7 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride,til
 				for(i,ws)in enumerate(batch_ws):end=min(ws+seq_len,total_tokens);wlen=end-ws;wlens.append(wlen);chunk_tok=val_data.val_tokens[ws:end+1].to(dtype=torch.int64,device=device);x_batch[i,:wlen]=chunk_tok[:-1];y_batch[i,:wlen]=chunk_tok[1:]
 				with torch.autocast(device_type='cuda',dtype=torch.bfloat16):logits=compiled_logits(x_batch)
 				nll=F.cross_entropy(logits.reshape(-1,logits.size(-1)).float(),y_batch.reshape(-1),reduction='none').reshape(bsz,seq_len)
-				for(i,ws)in enumerate(batch_ws):
-					wlen=wlens[i];s=0 if ws==0 else context_size;scored_nll=nll[i,s:wlen].to(torch.float64);tgt=y_batch[i,s:wlen]
-					if tilt_data is not None:
-						ht_t,bt_t,hw_t,bw_t,hd_t,bd_t=tilt_data;scored_nll=_apply_tilt(scored_nll,logits[i,s:wlen],tgt,ht_t,bt_t,hw_t,bw_t,hd_t,bd_t,val_data.is_boundary_token_lut,val_data.has_leading_space_lut,h.tilt_agree_bonus,ws,s,wlen,device)
-					loss_sum+=scored_nll.sum();token_count+=float(wlen-s);prev=x_batch[i,s:wlen];tb=val_data.base_bytes_lut[tgt].to(torch.float64);tb+=(val_data.has_leading_space_lut[tgt]&~val_data.is_boundary_token_lut[prev]).to(torch.float64);byte_count+=tb.sum()
+				for(i,ws)in enumerate(batch_ws):wlen=wlens[i];s=0 if ws==0 else context_size;scored_nll=nll[i,s:wlen].to(torch.float64);tgt=y_batch[i,s:wlen];loss_sum+=(_apply_tilt(scored_nll,logits[i,s:wlen],tgt,hints_t,betas_t,ws,s,wlen,device)if hints_t is not None else scored_nll).sum();token_count+=float(wlen-s);prev=x_batch[i,s:wlen];tb=val_data.base_bytes_lut[tgt].to(torch.float64);tb+=(val_data.has_leading_space_lut[tgt]&~val_data.is_boundary_token_lut[prev]).to(torch.float64);byte_count+=tb.sum()
 		is_last_chunk=ci==num_chunks-1
 		if not is_last_chunk and h.ttt_epochs>0:
 			base_model.train();chunk_seqs=(chunk_end-chunk_start)//seq_len
@@ -488,15 +470,10 @@ def precompute_tilt_hints(h,val_data,device):
 		ext=cpp_load(name='fused_expert_ext',sources=[cpp_src],extra_cflags=['-O3','-std=c++17'],verbose=True)
 		val_np=val_data.val_tokens.numpy().astype(np.int64);bb_np=val_data.base_bytes_lut.cpu().numpy().astype(np.int16);ls_np=val_data.has_leading_space_lut.cpu().numpy().astype(np.uint8);bd_np=val_data.is_boundary_token_lut.cpu().numpy().astype(np.uint8)
 		ngram=ext.ContextMixer(base_beta=h.tilt_base_beta,agree_bonus=h.tilt_agree_bonus,within_threshold=h.tilt_within_threshold,within_beta=h.tilt_within_beta,word_threshold=h.tilt_word_threshold,word_beta=h.tilt_word_beta,open_table_bits=h.tilt_open_table_bits,token_threshold_scale=1.0,order_stride=h.tilt_order_stride);ngram.set_tokens(val_np);ngram.set_luts(bb_np,ls_np,bd_np)
-		N=total_tokens+1;ht=np.zeros(N,dtype=np.int32);bt=np.zeros(N,dtype=np.float64);hw=np.zeros(N,dtype=np.int32);bw=np.zeros(N,dtype=np.float64);hd=np.zeros(N,dtype=np.int32);bd=np.zeros(N,dtype=np.float64)
-		positions=np.arange(1,N,dtype=np.int64);ngram.get_hints_batch(positions,ht[1:],bt[1:],hw[1:],bw[1:],hd[1:],bd[1:])
-		ht_t=torch.from_numpy(ht).to(device);bt_t=torch.from_numpy(bt).to(device);hw_t=torch.from_numpy(hw).to(device);bw_t=torch.from_numpy(bw).to(device);hd_t=torch.from_numpy(hd).to(device);bd_t=torch.from_numpy(bd).to(device)
-		nz=int((ht[1:]>=0).sum())+int((hw[1:]>=0).sum())+int((hd[1:]>=0).sum());log(f"tilt:precomputed {total_tokens} positions, tok={int((ht[1:]>=0).sum())} within={int((hw[1:]>=0).sum())} word={int((hd[1:]>=0).sum())} in {time.perf_counter()-t0:.1f}s")
-	else:
-		z32=lambda:torch.zeros(total_tokens+1,dtype=torch.int32,device=device);z64=lambda:torch.zeros(total_tokens+1,dtype=torch.float64,device=device);ht_t=z32();bt_t=z64();hw_t=z32();bw_t=z64();hd_t=z32();bd_t=z64()
-	if dist.is_available()and dist.is_initialized():
-		for t in[ht_t,bt_t,hw_t,bw_t,hd_t,bd_t]:dist.broadcast(t,src=0)
-	return ht_t,bt_t,hw_t,bw_t,hd_t,bd_t
+		all_hints=np.zeros(total_tokens+1,dtype=np.int32);all_betas=np.zeros(total_tokens+1,dtype=np.float64);positions=np.arange(1,total_tokens+1,dtype=np.int64);ngram.get_hints_batch(positions,all_hints[1:],all_betas[1:]);hints_t=torch.from_numpy(all_hints).to(device);betas_t=torch.from_numpy(all_betas).to(device);nz=int((all_hints[1:]>=0).sum());log(f"tilt:precomputed {total_tokens} positions, {nz} hints ({100*nz/total_tokens:.1f}%) in {time.perf_counter()-t0:.1f}s")
+	else:hints_t=torch.zeros(total_tokens+1,dtype=torch.int32,device=device);betas_t=torch.zeros(total_tokens+1,dtype=torch.float64,device=device)
+	if dist.is_available()and dist.is_initialized():dist.broadcast(hints_t,src=0);dist.broadcast(betas_t,src=0)
+	return hints_t,betas_t
 def train_and_eval(h,device):
 	random.seed(h.seed);np.random.seed(h.seed);torch.manual_seed(h.seed);torch.cuda.manual_seed_all(h.seed);val_data=ValidationData(h,device);log(f"train_shards: {len(list(Path(h.datasets_dir).resolve().glob('fineweb_train_*.bin')))}");log(f"val_tokens: {val_data.val_tokens.numel()-1}");base_model,compiled_model=train_model(h,device,val_data);torch._dynamo.reset();timed_eval('pre-quantization post-ema',eval_val,h,device,val_data,compiled_model);serialize(h,base_model,Path(__file__).read_text(encoding='utf-8'))
 	if h.distributed:dist.barrier()
@@ -507,8 +484,8 @@ def train_and_eval(h,device):
 	if h.ttt_enabled:
 		del eval_model,compiled_model;torch._dynamo.reset();torch.cuda.empty_cache();ttt_model=deserialize(h,device)
 		if h.num_loops>0:ttt_model.looping_active=True
-		tilt_data=(precompute_tilt_hints(h,val_data,device)if h.tilt_enabled else None)
-		timed_eval('legal_ttt_tilt',eval_val_sliding_ttt,h,ttt_model,h.rank,h.world_size,device,val_data,stride=h.eval_stride,tilt_data=tilt_data);del ttt_model
+		hints_t,betas_t=(precompute_tilt_hints(h,val_data,device)if h.tilt_enabled else(None,None))
+		timed_eval('legal_ttt_tilt',eval_val_sliding_ttt,h,ttt_model,h.rank,h.world_size,device,val_data,stride=h.eval_stride,hints_t=hints_t,betas_t=betas_t);del ttt_model
 def main():
 	world_size=int(os.environ.get('WORLD_SIZE','1'));local_rank=int(os.environ.get('LOCAL_RANK','0'));distributed='RANK'in os.environ and'WORLD_SIZE'in os.environ
 	if not torch.cuda.is_available():raise RuntimeError('CUDA is required')
