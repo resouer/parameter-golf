@@ -358,7 +358,7 @@ def _apply_tilt(snll,lr,tgt,ht_t,bt_t,ht_w,bt_w,ht_d,bt_d,bnd_lut,ws_lut,ab,ws,s
 	Z=1.+Z_bnd+Z_ws+Z_ot
 	# Target scoring: select hint for target's category
 	tb=bnd_lut[tgt];tw=ws_lut[tgt]&(~tb);sel_h=torch.where(tb,h0,torch.where(tw,ws_h,ot_h));sel_b=torch.where(tb,b0.to(torch.float64),torch.where(tw,ws_b,ot_b))
-	ih=(tgt==sel_h).to(torch.float64);has_hint=(sel_h>=0).to(torch.float64);return snll+has_hint*(Z.log()-sel_b*ih)
+	ih=(tgt==sel_h).to(torch.float64);sel_b_safe=torch.where(sel_h>=0,sel_b,torch.zeros_like(sel_b));return snll+Z.log()-sel_b_safe*ih
 def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride,tilt_data=None):
 	seq_len=h.eval_seq_len;total_tokens=val_data.val_tokens.numel()-1;ttt_chunk=h.ttt_chunk_tokens;context_size=seq_len-stride;window_starts=[ws for ws in range(0,total_tokens,stride)if ws+context_size<total_tokens];num_chunks=(total_tokens+ttt_chunk-1)//ttt_chunk;chunk_windows=[[]for _ in range(num_chunks)]
 	for ws in window_starts:end=min(ws+seq_len,total_tokens);wlen=end-ws;s=0 if ws==0 else context_size;scored_start=ws+s;ci=min(scored_start//ttt_chunk,num_chunks-1);chunk_windows[ci].append(ws)
