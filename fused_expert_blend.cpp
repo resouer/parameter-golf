@@ -227,8 +227,8 @@ class ContextMixer {
         }
     }
 
-    void within_hint(bool is_bnd, bool is_ws, int& out_tok, double& out_beta) {
-        if (is_bnd || is_ws || within_len_ == 0) {
+    void within_hint(int& out_tok, double& out_beta) {
+        if (within_len_ == 0) {
             out_tok = -1; out_beta = 0.0; return;
         }
         uint64_t ctx = within_hash_ ^ (uint64_t(within_len_) * LEN_MIX);
@@ -266,8 +266,8 @@ class ContextMixer {
         return h;
     }
 
-    void word_hint(bool is_ws, int& out_tok, double& out_beta) {
-        if (!is_ws || word_ring_fill_ < WORD_ORDER) {
+    void word_hint(int& out_tok, double& out_beta) {
+        if (word_ring_fill_ < WORD_ORDER) {
             out_tok = -1; out_beta = 0.0; return;
         }
         uint64_t ctx = word_ctx_hash();
@@ -376,13 +376,21 @@ public:
 
     void get_hints_batch(
         nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> positions,
-        nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_hints,
-        nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_betas) {
+        nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_hints_tok,
+        nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_betas_tok,
+        nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_hints_within,
+        nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_betas_within,
+        nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_hints_word,
+        nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cpu> out_betas_word) {
 
         const int n = int(positions.shape(0));
         const int64_t* pos = positions.data();
-        int32_t* hints = out_hints.data();
-        double* betas = out_betas.data();
+        int32_t* ht = out_hints_tok.data();
+        double* bt = out_betas_tok.data();
+        int32_t* hw = out_hints_within.data();
+        double* bw = out_betas_within.data();
+        int32_t* hd = out_hints_word.data();
+        double* bd = out_betas_word.data();
 
         uint64_t hashes[OPEN_MAX];
         uint64_t next_hashes[OPEN_MAX];
@@ -396,9 +404,6 @@ public:
 
         for (int i = 0; i < n; i++) {
             int64_t p = pos[i];
-            auto tok = uint16_t(tokens_[p]);
-            bool is_bnd = is_bnd_ && is_bnd_[tok];
-            bool is_ws = has_ls_ && has_ls_[tok];
             int max_avail = std::min(OPEN_MAX, int(p));
 
             if (i + 1 < n) {
@@ -408,36 +413,23 @@ public:
                 prefetch_open_lookups(next_hashes, nma);
             }
 
-            int tok_hint, within_tok, word_tok;
-            double tok_beta, within_b, word_b;
-            token_hint(hashes, max_avail, tok_hint, tok_beta);
-            within_hint(is_bnd, is_ws, within_tok, within_b);
-            word_hint(is_ws, word_tok, word_b);
+            // HINT PHASE: prefix-only, no tokens_[p] read
+            int tok_hint_v, within_tok_v, word_tok_v;
+            double tok_beta_v, within_b_v, word_b_v;
+            token_hint(hashes, max_avail, tok_hint_v, tok_beta_v);
+            within_hint(within_tok_v, within_b_v);
+            word_hint(word_tok_v, word_b_v);
 
-            struct Cand { int hint; double beta; };
-            Cand cands[3]; int nc = 0;
-            if (tok_hint >= 0) cands[nc++] = {tok_hint, tok_beta};
-            if (within_tok >= 0) cands[nc++] = {within_tok, within_b};
-            if (word_tok >= 0) cands[nc++] = {word_tok, word_b};
+            ht[i] = tok_hint_v; bt[i] = tok_beta_v;
+            hw[i] = within_tok_v; bw[i] = within_b_v;
+            hd[i] = word_tok_v; bd[i] = word_b_v;
 
-            int best_hint = -1; double best_beta = 0.0;
-            if (nc > 0) {
-                for (int a = 0; a < nc; a++)
-                    for (int b = 0; b < nc; b++)
-                        if (b != a && cands[b].hint == cands[a].hint)
-                            { cands[a].beta += agree_bonus_; break; }
-                int bi = 0;
-                for (int a = 1; a < nc; a++)
-                    if (cands[a].beta > cands[bi].beta) bi = a;
-                best_hint = cands[bi].hint;
-                best_beta = cands[bi].beta;
-            }
-
-            hints[i] = best_hint;
-            betas[i] = best_beta;
+            // UPDATE PHASE: reads tokens_[p] — happens AFTER hints are emitted
+            auto tok = uint16_t(tokens_[p]);
+            bool is_bnd = is_bnd_ && is_bnd_[tok];
+            bool is_ws = has_ls_ && has_ls_[tok];
 
             prefetch_open_updates(hashes, max_avail, tok);
-
             token_update(hashes, max_avail, tok);
             within_update(tok, is_bnd, is_ws);
             word_update(tok, is_bnd, is_ws);
@@ -463,5 +455,7 @@ NB_MODULE(fused_expert_ext, m) {
              nb::arg("base_bytes"), nb::arg("has_leading_space"), nb::arg("is_boundary"))
         .def("reset", &ContextMixer::reset)
         .def("get_hints_batch", &ContextMixer::get_hints_batch,
-             nb::arg("positions"), nb::arg("out_hints"), nb::arg("out_betas"))
+             nb::arg("positions"), nb::arg("out_hints_tok"), nb::arg("out_betas_tok"),
+             nb::arg("out_hints_within"), nb::arg("out_betas_within"),
+             nb::arg("out_hints_word"), nb::arg("out_betas_word"))
 }
