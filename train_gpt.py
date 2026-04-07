@@ -351,7 +351,7 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride):
 			if is_unfrozen:p.requires_grad_(True);ttt_params.append(p)
 			else:p.requires_grad_(False)
 	else:
-		scalar_keys=('q_gain','attn_scale','mlp_scale','resid_mix','norm.weight','skip_weights','skip_gates','final_norm')
+		scalar_keys=('q_gain','attn_scale','mlp_scale','resid_mix','skip_weights','skip_gates')
 		for(name,p)in base_model.named_parameters():
 			use=any(k in name for k in scalar_keys)
 			if use:p.requires_grad_(True);ttt_params.append(p)
@@ -372,7 +372,7 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride):
 		if not is_last_chunk and h.ttt_epochs>0:
 			base_model.train();chunk_seqs=(chunk_end-chunk_start)//seq_len
 			if chunk_seqs>0:
-				cos_lr=h.ttt_lr*.5*(1.+math.cos(math.pi*ci/max(num_chunks-1,1)))
+				scalar_ttt_lr=0.01;cos_lr=scalar_ttt_lr*.5*(1.+math.cos(math.pi*ci/max(num_chunks-1,1)))
 				for pg in optimizer.param_groups:pg['lr']=cos_lr
 				my_seq_s=chunk_seqs*rank//world_size;my_seq_e=chunk_seqs*(rank+1)//world_size;my_chunk_seqs=my_seq_e-my_seq_s
 				for _ep in range(h.ttt_epochs):
