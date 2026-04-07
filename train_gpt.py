@@ -351,14 +351,12 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride):
 			if is_unfrozen:p.requires_grad_(True);ttt_params.append(p)
 			else:p.requires_grad_(False)
 	else:
-		frozen_block_ids=set(range(min(h.ttt_freeze_blocks,len(base_model.blocks))))
+		scalar_keys=('q_gain','attn_scale','mlp_scale','resid_mix','norm.weight','skip_weights','skip_gates','final_norm')
 		for(name,p)in base_model.named_parameters():
-			freeze=False
-			for bi in frozen_block_ids:
-				if f"blocks.{bi}."in name:freeze=True;break
-			if freeze:p.requires_grad_(False)
-			else:p.requires_grad_(True);ttt_params.append(p)
-	log(f"ttt_sliding:params unfrozen={sum(p.numel()for p in ttt_params)} frozen={sum(p.numel()for p in base_model.parameters()if not p.requires_grad)}");optimizer=torch.optim.SGD(ttt_params,lr=h.ttt_lr,momentum=h.ttt_momentum);t0=time.perf_counter();batch_seqs=h.ttt_batch_seqs
+			use=any(k in name for k in scalar_keys)
+			if use:p.requires_grad_(True);ttt_params.append(p)
+			else:p.requires_grad_(False)
+	log(f"ttt_sliding:scalar_only_ttt params={sum(p.numel()for p in ttt_params)} frozen={sum(p.numel()for p in base_model.parameters()if not p.requires_grad)}");optimizer=torch.optim.SGD(ttt_params,lr=0.01,momentum=h.ttt_momentum);t0=time.perf_counter();batch_seqs=h.ttt_batch_seqs
 	for ci in range(num_chunks):
 		windows=chunk_windows[ci]
 		if not windows:continue
