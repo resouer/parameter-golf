@@ -8,6 +8,18 @@ import random
 import subprocess
 import sys
 import time
+
+# Auto-download Scylla data if not present
+_SCYLLA_DIR = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_scylla")
+if not glob.glob(os.path.join(_SCYLLA_DIR, "*.bin")):
+    print(f"[setup] Scylla data not found at {_SCYLLA_DIR}, downloading from HuggingFace...")
+    os.makedirs(_SCYLLA_DIR, exist_ok=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"], check=False)
+    subprocess.run([
+        sys.executable, "-c",
+        f"from huggingface_hub import snapshot_download; snapshot_download('anthonym21/fineweb10B-scylla', local_dir='{_SCYLLA_DIR}', repo_type='dataset')"
+    ], check=True)
+    print(f"[setup] Scylla data downloaded to {_SCYLLA_DIR}")
 import uuid
 from pathlib import Path
 import lzma
