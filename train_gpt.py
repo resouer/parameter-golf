@@ -105,8 +105,8 @@ class Hyperparameters():
 
     # Causal SLOT
     slot_enabled = bool(int(os.environ.get("SLOT_ENABLED", "1")))
-    slot_lr = float(os.environ.get("SLOT_LR", 0.001))
-    slot_steps = int(os.environ.get("SLOT_STEPS", 4))
+    slot_lr = float(os.environ.get("SLOT_LR", 0.008))
+    slot_steps = int(os.environ.get("SLOT_STEPS", 16))
 
     # Compression
     compressor = os.environ.get('COMPRESSOR', 'brotli')  #(lzma or brotli)
