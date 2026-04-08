@@ -1567,7 +1567,7 @@ def run_evals(
             log(f"slot:forward_hidden FAILED: {e}")
             import traceback; log(traceback.format_exc())
         seq_len = h.eval_seq_len
-        stride = h.eval_stride
+        stride = h.eval_stride * 2  # 2x stride for SLOT speed
         total_tokens = val_data.val_tokens.numel() - 1
 
         ws_list = [ws for ws in range(0, total_tokens, stride) if min(ws + seq_len, total_tokens) - ws >= 1]
