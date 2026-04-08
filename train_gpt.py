@@ -84,6 +84,12 @@ class Hyperparameters():
     # Parallel residuals (GPT-J style, from abaybektursun PR #1420)
     parallel_residual_start = int(os.environ.get('PARALLEL_RESIDUAL_START', 7))
 
+    # Score-first TTT (legal eval-time training, from PR #549/#1413/#1477)
+    ttt_enabled = bool(int(os.environ.get('TTT_ENABLED', '1')))
+    ttt_lr = float(os.environ.get('TTT_LR', 0.005))
+    ttt_epochs = int(os.environ.get('TTT_EPOCHS', 3))
+    ttt_chunk_tokens = int(os.environ.get('TTT_CHUNK_TOKENS', 2048 * 32 * 8))  # tokens per chunk
+
     # Optimizer
     min_lr = float(os.environ.get('MIN_LR', 0.0))
     embed_lr = float(os.environ.get('EMBED_LR', 0.6))
@@ -1272,6 +1278,98 @@ def eval_val_sliding(
     return _loss_bpb(loss_sum, token_count, byte_count)
 
 
+def eval_ttt(
+    h: Hyperparameters,
+    device: torch.device,
+    val_data: ValidationData,
+    model: nn.Module,
+) -> tuple[float, float]:
+    """Score-first TTT: score each chunk under inference_mode, then train on it.
+    Legal under Issue #1017: each position scored before any update uses it.
+    Pattern from PR #549, #1413, #1477."""
+    model.eval()
+    seq_len = h.eval_seq_len
+    stride = h.eval_stride
+    context_size = seq_len - stride
+    total_tokens = val_data.val_tokens.numel() - 1
+
+    # Build sliding windows (same as eval_val_sliding)
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if ws + context_size < total_tokens]
+    total_windows = len(window_starts)
+    my_s = (total_windows * h.rank) // h.world_size
+    my_e = (total_windows * (h.rank + 1)) // h.world_size
+    my_windows = window_starts[my_s:my_e]
+
+    # Split into chunks for score-first TTT
+    chunk_size = h.ttt_chunk_tokens // (seq_len * h.world_size)
+    chunk_size = max(1, chunk_size)
+    chunks = [my_windows[i:i + chunk_size] for i in range(0, len(my_windows), chunk_size)]
+
+    # TTT optimizer: SGD on all model params
+    optimizer = torch.optim.SGD(model.parameters(), lr=h.ttt_lr)
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    for chunk_idx, chunk_windows in enumerate(chunks):
+        bsz = len(chunk_windows)
+
+        x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+        y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+        wlens: list[int] = []
+
+        for i, ws in enumerate(chunk_windows):
+            we = min(ws + seq_len, total_tokens)
+            wlen = we - ws
+            wlens.append(wlen)
+            chunk_tok = val_data.val_tokens[ws:we + 1].to(dtype=torch.int64, device=device)
+            x_batch[i, :wlen] = chunk_tok[:-1]
+            y_batch[i, :wlen] = chunk_tok[1:]
+
+        # Phase 1: SCORE (no grad, no model update)
+        with torch.inference_mode():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model.forward_logits(x_batch)
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1),
+                reduction="none",
+            ).reshape(bsz, seq_len)
+
+        for i, ws in enumerate(chunk_windows):
+            wlen = wlens[i]
+            s = 0 if ws == 0 else context_size
+            scored_nll = nll[i, s:wlen].to(torch.float64)
+            loss_sum += scored_nll.sum()
+            token_count += float(wlen - s)
+            tgt = y_batch[i, s:wlen]
+            prev = x_batch[i, s:wlen]
+            tb = val_data.base_bytes_lut[tgt].to(torch.float64)
+            tb += (val_data.has_leading_space_lut[tgt] &
+                   ~val_data.is_boundary_token_lut[prev]).to(torch.float64)
+            byte_count += tb.sum()
+
+        # Phase 2: TRAIN on just-scored chunk (not last chunk)
+        if chunk_idx < len(chunks) - 1:
+            model.train()
+            for _epoch in range(h.ttt_epochs):
+                optimizer.zero_grad()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = model(x_batch, y_batch)
+                loss.backward()
+                optimizer.step()
+            model.eval()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    return _loss_bpb(loss_sum, token_count, byte_count)
+
+
 def timed_eval(label: str, fn, *args, **kwargs) -> tuple[float, float]:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1472,10 +1570,20 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     if h.num_loops > 0:
         eval_model.looping_active = True
 
+    # Score-first TTT: run BEFORE torch.compile (compile conflict fix from R16)
+    if h.ttt_enabled:
+        log("ttt:starting score-first TTT evaluation")
+        timed_eval("ttt", eval_ttt, h, device, val_data, eval_model)
+        log("ttt:score-first TTT complete")
+
     compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
     timed_eval("quantized", eval_val, h, device, val_data, compiled_model)
     if h.sliding_window_enabled:
         timed_eval("quantized_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
+
+    # Final TTT sliding eval (after TTT training has modified weights)
+    if h.ttt_enabled and h.sliding_window_enabled:
+        timed_eval("final_ttt_sliding", eval_val_sliding, h, device, val_data, eval_model)
 
 
 def main():
