@@ -10,7 +10,7 @@ import sys
 import time
 
 # Auto-download Scylla data if not present
-_SCYLLA_DIR = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_scylla")
+_SCYLLA_DIR = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
 if not glob.glob(os.path.join(_SCYLLA_DIR, "*.bin")):
     print(f"[setup] Scylla data not found at {_SCYLLA_DIR}, downloading from HuggingFace...")
     os.makedirs(_SCYLLA_DIR, exist_ok=True)
@@ -46,10 +46,10 @@ except ImportError:
    _HAS_FA3 = False
    flash_attn_3_func = None
 class Hyperparameters:
- data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_scylla")
+ data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
  train_files = os.path.join(data_path, "fineweb_train_*.bin")
  val_files = os.path.join(data_path, "fineweb_val_*.bin")
- tokenizer_path = os.environ.get("TOKENIZER_PATH", "candidate.vocab")
+ tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
  run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
  seed = int(os.environ.get("SEED", 1337))
  val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
@@ -63,8 +63,8 @@ class Hyperparameters:
  eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
  max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
  qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 4.0))
- vocab_size = int(os.environ.get("VOCAB_SIZE", 998))
- num_layers = int(os.environ.get("NUM_LAYERS", 11))
+ vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+ num_layers = int(os.environ.get("NUM_LAYERS", 12))
  num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
  model_dim = int(os.environ.get("MODEL_DIM", 512))
  num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -95,16 +95,16 @@ class Hyperparameters:
  muon_wd = float(os.environ.get("MUON_WD", 0.04))
  adam_wd = float(os.environ.get("ADAM_WD", 0.04))
  qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
- bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
- bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
- xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on last 11 layers (0 = disabled)
+ bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
+ bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+ xsa_last_n = int(os.environ.get("XSA_LAST_N", 12))  # XSA on all 12 layers
  rope_dims = int(os.environ.get("ROPE_DIMS", 16))
  ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
  dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
  late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
  ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
  ve_dim = int(os.environ.get("VE_DIM", 128))
- ve_layers = os.environ.get("VE_LAYERS", "9,10")
+ ve_layers = os.environ.get("VE_LAYERS", "10,11")
  vrl_enabled = bool(int(os.environ.get("VRL_ENABLED", "1")))
  ogd_enabled = bool(int(os.environ.get("OGD_ENABLED", "1")))
  ogd_lr = float(os.environ.get("OGD_LR", 0.1))
@@ -1185,7 +1185,7 @@ def main() -> None:
  np.random.seed(args.seed)
  torch.manual_seed(args.seed)
  torch.cuda.manual_seed_all(args.seed)
- meta_path_env = os.environ.get("TOKENIZER_META_PATH", "candidate.meta.npz")
+ meta_path_env = os.environ.get("TOKENIZER_META_PATH", "")
  if meta_path_env and Path(meta_path_env).exists():
   md = np.load(meta_path_env)
   meta_vocab = int(np.asarray(md["vocab_size"]).item())
