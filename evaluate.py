@@ -334,6 +334,9 @@ def _log_has_results(log_file):
         return False
     with open(log_file) as f:
         content = f.read()
+    # If SLOT is enabled, wait for final_causal_slot or results_json (not just any eval result)
+    if "slot_enabled: True" in content:
+        return "final_causal_slot" in content or "results_json" in content
     return "results_json" in content or ("eval_time" in content and "val_bpb" in content)
 
 
