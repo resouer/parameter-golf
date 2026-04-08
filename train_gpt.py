@@ -39,7 +39,7 @@ class Hyperparameters():
 
     # Training length
     iterations = int(os.environ.get('ITERATIONS', 20000))
-    warmdown_frac = float(os.environ.get('WARMDOWN_FRAC', 0.667))
+    warmdown_frac = float(os.environ.get('WARMDOWN_FRAC', 0.72))
     warmup_steps = int(os.environ.get('WARMUP_STEPS', 20))
     train_batch_tokens = int(os.environ.get('TRAIN_BATCH_TOKENS', 2048 * 48 * 8))
     train_seq_len = int(os.environ.get('TRAIN_SEQ_LEN', 2048))
@@ -79,7 +79,7 @@ class Hyperparameters():
     head_lr = float(os.environ.get('HEAD_LR', 0.008))
     tied_embed_lr = float(os.environ.get('TIED_EMBED_LR', 0.03))
     tied_embed_init_std = float(os.environ.get('TIED_EMBED_INIT_STD', 0.005))
-    matrix_lr = float(os.environ.get('MATRIX_LR', 0.02))
+    matrix_lr = float(os.environ.get('MATRIX_LR', 0.022))
     scalar_lr = float(os.environ.get('SCALAR_LR', 0.02))
     muon_momentum = float(os.environ.get('MUON_MOMENTUM', 0.99))
     muon_backend_steps = int(os.environ.get('MUON_BACKEND_STEPS', 5))
@@ -92,13 +92,13 @@ class Hyperparameters():
     eval_stride = int(os.environ.get('EVAL_STRIDE', 64))
     muon_beta2 = float(os.environ.get('MUON_BETA2', 0.95))
     adam_wd = float(os.environ.get('ADAM_WD', 0.02))
-    muon_wd = float(os.environ.get('MUON_WD', 0.090))
-    embed_wd = float(os.environ.get('EMBED_WD', 0.090))
-    ema_decay = float(os.environ.get('EMA_DECAY', 0.997))
+    muon_wd = float(os.environ.get('MUON_WD', 0.095))
+    embed_wd = float(os.environ.get('EMBED_WD', 0.095))
+    ema_decay = float(os.environ.get('EMA_DECAY', 0.9965))
 
     # Depth Recurrence (Modification 2)
     recur_layers = os.environ.get("RECUR_LAYERS", "4,5")
-    recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
+    recur_start_step = int(os.environ.get("RECUR_START_STEP", 2000))
 
     # Parallel Residuals (Modification 5)
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
