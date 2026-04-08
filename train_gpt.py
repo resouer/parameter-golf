@@ -1565,8 +1565,8 @@ def run_evals(
         sl_bc = torch.zeros((), device=device, dtype=torch.float64)
 
         batch_size = 32
-        compiled_hidden = torch.compile(eval_model.forward_hidden, dynamic=False, fullgraph=True)
-        compiled_logits_fn = torch.compile(eval_model.compute_logits, dynamic=False, fullgraph=True)
+        compiled_hidden = eval_model.forward_hidden  # skip compile for SLOT (avoids fullgraph issues)
+        compiled_logits_fn = eval_model.compute_logits
 
         for bi in range(0, len(my_ws), batch_size):
             bws = my_ws[bi:bi+batch_size]
