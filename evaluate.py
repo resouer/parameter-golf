@@ -140,15 +140,32 @@ SHARDS=80
 [ "$VOCAB" -gt 1024 ] && SHARDS=143
 [ "$VOCAB" -gt 4096 ] && SHARDS=128
 echo "data_setup: vocab=$VOCAB shards=$SHARDS"
-# Non-default vocab: use kevclark's HF repo + delete stale manifest (SP8192 not in default manifest)
-[ "$VOCAB" -gt 1024 ] && export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
-[ "$VOCAB" -gt 1024 ] && rm -f data/manifest.json
-if [ ! -f "data/datasets/.download_complete_sp${VOCAB}" ]; then
-    python data/cached_challenge_fineweb.py --variant sp${VOCAB} --train-shards $SHARDS
-    touch "data/datasets/.download_complete_sp${VOCAB}"
+# Scylla (998-vocab custom tokenizer): download from HuggingFace
+if [ "$VOCAB" = "998" ]; then
+    echo "data_setup: Scylla tokenizer detected (vocab=998)"
+    SCYLLA_DIR="./data/datasets/fineweb10B_scylla"
+    if [ ! -f "$SCYLLA_DIR/.download_complete" ]; then
+        echo "data_setup: downloading Scylla data from HuggingFace..."
+        pip install -q huggingface_hub 2>/dev/null || true
+        python3 -c "from huggingface_hub import snapshot_download; snapshot_download('anthonym21/fineweb10B-scylla', local_dir='$SCYLLA_DIR', repo_type='dataset')"
+        touch "$SCYLLA_DIR/.download_complete"
+        echo "data_setup: Scylla download complete"
+    fi
+    export DATA_PATH="$SCYLLA_DIR"
+    # Tokenizer files from repo (candidate.vocab, candidate.meta.npz)
+    export TOKENIZER_PATH="${TOKENIZER_PATH:-./candidate.vocab}"
+    export TOKENIZER_META_PATH="${TOKENIZER_META_PATH:-./candidate.meta.npz}"
+else
+    # Non-default vocab: use kevclark's HF repo + delete stale manifest (SP8192 not in default manifest)
+    [ "$VOCAB" -gt 1024 ] && export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
+    [ "$VOCAB" -gt 1024 ] && rm -f data/manifest.json
+    if [ ! -f "data/datasets/.download_complete_sp${VOCAB}" ]; then
+        python data/cached_challenge_fineweb.py --variant sp${VOCAB} --train-shards $SHARDS
+        touch "data/datasets/.download_complete_sp${VOCAB}"
+    fi
+    export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp${VOCAB}}
+    export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_${VOCAB}_bpe.model}
 fi
-export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp${VOCAB}}
-export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_${VOCAB}_bpe.model}
 """
 
     clone_setup = f"""
