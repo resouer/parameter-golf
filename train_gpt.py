@@ -77,7 +77,7 @@ class Hyperparameters():
     qk_gain_init = float(os.environ.get('QK_GAIN_INIT', 4.0))
 
     # Layer looping (triple loop from abaybektursun PR #1420)
-    num_loops = int(os.environ.get('NUM_LOOPS', 3))
+    num_loops = int(os.environ.get('NUM_LOOPS', 2))
     loop_start = int(os.environ.get('LOOP_START', 4))
     loop_end = int(os.environ.get('LOOP_END', 5))
     enable_looping_at = float(os.environ.get('ENABLE_LOOPING_AT', 0.35))
