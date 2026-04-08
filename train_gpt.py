@@ -1573,11 +1573,8 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     if h.ttt_enabled:
         # Score-first TTT: run BEFORE torch.compile (compile conflict fix from R16)
         log("ttt:starting score-first TTT evaluation")
-        timed_eval("ttt_scoring", eval_ttt, h, device, val_data, eval_model)
-        log("ttt:score-first TTT complete")
-        # Final sliding eval after TTT has modified weights
-        if h.sliding_window_enabled:
-            timed_eval("final_ttt_sliding", eval_val_sliding, h, device, val_data, eval_model)
+        timed_eval("final_ttt", eval_ttt, h, device, val_data, eval_model)
+        log("ttt:done")
     else:
         compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
         timed_eval("quantized", eval_val, h, device, val_data, compiled_model)
