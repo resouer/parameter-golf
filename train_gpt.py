@@ -1602,18 +1602,30 @@ def run_evals(
                     context_mask[i, :s] = True
                     has_context = True
 
-            # Optimize delta on context-only positions (CAUSAL)
+            # Optimize delta on context-only positions (CAUSAL) with adaptive LR
             delta = torch.zeros(1, 1, H.shape[-1], device=device, dtype=H.dtype, requires_grad=True)
             if has_context:
-                sopt = torch.optim.AdamW([delta], lr=h.slot_lr, betas=(0.3, 0.9), weight_decay=1e-8, eps=1e-5)
-                for _ in range(h.slot_steps):
+                slot_lr_curr = h.slot_lr
+                sopt = torch.optim.AdamW([delta], lr=slot_lr_curr, betas=(0.3, 0.9), weight_decay=1e-8, eps=1e-5)
+                prev_loss = None
+                for step_i in range(h.slot_steps):
                     sopt.zero_grad()
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         lg = eval_model.compute_logits((H + delta).to(torch.bfloat16)).float()
                     nll_all = F.cross_entropy(lg.reshape(-1, lg.size(-1)), yb.reshape(-1), reduction="none").reshape(bsz, seq_len)
                     ctx_nll = nll_all[context_mask]
                     if ctx_nll.numel() > 0:
-                        ctx_nll.mean().backward()
+                        curr_loss = ctx_nll.mean()
+                        # Adaptive LR: increase if loss dropping, decrease if plateauing
+                        if prev_loss is not None:
+                            ratio = curr_loss.item() / max(prev_loss, 1e-8)
+                            if ratio < 0.995:  # loss decreasing well
+                                slot_lr_curr = min(slot_lr_curr * 1.2, h.slot_lr * 3)
+                            elif ratio > 1.001:  # loss increasing (overshooting)
+                                slot_lr_curr = max(slot_lr_curr * 0.5, h.slot_lr * 0.1)
+                            for pg in sopt.param_groups: pg['lr'] = slot_lr_curr
+                        prev_loss = curr_loss.item()
+                        curr_loss.backward()
                         sopt.step()
 
             # Score new positions with optimized delta
