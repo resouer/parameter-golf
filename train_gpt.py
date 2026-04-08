@@ -1541,18 +1541,8 @@ def run_evals(
     val_data: ValidationData,
     eval_model: torch.nn.Module
 ):
-    compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
-    timed_eval("final_int6_roundtrip", eval_val, h, device, val_data, compiled_model)
-    if h.sliding_window_enabled:
-        timed_eval("final_int6_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
-
-    # Causal SLOT evaluation — use existing eval_model, reset compile
+    # Causal SLOT evaluation — run FIRST before any torch.compile
     if h.slot_enabled and h.eval_stride > 0:
-        try:
-            del compiled_model
-        except: pass
-        torch._dynamo.reset()
-        torch.cuda.empty_cache()
         torch.cuda.synchronize()
         log("slot:entering SLOT eval phase")
         t_slot = time.perf_counter()
@@ -1580,7 +1570,7 @@ def run_evals(
         sl_bc = torch.zeros((), device=device, dtype=torch.float64)
 
         batch_size = 32
-        compiled_hidden = torch.compile(eval_model.forward_hidden, dynamic=False)
+        compiled_hidden = torch.compile(eval_model.forward_hidden, dynamic=False, fullgraph=True)
         compiled_logits_fn = eval_model.compute_logits  # keep uncompiled for grad
 
         for bi in range(0, len(my_ws), batch_size):
@@ -1649,6 +1639,14 @@ def run_evals(
         slot_bpb = slot_loss / math.log(2.0) * (sl_tc.item() / sl_bc.item())
         torch.cuda.synchronize()
         log(f"final_causal_slot val_loss:{slot_loss:.8f} val_bpb:{slot_bpb:.8f} eval_time:{1000*(time.perf_counter()-t_slot):.0f}ms")
+
+    # Standard evals (after SLOT)
+    for p in eval_model.parameters(): p.requires_grad_(True)
+    torch._dynamo.reset()
+    compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    timed_eval("final_int6_roundtrip", eval_val, h, device, val_data, compiled_model)
+    if h.sliding_window_enabled:
+        timed_eval("final_int6_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
 
 # -----------------------------
 # Training
