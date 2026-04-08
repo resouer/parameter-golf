@@ -1570,20 +1570,19 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     if h.num_loops > 0:
         eval_model.looping_active = True
 
-    # Score-first TTT: run BEFORE torch.compile (compile conflict fix from R16)
     if h.ttt_enabled:
+        # Score-first TTT: run BEFORE torch.compile (compile conflict fix from R16)
         log("ttt:starting score-first TTT evaluation")
-        timed_eval("ttt", eval_ttt, h, device, val_data, eval_model)
+        timed_eval("ttt_scoring", eval_ttt, h, device, val_data, eval_model)
         log("ttt:score-first TTT complete")
-
-    compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
-    timed_eval("quantized", eval_val, h, device, val_data, compiled_model)
-    if h.sliding_window_enabled:
-        timed_eval("quantized_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
-
-    # Final TTT sliding eval (after TTT training has modified weights)
-    if h.ttt_enabled and h.sliding_window_enabled:
-        timed_eval("final_ttt_sliding", eval_val_sliding, h, device, val_data, eval_model)
+        # Final sliding eval after TTT has modified weights
+        if h.sliding_window_enabled:
+            timed_eval("final_ttt_sliding", eval_val_sliding, h, device, val_data, eval_model)
+    else:
+        compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
+        timed_eval("quantized", eval_val, h, device, val_data, compiled_model)
+        if h.sliding_window_enabled:
+            timed_eval("quantized_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
 
 
 def main():
