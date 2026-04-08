@@ -1548,13 +1548,24 @@ def run_evals(
 
     # Causal SLOT evaluation — use existing eval_model, reset compile
     if h.slot_enabled and h.eval_stride > 0:
-        del compiled_model
+        try:
+            del compiled_model
+        except: pass
         torch._dynamo.reset()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        log("slot:entering SLOT eval phase")
         t_slot = time.perf_counter()
         eval_model.eval()
         for p in eval_model.parameters(): p.requires_grad_(False)
+        log(f"slot:model frozen, testing forward_hidden...")
+        try:
+            test_x = torch.zeros(1, 64, dtype=torch.int64, device=device)
+            with torch.no_grad(): test_h = eval_model.forward_hidden(test_x)
+            log(f"slot:forward_hidden OK, shape={test_h.shape}")
+        except Exception as e:
+            log(f"slot:forward_hidden FAILED: {e}")
+            import traceback; log(traceback.format_exc())
         seq_len = h.eval_seq_len
         stride = h.eval_stride
         total_tokens = val_data.val_tokens.numel() - 1
