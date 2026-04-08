@@ -1546,17 +1546,15 @@ def run_evals(
     if h.sliding_window_enabled:
         timed_eval("final_int6_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
 
-    # Causal SLOT evaluation — fresh model to avoid compile interference
+    # Causal SLOT evaluation — use existing eval_model, reset compile
     if h.slot_enabled and h.eval_stride > 0:
-        del eval_model, compiled_model
+        del compiled_model
         torch._dynamo.reset()
         torch.cuda.empty_cache()
-        eval_model = deserialize(h, device)
-        if h.num_loops > 0:
-            eval_model.looping_active = True
         torch.cuda.synchronize()
         t_slot = time.perf_counter()
         eval_model.eval()
+        for p in eval_model.parameters(): p.requires_grad_(False)
         seq_len = h.eval_seq_len
         stride = h.eval_stride
         total_tokens = val_data.val_tokens.numel() - 1
