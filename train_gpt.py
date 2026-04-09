@@ -180,34 +180,12 @@ class Muon(torch.optim.Optimizer):
 	def __init__(self,params,lr,momentum,backend_steps,nesterov=True,weight_decay=.0,row_normalize=False,precond_refresh=32,precond_ewma=0.95,precond_ridge=0.2):
 		super().__init__(params,dict(lr=lr,momentum=momentum,backend_steps=backend_steps,nesterov=nesterov,weight_decay=weight_decay,row_normalize=row_normalize))
 		self._precond_refresh=precond_refresh;self._precond_ewma=precond_ewma;self._precond_ridge=precond_ridge;self._step_count=0
-	def register_input_hook(self,module,param):
-		"""Register forward hook to track input second moment for Newton-Muon right-preconditioning."""
-		def hook(mod,inp):
-			if not mod.training:return
-			if self._step_count%self._precond_refresh!=0 and self._step_count>0:return
-			x=inp[0].detach().bfloat16()
-			if x.ndim==3:x=x.reshape(-1,x.size(-1))
-			n=x.size(0);xtx=(x.T@x).float()/n
-			st=self.state[param]
-			if'precond_cov'not in st:st['precond_cov']=torch.zeros_like(xtx);st['precond_inv']=None
-			st['precond_cov'].lerp_(xtx,1.0-self._precond_ewma)
-		module.register_forward_pre_hook(hook)
 	@torch.no_grad()
 	def step(self,closure=None):
 		loss=None
 		if closure is not None:
 			with torch.enable_grad():loss=closure()
 		self._step_count+=1;do_refresh=(self._step_count%self._precond_refresh==0)
-		if do_refresh:
-			for group in self.param_groups:
-				for p in group['params']:
-					st=self.state[p]
-					if'precond_cov'in st:
-						C=st['precond_cov'].float();d=C.size(0)
-						ridge=(C.trace()/d)*self._precond_ridge+1e-8
-						C.diagonal().add_(ridge)
-						try:L=torch.linalg.cholesky(C);st['precond_inv']=torch.cholesky_inverse(L)
-						except:st['precond_inv']=None
 		distributed=dist.is_available()and dist.is_initialized();world_size=dist.get_world_size()if distributed else 1;rank=dist.get_rank()if distributed else 0
 		for group in self.param_groups:
 			params=group['params']
@@ -220,8 +198,17 @@ class Muon(torch.optim.Optimizer):
 					buf=state['momentum_buffer'];buf.mul_(momentum).add_(g)
 					if nesterov:g=g.add(buf,alpha=momentum)
 					if group.get('row_normalize',False):row_norms=g.float().norm(dim=-1,keepdim=True).clamp_min(1e-07);g=g/row_norms.to(g.dtype)
+					# Newton-Muon: gradient-based right preconditioner (arXiv:2604.01472)
+					# Use G^T@G as proxy for input second moment ZZ^T (no hooks needed)
+					if do_refresh and g.ndim==2:
+						gtg=(g.float().T@g.float())/g.size(0)
+						if'precond_cov'not in state:state['precond_cov']=torch.zeros_like(gtg)
+						state['precond_cov'].lerp_(gtg,1.0-self._precond_ewma)
+						C=state['precond_cov'].clone();d=C.size(0);ridge=(C.trace()/d)*self._precond_ridge+1e-8;C.diagonal().add_(ridge)
+						try:L=torch.linalg.cholesky(C);state['precond_inv']=torch.cholesky_inverse(L)
+						except:state['precond_inv']=None
 					inv=state.get('precond_inv')
-					if inv is not None:g=g.float()@inv.to(g.device);g=g.to(torch.bfloat16)
+					if inv is not None:g=(g.float()@inv.to(g.device)).to(torch.bfloat16)
 					g=zeropower_via_newtonschulz5(g,steps=backend_steps);g*=max(1,g.size(0)/g.size(1))**.5;updates_flat[curr:curr+p.numel()]=g.reshape(-1)
 				curr+=p.numel()
 			if distributed:dist.all_reduce(updates_flat,op=dist.ReduceOp.SUM)
@@ -238,13 +225,7 @@ class Optimizers:
 		if base_model.skip_gates is not None and base_model.skip_gates.numel()>0:scalar_params.append(base_model.skip_gates)
 		if base_model.lane_merge is not None:scalar_params.append(base_model.lane_merge)
 		token_lr=h.tied_embed_lr if h.tie_embeddings else h.embed_lr;tok_params=[{'params':[base_model.tok_emb.weight],'lr':token_lr,'base_lr':token_lr}];self.optimizer_tok=torch.optim.AdamW(tok_params,betas=(h.beta1,h.beta2),eps=h.adam_eps,weight_decay=h.embed_wd,fused=True);self.optimizer_muon=Muon(matrix_params,lr=h.matrix_lr,momentum=h.muon_momentum,backend_steps=h.muon_backend_steps,weight_decay=h.muon_wd,row_normalize=h.muon_row_normalize)
-		# Newton-Muon: register input hooks for right-preconditioning (arXiv:2604.01472)
-		param_to_module={};
-		for name,mod in base_model.blocks.named_modules():
-			if isinstance(mod,nn.Linear):
-				for pname,p in mod.named_parameters(recurse=False):
-					if p.ndim==2 and p in set(matrix_params):param_to_module[id(p)]=(mod,p)
-		for pid,(mod,p)in param_to_module.items():self.optimizer_muon.register_input_hook(mod,p)
+		# Newton-Muon preconditioner is computed from gradients inside step() — no hooks needed
 		for group in self.optimizer_muon.param_groups:group['base_lr']=h.matrix_lr
 		self.optimizer_scalar=torch.optim.AdamW([{'params':scalar_params,'lr':h.scalar_lr,'base_lr':h.scalar_lr}],betas=(h.beta1,h.beta2),eps=h.adam_eps,weight_decay=h.adam_wd,fused=True);self.optimizers=[self.optimizer_tok,self.optimizer_muon,self.optimizer_scalar]
 		if base_model.lm_head is not None:self.optimizer_head=torch.optim.Adam([{'params':[base_model.lm_head.weight],'lr':h.head_lr,'base_lr':h.head_lr}],betas=(h.beta1,h.beta2),eps=h.adam_eps,fused=True);self.optimizers.insert(1,self.optimizer_head)
