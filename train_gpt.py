@@ -989,16 +989,16 @@ def gptq_mixed_quantize(
             meta[name] = "passthrough (float16)"
             continue
         cs = h.embed_clip_sigmas if "tok_emb" in name else h.matrix_clip_sigmas
-        # Reuse-aware mixed-precision: looped MLP gets int7, non-critical late layers get int5
+        # Reuse-aware mixed-precision: looped v_proj/o_proj get int7
         # Novel: quantization precision scaled by depth-recurrence reuse count
+        # v_proj and o_proj are most quantization-sensitive in looped layers (PR #1420)
         if "tok_emb" in name:
             bits = h.embed_bits
         else:
             m_layer = re.match(r'blocks\.(\d+)\.', name)
-            if m_layer and h.loop_start <= int(m_layer.group(1)) <= h.loop_end and ".mlp." in name:
-                bits = 7  # looped MLP reused 4x → protect with more bits
-            elif m_layer and int(m_layer.group(1)) >= 7 and ".attn." in name:
-                bits = 5  # non-critical late attention (layers 7-10) → save bytes
+            if m_layer and h.loop_start <= int(m_layer.group(1)) <= h.loop_end and \
+               (".attn.v_proj" in name or ".attn.o_proj" in name):
+                bits = 7  # looped v/o reused 4x, most sensitive → protect
             else:
                 bits = h.matrix_bits  # int6 default
         q, s = gptq_quantize_weight(
