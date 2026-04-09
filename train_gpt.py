@@ -50,7 +50,7 @@ class Hyperparameters():
     train_batch_tokens = int(os.environ.get('TRAIN_BATCH_TOKENS', 2048 * 48 * 8))
     train_seq_len = int(os.environ.get('TRAIN_SEQ_LEN', 2048))
     train_log_every = int(os.environ.get('TRAIN_LOG_EVERY', 500))
-    max_wallclock_seconds = float(os.environ.get('MAX_WALLCLOCK_SECONDS', 540.0))
+    max_wallclock_seconds = float(os.environ.get('MAX_WALLCLOCK_SECONDS', 600.0))
 
     # Validation/Evals
     val_batch_tokens = int(os.environ.get('VAL_BATCH_TOKENS', 2048 * 32 * 8))
@@ -77,7 +77,7 @@ class Hyperparameters():
     qk_gain_init = float(os.environ.get('QK_GAIN_INIT', 4.0))
 
     # Layer looping (triple loop from abaybektursun PR #1420)
-    num_loops = int(os.environ.get('NUM_LOOPS', 2))
+    num_loops = int(os.environ.get('NUM_LOOPS', 3))
     loop_start = int(os.environ.get('LOOP_START', 4))
     loop_end = int(os.environ.get('LOOP_END', 5))
     enable_looping_at = float(os.environ.get('ENABLE_LOOPING_AT', 0.35))
@@ -85,7 +85,7 @@ class Hyperparameters():
     parallel_residual_start = int(os.environ.get('PARALLEL_RESIDUAL_START', 7))
 
     # Score-first TTT (legal eval-time training, from PR #549/#1413/#1477)
-    ttt_enabled = bool(int(os.environ.get('TTT_ENABLED', '1')))
+    ttt_enabled = bool(int(os.environ.get('TTT_ENABLED', '0')))
     ttt_lr = float(os.environ.get('TTT_LR', 0.005))
     ttt_epochs = int(os.environ.get('TTT_EPOCHS', 1))
     ttt_chunk_tokens = int(os.environ.get('TTT_CHUNK_TOKENS', 2048 * 64 * 8))  # tokens per chunk (larger = fewer train steps)
