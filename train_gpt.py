@@ -366,16 +366,24 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride):
 				batch_ws=my_windows[bi:bi+batch_seqs];bsz=len(batch_ws);x_batch=torch.zeros(bsz,seq_len,dtype=torch.int64,device=device);y_batch=torch.zeros(bsz,seq_len,dtype=torch.int64,device=device);wlens=[]
 				for(i,ws)in enumerate(batch_ws):end=min(ws+seq_len,total_tokens);wlen=end-ws;wlens.append(wlen);chunk_tok=val_data.val_tokens[ws:end+1].to(dtype=torch.int64,device=device);x_batch[i,:wlen]=chunk_tok[:-1];y_batch[i,:wlen]=chunk_tok[1:]
 				with torch.autocast(device_type='cuda',dtype=torch.bfloat16):logits=compiled_logits(x_batch)
-				logits_f=logits.reshape(-1,logits.size(-1)).float()+logit_bias.unsqueeze(0)
-				nll=F.cross_entropy(logits_f,y_batch.reshape(-1),reduction='none').reshape(bsz,seq_len)
-				scored_logits_list=[];scored_targets_list=[]
+				logits_raw=logits.reshape(-1,logits.size(-1)).float()
+				# Build scored-position mask (excludes padding AND context)
+				scored_mask=torch.zeros(bsz,seq_len,dtype=torch.bool,device=device)
 				for(i,ws)in enumerate(batch_ws):
-					wlen=wlens[i];s=0 if ws==0 else context_size;scored_nll=nll[i,s:wlen].to(torch.float64);loss_sum+=scored_nll.sum();token_count+=float(wlen-s);tgt=y_batch[i,s:wlen];prev=x_batch[i,s:wlen];tb=val_data.base_bytes_lut[tgt].to(torch.float64);tb+=(val_data.has_leading_space_lut[tgt]&~val_data.is_boundary_token_lut[prev]).to(torch.float64);byte_count+=tb.sum()
-					scored_logits_list.append(logits_f.reshape(bsz,seq_len,-1)[i,s:wlen]);scored_targets_list.append(tgt)
-				if scored_logits_list:
-					sl=torch.cat(scored_logits_list,0);st=torch.cat(scored_targets_list,0)
-					probs=torch.softmax(sl.detach(),dim=-1);toh=F.one_hot(st,h.vocab_size).float()
-					logit_bias-=bias_lr*(probs-toh).mean(0)
+					wlen=wlens[i];s=0 if ws==0 else context_size
+					scored_mask[i,s:wlen]=True
+				scored_flat=scored_mask.reshape(-1)
+				# Apply bias only to scored positions for NLL computation
+				logits_biased=logits_raw.clone();logits_biased[scored_flat]+=logit_bias.unsqueeze(0).expand(scored_flat.sum(),-1) if scored_flat.any() else 0
+				nll=F.cross_entropy(logits_biased,y_batch.reshape(-1),reduction='none').reshape(bsz,seq_len)
+				for(i,ws)in enumerate(batch_ws):wlen=wlens[i];s=0 if ws==0 else context_size;scored_nll=nll[i,s:wlen].to(torch.float64);loss_sum+=scored_nll.sum();token_count+=float(wlen-s);tgt=y_batch[i,s:wlen];prev=x_batch[i,s:wlen];tb=val_data.base_bytes_lut[tgt].to(torch.float64);tb+=(val_data.has_leading_space_lut[tgt]&~val_data.is_boundary_token_lut[prev]).to(torch.float64);byte_count+=tb.sum()
+				# Update bias from scored positions only, sync across ranks
+				if scored_flat.any():
+					sl=logits_biased[scored_flat];st=y_batch.reshape(-1)[scored_flat]
+					probs=torch.softmax(sl.detach(),dim=-1);toh=F.one_hot(st.long(),h.vocab_size).float()
+					grad=(probs-toh).mean(0)
+					if world_size>1:dist.all_reduce(grad,op=dist.ReduceOp.AVG)
+					logit_bias-=bias_lr*grad
 		is_last_chunk=ci==num_chunks-1
 		if not is_last_chunk and h.ttt_epochs>0:
 			base_model.train();chunk_seqs=(chunk_end-chunk_start)//seq_len
