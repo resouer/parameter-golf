@@ -980,6 +980,24 @@ def gptq_quantize_weight(
     return Q[:, invperm], s
 
 
+def _reuse_aware_bits(name: str, h: Hyperparameters) -> int:
+    """Reuse-aware mixed-precision: looped layers get more bits, non-critical layers get fewer.
+    Novel mechanism: quantization precision scaled by depth-recurrence reuse count."""
+    if "tok_emb" in name:
+        return h.embed_bits  # int8 for embeddings
+    # Extract layer index from name like "blocks.4.attn.q_proj.weight"
+    m = re.match(r'blocks\.(\d+)\.', name)
+    if m:
+        layer_idx = int(m.group(1))
+        # Looped layers (4-5): reused 4x with NUM_LOOPS=3 → errors amplified 4x → int7
+        if h.loop_start <= layer_idx <= h.loop_end:
+            return 7
+        # Non-critical late attention projections: int5 to save bytes
+        if layer_idx >= 8 and (".attn.q_proj" in name or ".attn.k_proj" in name):
+            return 5
+    return h.matrix_bits  # default int6
+
+
 def gptq_mixed_quantize(
     state_dict: dict[str, Tensor],
     hessians: dict[str, Tensor],
@@ -995,7 +1013,7 @@ def gptq_mixed_quantize(
             meta[name] = "passthrough (float16)"
             continue
         cs = h.embed_clip_sigmas if "tok_emb" in name else h.matrix_clip_sigmas
-        bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
+        bits = _reuse_aware_bits(name, h)
         q, s = gptq_quantize_weight(
             t, hessians[name], clip_sigmas=cs, clip_range=2**(bits - 1) - 1)
         result[name + ".q"] = q
