@@ -392,17 +392,24 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride):
 				cos_lr=h.ttt_lr*.5*(1.+math.cos(math.pi*ci/max(num_chunks-1,1)))
 				for pg in optimizer.param_groups:pg['lr']=cos_lr
 				my_seq_s=chunk_seqs*rank//world_size;my_seq_e=chunk_seqs*(rank+1)//world_size;my_chunk_seqs=my_seq_e-my_seq_s
+				# Compute global max batches so all ranks call all_reduce same number of times
+				max_chunk_seqs=chunk_seqs-chunk_seqs*(world_size-1)//world_size if world_size>1 else my_chunk_seqs
+				n_batches_global=max((max_chunk_seqs+batch_seqs-1)//batch_seqs,1)
 				for _ep in range(h.ttt_epochs):
-					for bs in range(0,my_chunk_seqs,batch_seqs):
-						be=min(bs+batch_seqs,my_chunk_seqs);actual_bs=my_seq_s+bs;start_tok=chunk_start+actual_bs*seq_len;end_tok=chunk_start+(my_seq_s+be)*seq_len+1
-						if end_tok>val_data.val_tokens.numel():continue
-						local=val_data.val_tokens[start_tok:end_tok].to(device=device,dtype=torch.int64);x=local[:-1].reshape(-1,seq_len);y=local[1:].reshape(-1,seq_len);optimizer.zero_grad(set_to_none=True)
-						with torch.autocast(device_type='cuda',dtype=torch.bfloat16):loss=base_model(x,y)
-						loss.backward()
+					for bi_global in range(n_batches_global):
+						bs=bi_global*batch_seqs;be=min(bs+batch_seqs,my_chunk_seqs);has_work=bs<my_chunk_seqs
+						optimizer.zero_grad(set_to_none=True)
+						if has_work:
+							actual_bs=my_seq_s+bs;start_tok=chunk_start+actual_bs*seq_len;end_tok=chunk_start+(my_seq_s+be)*seq_len+1
+							if end_tok<=val_data.val_tokens.numel():
+								local=val_data.val_tokens[start_tok:end_tok].to(device=device,dtype=torch.int64);x=local[:-1].reshape(-1,seq_len);y=local[1:].reshape(-1,seq_len)
+								with torch.autocast(device_type='cuda',dtype=torch.bfloat16):loss=base_model(x,y)
+								loss.backward()
 						if world_size>1:
 							for p in ttt_params:
-								if p.grad is not None:dist.all_reduce(p.grad,op=dist.ReduceOp.AVG)
-						torch.nn.utils.clip_grad_norm_(ttt_params,h.ttt_grad_clip);optimizer.step()
+								if p.grad is None:p.grad=torch.zeros_like(p)
+								dist.all_reduce(p.grad,op=dist.ReduceOp.AVG)
+						if has_work:torch.nn.utils.clip_grad_norm_(ttt_params,h.ttt_grad_clip);optimizer.step()
 		if rank==0 and(ci%10==0 or ci==num_chunks-1):elapsed=time.perf_counter()-t0;rl=loss_sum.item()/max(token_count.item(),1);rbpb=rl/math.log(2.)*(token_count.item()/max(byte_count.item(),1));log(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
 	if dist.is_available()and dist.is_initialized():dist.all_reduce(loss_sum,op=dist.ReduceOp.SUM);dist.all_reduce(token_count,op=dist.ReduceOp.SUM);dist.all_reduce(byte_count,op=dist.ReduceOp.SUM)
 	val_loss=(loss_sum/token_count).item();val_bpb=val_loss/math.log(2.)*(token_count.item()/byte_count.item())
