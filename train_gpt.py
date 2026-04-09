@@ -356,8 +356,7 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride):
 		if freeze:p.requires_grad_(False)
 		else:p.requires_grad_(True);ttt_params.append(p)
 	log(f"ttt_sliding:params unfrozen={sum(p.numel()for p in ttt_params)} frozen={sum(p.numel()for p in base_model.parameters()if not p.requires_grad)}");optimizer=torch.optim.SGD(ttt_params,lr=h.ttt_lr,momentum=h.ttt_momentum);t0=time.perf_counter();batch_seqs=h.ttt_batch_seqs
-	# Nacrith logit bias: online per-vocab correction (arXiv:2602.19626)
-	logit_bias=torch.zeros(h.vocab_size,device=device,dtype=torch.float32);bias_lr=float(os.environ.get('BIAS_LR','0.003'))
+	logit_bias=torch.zeros(h.vocab_size,device=device,dtype=torch.float32);bias_lr=float(os.environ.get('BIAS_LR','0.005'))
 	for ci in range(num_chunks):
 		windows=chunk_windows[ci]
 		if not windows:continue
@@ -369,9 +368,14 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride):
 				with torch.autocast(device_type='cuda',dtype=torch.bfloat16):logits=compiled_logits(x_batch)
 				logits_f=logits.reshape(-1,logits.size(-1)).float()+logit_bias.unsqueeze(0)
 				nll=F.cross_entropy(logits_f,y_batch.reshape(-1),reduction='none').reshape(bsz,seq_len)
-				for(i,ws)in enumerate(batch_ws):wlen=wlens[i];s=0 if ws==0 else context_size;scored_nll=nll[i,s:wlen].to(torch.float64);loss_sum+=scored_nll.sum();token_count+=float(wlen-s);tgt=y_batch[i,s:wlen];prev=x_batch[i,s:wlen];tb=val_data.base_bytes_lut[tgt].to(torch.float64);tb+=(val_data.has_leading_space_lut[tgt]&~val_data.is_boundary_token_lut[prev]).to(torch.float64);byte_count+=tb.sum()
-				# Update bias after scoring (score-first compliance)
-				probs=torch.softmax(logits_f.detach(),dim=-1);targets_oh=F.one_hot(y_batch.reshape(-1),h.vocab_size).float();grad=(probs-targets_oh).mean(0);logit_bias-=bias_lr*grad
+				scored_logits_list=[];scored_targets_list=[]
+				for(i,ws)in enumerate(batch_ws):
+					wlen=wlens[i];s=0 if ws==0 else context_size;scored_nll=nll[i,s:wlen].to(torch.float64);loss_sum+=scored_nll.sum();token_count+=float(wlen-s);tgt=y_batch[i,s:wlen];prev=x_batch[i,s:wlen];tb=val_data.base_bytes_lut[tgt].to(torch.float64);tb+=(val_data.has_leading_space_lut[tgt]&~val_data.is_boundary_token_lut[prev]).to(torch.float64);byte_count+=tb.sum()
+					scored_logits_list.append(logits_f.reshape(bsz,seq_len,-1)[i,s:wlen]);scored_targets_list.append(tgt)
+				if scored_logits_list:
+					sl=torch.cat(scored_logits_list,0);st=torch.cat(scored_targets_list,0)
+					probs=torch.softmax(sl.detach(),dim=-1);toh=F.one_hot(st,h.vocab_size).float()
+					logit_bias-=bias_lr*(probs-toh).mean(0)
 		is_last_chunk=ci==num_chunks-1
 		if not is_last_chunk and h.ttt_epochs>0:
 			base_model.train();chunk_seqs=(chunk_end-chunk_start)//seq_len
