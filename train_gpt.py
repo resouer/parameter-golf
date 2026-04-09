@@ -184,9 +184,10 @@ class Muon(torch.optim.Optimizer):
 		"""Register forward hook to track input second moment for Newton-Muon right-preconditioning."""
 		def hook(mod,inp):
 			if not mod.training:return
-			x=inp[0].detach().float()
+			if self._step_count%self._precond_refresh!=0 and self._step_count>0:return
+			x=inp[0].detach().bfloat16()
 			if x.ndim==3:x=x.reshape(-1,x.size(-1))
-			n=x.size(0);xtx=x.T@x/n
+			n=x.size(0);xtx=(x.T@x).float()/n
 			st=self.state[param]
 			if'precond_cov'not in st:st['precond_cov']=torch.zeros_like(xtx);st['precond_inv']=None
 			st['precond_cov'].lerp_(xtx,1.0-self._precond_ewma)
