@@ -409,7 +409,7 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride):
 							for p in ttt_params:
 								if p.grad is None:p.grad=torch.zeros_like(p)
 								dist.all_reduce(p.grad,op=dist.ReduceOp.AVG)
-						if has_work:torch.nn.utils.clip_grad_norm_(ttt_params,h.ttt_grad_clip);optimizer.step()
+						torch.nn.utils.clip_grad_norm_(ttt_params,h.ttt_grad_clip);optimizer.step()
 		if rank==0 and(ci%10==0 or ci==num_chunks-1):elapsed=time.perf_counter()-t0;rl=loss_sum.item()/max(token_count.item(),1);rbpb=rl/math.log(2.)*(token_count.item()/max(byte_count.item(),1));log(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
 	if dist.is_available()and dist.is_initialized():dist.all_reduce(loss_sum,op=dist.ReduceOp.SUM);dist.all_reduce(token_count,op=dist.ReduceOp.SUM);dist.all_reduce(byte_count,op=dist.ReduceOp.SUM)
 	val_loss=(loss_sum/token_count).item();val_bpb=val_loss/math.log(2.)*(token_count.item()/byte_count.item())
