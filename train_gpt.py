@@ -380,11 +380,11 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride):
 					sl=logits_biased[scored_flat];st=y_batch.reshape(-1)[scored_flat]
 					probs=torch.softmax(sl.detach(),dim=-1);toh=F.one_hot(st.long(),h.vocab_size).float()
 					bias_grad_accum+=(probs-toh).sum(0);bias_n_scored+=int(scored_flat.sum())
-		# One bias update per chunk, synced across all ranks
-		if bias_n_scored>0:
-			grad=bias_grad_accum/bias_n_scored
-			if world_size>1:dist.all_reduce(grad,op=dist.ReduceOp.AVG)
-			logit_bias-=bias_lr*grad
+		# One bias update per chunk, synced across all ranks (always call all_reduce)
+		if world_size>1:
+			dist.all_reduce(bias_grad_accum,op=dist.ReduceOp.SUM)
+			n_tensor=torch.tensor(float(bias_n_scored),device=device);dist.all_reduce(n_tensor,op=dist.ReduceOp.SUM);bias_n_scored=int(n_tensor.item())
+		if bias_n_scored>0:logit_bias-=bias_lr*(bias_grad_accum/bias_n_scored)
 		is_last_chunk=ci==num_chunks-1
 		if not is_last_chunk and h.ttt_epochs>0:
 			base_model.train();chunk_seqs=(chunk_end-chunk_start)//seq_len
