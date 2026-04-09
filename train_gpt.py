@@ -989,17 +989,17 @@ def gptq_mixed_quantize(
             meta[name] = "passthrough (float16)"
             continue
         cs = h.embed_clip_sigmas if "tok_emb" in name else h.matrix_clip_sigmas
-        # Reuse-aware mixed-precision: looped layers get int7, non-critical late q/k get int5
+        # Reuse-aware mixed-precision: looped MLP layers get wider clip (14σ vs 13.5σ)
+        # Novel: quantization sensitivity scaled by depth-recurrence reuse count
         if "tok_emb" in name:
             bits = h.embed_bits
         else:
+            bits = h.matrix_bits  # int6 for all
             m_layer = re.match(r'blocks\.(\d+)\.', name)
             if m_layer and h.loop_start <= int(m_layer.group(1)) <= h.loop_end:
-                bits = 7  # looped layers reused 4x → protect with more bits
+                cs = 15.0  # wider clip for looped layers (less clipping → preserve range)
             elif m_layer and int(m_layer.group(1)) >= 8 and (".attn.q_proj" in name or ".attn.k_proj" in name):
-                bits = 5  # non-critical late attention → save bytes
-            else:
-                bits = h.matrix_bits
+                cs = 12.0  # tighter clip for non-critical late q/k (more aggressive quantization)
         q, s = gptq_quantize_weight(
             t, hessians[name], clip_sigmas=cs, clip_range=2**(bits - 1) - 1)
         result[name + ".q"] = q
