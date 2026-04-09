@@ -190,7 +190,7 @@ class Muon(torch.optim.Optimizer):
 			lr=group['lr'];momentum=group['momentum'];backend_steps=group['backend_steps'];nesterov=group['nesterov'];total_params=sum(int(p.numel())for p in params);updates_flat=torch.zeros(total_params,device=params[0].device,dtype=torch.bfloat16);curr=0
 			for(i,p)in enumerate(params):
 				if i%world_size==rank and p.grad is not None:
-					g=p.grad;g=g.sign()*g.abs().pow(1.2);state=self.state[p]
+					g=p.grad;gf=g.float();g=(gf.sign()*gf.abs().pow(1.2)).to(g.dtype);state=self.state[p]
 					if'momentum_buffer'not in state:state['momentum_buffer']=torch.zeros_like(g)
 					buf=state['momentum_buffer'];buf.mul_(momentum).add_(g)
 					if nesterov:g=g.add(buf,alpha=momentum)
