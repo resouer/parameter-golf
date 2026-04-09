@@ -198,17 +198,14 @@ class Muon(torch.optim.Optimizer):
 					buf=state['momentum_buffer'];buf.mul_(momentum).add_(g)
 					if nesterov:g=g.add(buf,alpha=momentum)
 					if group.get('row_normalize',False):row_norms=g.float().norm(dim=-1,keepdim=True).clamp_min(1e-07);g=g/row_norms.to(g.dtype)
-					# Newton-Muon: gradient-based right preconditioner (arXiv:2604.01472)
-					# Use G^T@G as proxy for input second moment ZZ^T (no hooks needed)
-					if do_refresh and g.ndim==2:
-						gtg=(g.float().T@g.float())/g.size(0)
-						if'precond_cov'not in state:state['precond_cov']=torch.zeros_like(gtg)
-						state['precond_cov'].lerp_(gtg,1.0-self._precond_ewma)
-						C=state['precond_cov'].clone();d=C.size(0);ridge=(C.trace()/d)*self._precond_ridge+1e-8;C.diagonal().add_(ridge)
-						try:L=torch.linalg.cholesky(C);state['precond_inv']=torch.cholesky_inverse(L)
-						except:state['precond_inv']=None
-					inv=state.get('precond_inv')
-					if inv is not None:g=(g.float()@inv.to(g.device)).to(torch.bfloat16)
+					# Newton-Muon diagonal: scale gradient columns by inverse column variance
+					# Diagonal approximation of right-preconditioner from arXiv:2604.01472
+					if g.ndim==2:
+						col_var=g.float().var(dim=0).clamp_min(1e-8)
+						if'precond_diag'not in state:state['precond_diag']=torch.ones_like(col_var)
+						state['precond_diag'].lerp_(col_var,1.0-self._precond_ewma)
+						inv_scale=(1.0/state['precond_diag'].sqrt()).clamp_max(10.0)
+						g=g*inv_scale.to(g.dtype).unsqueeze(0)
 					g=zeropower_via_newtonschulz5(g,steps=backend_steps);g*=max(1,g.size(0)/g.size(1))**.5;updates_flat[curr:curr+p.numel()]=g.reshape(-1)
 				curr+=p.numel()
 			if distributed:dist.all_reduce(updates_flat,op=dist.ReduceOp.SUM)
