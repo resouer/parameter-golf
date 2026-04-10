@@ -411,7 +411,7 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride,ngr
 			if f"blocks.{bi}."in name:freeze=True;break
 		if freeze:p.requires_grad_(False)
 		else:p.requires_grad_(True);ttt_params.append(p)
-	hash_params=[p for p in base_model.eval_logit_hash.parameters()];ttt_params.extend(hash_params)
+	hash_param_ids={id(p)for p in base_model.eval_logit_hash.parameters()};ttt_params=[p for p in ttt_params if id(p)not in hash_param_ids];ttt_params.extend(list(base_model.eval_logit_hash.parameters()))
 	log(f"ttt_sliding:params unfrozen={sum(p.numel()for p in ttt_params)} hash={sum(p.numel()for p in hash_params)} frozen={sum(p.numel()for p in base_model.parameters()if not p.requires_grad)}");optimizer=torch.optim.SGD(ttt_params,lr=h.ttt_lr,momentum=h.ttt_momentum);t0=time.perf_counter();batch_seqs=h.ttt_batch_seqs
 	for ci in range(num_chunks):
 		windows=chunk_windows[ci]
