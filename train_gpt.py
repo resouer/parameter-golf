@@ -403,7 +403,7 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride,ngr
 	seq_len=h.eval_seq_len;total_tokens=val_data.val_tokens.numel()-1;ttt_chunk=h.ttt_chunk_tokens;context_size=seq_len-stride;window_starts=[ws for ws in range(0,total_tokens,stride)if ws+context_size<total_tokens];num_chunks=(total_tokens+ttt_chunk-1)//ttt_chunk;chunk_windows=[[]for _ in range(num_chunks)]
 	for ws in window_starts:end=min(ws+seq_len,total_tokens);wlen=end-ws;s=0 if ws==0 else context_size;scored_start=ws+s;ci=min(scored_start//ttt_chunk,num_chunks-1);chunk_windows[ci].append(ws)
 	# Logit-space hash: learned bigram-conditional logit bias (novel mechanism)
-	hash_sz=8192;base_model.eval_logit_hash=nn.Embedding(hash_sz,h.vocab_size,dtype=torch.bfloat16).to(device);nn.init.zeros_(base_model.eval_logit_hash.weight);log(f"logit_hash:init buckets={hash_sz} vocab={h.vocab_size}")
+	hash_sz=2048;base_model.eval_logit_hash=nn.Embedding(hash_sz,h.vocab_size,dtype=torch.bfloat16).to(device);nn.init.zeros_(base_model.eval_logit_hash.weight);log(f"logit_hash:init buckets={hash_sz} vocab={h.vocab_size}")
 	log(f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} total_windows={len(window_starts)} stride={stride} ttt_lr={h.ttt_lr} ttt_epochs={h.ttt_epochs} freeze_blocks={h.ttt_freeze_blocks}");compiled_logits=torch.compile(base_model.forward_logits,dynamic=False,fullgraph=True);loss_sum=torch.zeros((),device=device,dtype=torch.float64);token_count=torch.zeros((),device=device,dtype=torch.float64);byte_count=torch.zeros((),device=device,dtype=torch.float64);frozen_block_ids=set(range(min(h.ttt_freeze_blocks,len(base_model.blocks))));ttt_params=[]
 	for(name,p)in base_model.named_parameters():
 		freeze=False
