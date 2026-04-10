@@ -173,10 +173,6 @@ class GPT(nn.Module):
 		if self.head_proj is not None:x=self.head_proj(x)
 		if self.tie_embeddings:logits_proj=F.linear(x,self.tok_emb.weight)
 		else:logits_proj=self.lm_head(x)
-		if hasattr(self,'eval_logit_hash')and self.eval_logit_hash is not None:
-			prev=torch.cat([input_ids[:,:1],input_ids[:,:-1]],dim=1)
-			hk=(prev.long()*2039+input_ids.long())%self.eval_logit_hash.num_embeddings
-			logits_proj=logits_proj+self.eval_logit_hash(hk)
 		out=self.logit_softcap*torch.tanh(logits_proj/self.logit_softcap)
 		if self.asymmetric_logit:pos_s=self.logit_pos_scale.to(out.dtype);neg_s=self.logit_neg_scale.to(out.dtype);out=torch.where(out>=0,out*pos_s,out*neg_s)
 		return out
@@ -402,8 +398,6 @@ def eval_val_sliding_etlb(h,device,val_data,base_model):
 def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride,ngram_state=None):
 	seq_len=h.eval_seq_len;total_tokens=val_data.val_tokens.numel()-1;ttt_chunk=h.ttt_chunk_tokens;context_size=seq_len-stride;window_starts=[ws for ws in range(0,total_tokens,stride)if ws+context_size<total_tokens];num_chunks=(total_tokens+ttt_chunk-1)//ttt_chunk;chunk_windows=[[]for _ in range(num_chunks)]
 	for ws in window_starts:end=min(ws+seq_len,total_tokens);wlen=end-ws;s=0 if ws==0 else context_size;scored_start=ws+s;ci=min(scored_start//ttt_chunk,num_chunks-1);chunk_windows[ci].append(ws)
-	# Logit-space hash: learned bigram-conditional logit bias (novel mechanism)
-	hash_sz=2048;base_model.eval_logit_hash=nn.Embedding(hash_sz,h.vocab_size,dtype=torch.bfloat16).to(device);nn.init.zeros_(base_model.eval_logit_hash.weight);log(f"logit_hash:init buckets={hash_sz} vocab={h.vocab_size}")
 	log(f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} total_windows={len(window_starts)} stride={stride} ttt_lr={h.ttt_lr} ttt_epochs={h.ttt_epochs} freeze_blocks={h.ttt_freeze_blocks}");compiled_logits=torch.compile(base_model.forward_logits,dynamic=False,fullgraph=True);loss_sum=torch.zeros((),device=device,dtype=torch.float64);token_count=torch.zeros((),device=device,dtype=torch.float64);byte_count=torch.zeros((),device=device,dtype=torch.float64);frozen_block_ids=set(range(min(h.ttt_freeze_blocks,len(base_model.blocks))));ttt_params=[]
 	for(name,p)in base_model.named_parameters():
 		freeze=False
@@ -411,8 +405,7 @@ def eval_val_sliding_ttt(h,base_model,rank,world_size,device,val_data,stride,ngr
 			if f"blocks.{bi}."in name:freeze=True;break
 		if freeze:p.requires_grad_(False)
 		else:p.requires_grad_(True);ttt_params.append(p)
-	hash_param_ids={id(p)for p in base_model.eval_logit_hash.parameters()};ttt_params=[p for p in ttt_params if id(p)not in hash_param_ids];ttt_params.extend(list(base_model.eval_logit_hash.parameters()))
-	log(f"ttt_sliding:params unfrozen={sum(p.numel()for p in ttt_params)} hash={sum(p.numel()for p in hash_params)} frozen={sum(p.numel()for p in base_model.parameters()if not p.requires_grad)}");optimizer=torch.optim.SGD(ttt_params,lr=h.ttt_lr,momentum=h.ttt_momentum);t0=time.perf_counter();batch_seqs=h.ttt_batch_seqs
+	log(f"ttt_sliding:params unfrozen={sum(p.numel()for p in ttt_params)} frozen={sum(p.numel()for p in base_model.parameters()if not p.requires_grad)}");optimizer=torch.optim.SGD(ttt_params,lr=h.ttt_lr,momentum=h.ttt_momentum);t0=time.perf_counter();batch_seqs=h.ttt_batch_seqs
 	for ci in range(num_chunks):
 		windows=chunk_windows[ci]
 		if not windows:continue
