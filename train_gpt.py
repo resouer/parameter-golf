@@ -76,7 +76,7 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 96))
-    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0002))
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 64))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 2048))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
@@ -91,6 +91,7 @@ class Hyperparameters:
     ttt_eval_batches = os.environ.get("TTT_EVAL_BATCHES", "")
     ttt_output_dir = os.environ.get("TTT_OUTPUT_DIR", "")
     ttt_cosine_lr = bool(int(os.environ.get("TTT_COSINE_LR", "0")))
+    ttt_entropy_gate = float(os.environ.get("TTT_ENTROPY_GATE", "2.5"))
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
     etlb_lr = float(os.environ.get("ETLB_LR", 0.05))
     etlb_steps = int(os.environ.get("ETLB_STEPS", 5))
@@ -2235,16 +2236,16 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
                 )
             if needs_train:
                 activate_chunk_mask = (num_chunks_t - 1 > ci).float()
-                # Cosine LR decay within document: early chunks get full LR
-                # for fast adaptation, later chunks get lower LR for fine-tuning.
-                # Prevents overfitting on long documents while maintaining
-                # strong initial adaptation signal.
-                if h.ttt_cosine_lr and max_nc > 1:
-                    frac = ci / (max_nc - 1)
-                    cos_scale = 0.5 * (1.0 + math.cos(math.pi * frac))
-                    cos_lr = h.ttt_lora_lr * max(cos_scale, 0.1)
-                    for pg in cur_opt.param_groups:
-                        pg["lr"] = cos_lr
+                # Entropy-gated LoRA update: skip gradient update on chunks
+                # where the model is already confident (low loss). Focus
+                # adaptation capacity on hard chunks that benefit most.
+                if h.ttt_entropy_gate > 0:
+                    with torch.no_grad():
+                        chunk_mean_loss = per_tok_loss[
+                            :, chunk_offset : chunk_offset + chunk_size
+                        ].mean(dim=-1)
+                        gate = (chunk_mean_loss > h.ttt_entropy_gate).float()
+                        activate_chunk_mask = activate_chunk_mask * gate
                 for gi in range(h.ttt_grad_steps):
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
