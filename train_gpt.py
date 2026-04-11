@@ -640,8 +640,19 @@ class Block(nn.Module):
         )
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
-    def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0):
-        mix = self.resid_mix.to(dtype=x.dtype)
+    def _pass_modulated_controls(self, x_dtype, pass_mod=None):
+        mix = self.resid_mix.to(dtype=x_dtype)
+        attn_scale = self.attn_scale.to(dtype=x_dtype)
+        mlp_scale = self.mlp_scale.to(dtype=x_dtype)
+        if pass_mod is not None:
+            attn_mul, mlp_mul, resid_mul = pass_mod
+            attn_scale = attn_scale * attn_mul.to(dtype=x_dtype)
+            mlp_scale = mlp_scale * mlp_mul.to(dtype=x_dtype)
+            mix = mix * resid_mul.to(dtype=x_dtype)[:, None]
+        return mix, attn_scale, mlp_scale
+
+    def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0, pass_mod=None):
+        mix, attn_scale, mlp_scale = self._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(
             self.attn_norm(x_in) * self.ln_scale_factor,
@@ -649,14 +660,14 @@ class Block(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
-            None, None, :
-        ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        x_out = x_in + attn_scale[None, None, :] * attn_out
+        x_out = x_out + mlp_scale[None, None, :] * self.mlp(
+            self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w
+        )
         return x_out
 
-    def forward_attn(self, x, x0, q_w, k_w, v_w, out_w, cu_seqlens=None, max_seqlen=0):
-        mix = self.resid_mix.to(dtype=x.dtype)
+    def forward_attn(self, x, x0, q_w, k_w, v_w, out_w, cu_seqlens=None, max_seqlen=0, pass_mod=None):
+        mix, attn_scale, _ = self._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(
             self.attn_norm(x_in) * self.ln_scale_factor,
@@ -664,10 +675,11 @@ class Block(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
-        return x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        return x_in + attn_scale[None, None, :] * attn_out
 
-    def forward_mlp(self, x, up_w, down_w):
-        return x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(
+    def forward_mlp(self, x, up_w, down_w, pass_mod=None):
+        _, _, mlp_scale = self._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
+        return x + mlp_scale[None, None, :] * self.mlp(
             self.mlp_norm(x) * self.ln_scale_factor, up_w, down_w
         )
 
@@ -737,6 +749,9 @@ class GPT(nn.Module):
             for i in range(max(0, h.num_layers - h.xsa_last_n), h.num_layers):
                 self.blocks[i].attn.use_xsa = True
         self.looping_active = False
+        self.num_loop_passes = h.num_loops + 1 if h.num_loops > 0 else 0
+        self.loop_start = h.loop_start
+        self.loop_end = h.loop_end
         if h.num_loops > 0:
             loop_seg = list(range(h.loop_start, h.loop_end + 1))
             all_indices = list(range(h.loop_start))
@@ -766,7 +781,33 @@ class GPT(nn.Module):
         self.lane_merge = (
             nn.Parameter(torch.tensor(0.5)) if self.parallel_start_layer > 0 else None
         )
+        if self.num_loop_passes > 0:
+            self.loop_pass_attn_mul = nn.Parameter(torch.ones(self.num_loop_passes, dtype=torch.float32))
+            self.loop_pass_mlp_mul = nn.Parameter(torch.ones(self.num_loop_passes, dtype=torch.float32))
+            self.loop_pass_resid_mul = nn.Parameter(torch.ones(self.num_loop_passes, 2, dtype=torch.float32))
+        else:
+            self.loop_pass_attn_mul = None
+            self.loop_pass_mlp_mul = None
+            self.loop_pass_resid_mul = None
         self._init_weights()
+
+    def _loop_pass_mod(self, layer_idx, loop_counts):
+        if (
+            not self.looping_active
+            or self.num_loop_passes <= 0
+            or layer_idx < self.loop_start
+            or layer_idx > self.loop_end
+        ):
+            return None
+        pass_idx = loop_counts.get(layer_idx, 0)
+        loop_counts[layer_idx] = pass_idx + 1
+        if pass_idx >= self.num_loop_passes:
+            return None
+        return (
+            self.loop_pass_attn_mul[pass_idx],
+            self.loop_pass_mlp_mul[pass_idx],
+            self.loop_pass_resid_mul[pass_idx],
+        )
 
     def _init_weights(self):
         if self.tie_embeddings:
@@ -811,6 +852,7 @@ class GPT(nn.Module):
             x = self.embed_proj(x)
         x0 = x
         skips = []
+        loop_counts = {}
         enc_iter = (
             self.encoder_indices
             if self.looping_active
@@ -826,13 +868,18 @@ class GPT(nn.Module):
         )
         for i in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            pass_mod = self._loop_pass_mod(i, loop_counts)
+            x = self.blocks[i](
+                x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, pass_mod=pass_mod,
+            )
             skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
         for skip_idx, i in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
+            pass_mod = self._loop_pass_mod(i, loop_counts)
             if lane0 is None:
                 if skip_idx < self.num_skip_weights and skips:
                     scaled_skip = (
@@ -849,10 +896,16 @@ class GPT(nn.Module):
                 if i >= psl and psl > 0:
                     lane0 = x
                     lane1 = x.clone()
-                    lane0 = self.blocks[i].forward_attn(lane0, x0, q_w, k_w, v_w, out_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-                    lane1 = self.blocks[i].forward_mlp(lane1, up_w, down_w)
+                    lane0 = self.blocks[i].forward_attn(
+                        lane0, x0, q_w, k_w, v_w, out_w,
+                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, pass_mod=pass_mod,
+                    )
+                    lane1 = self.blocks[i].forward_mlp(lane1, up_w, down_w, pass_mod=pass_mod)
                 else:
-                    x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                    x = self.blocks[i](
+                        x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, pass_mod=pass_mod,
+                    )
             else:
                 if skip_idx < self.num_skip_weights and skips:
                     scaled_skip = (
@@ -866,8 +919,11 @@ class GPT(nn.Module):
                         lane0 = torch.lerp(scaled_skip, lane0, g)
                     else:
                         lane0 = lane0 + scaled_skip
-                lane0 = self.blocks[i].forward_attn(lane0, x0, q_w, k_w, v_w, out_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-                lane1 = self.blocks[i].forward_mlp(lane1, up_w, down_w)
+                lane0 = self.blocks[i].forward_attn(
+                    lane0, x0, q_w, k_w, v_w, out_w,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, pass_mod=pass_mod,
+                )
+                lane1 = self.blocks[i].forward_mlp(lane1, up_w, down_w, pass_mod=pass_mod)
         if lane0 is not None:
             lm = self.lane_merge.to(dtype=lane0.dtype)
             x = lm * lane0 + (1.0 - lm) * lane1
@@ -897,6 +953,7 @@ class GPT(nn.Module):
             x = self.embed_proj(x)
         x0 = x
         skips = []
+        loop_counts = {}
         enc_iter = (
             self.encoder_indices
             if self.looping_active
@@ -915,7 +972,10 @@ class GPT(nn.Module):
         slot = 0
         for i in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
+            pass_mod = self._loop_pass_mod(i, loop_counts)
+            x = self._block_with_lora(
+                self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=pass_mod
+            )
             slot += 1
             skips.append(x)
         psl = self.parallel_start_layer
@@ -923,6 +983,7 @@ class GPT(nn.Module):
         lane1 = None
         for skip_idx, i in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
+            pass_mod = self._loop_pass_mod(i, loop_counts)
             if lane0 is None:
                 if skip_idx < self.num_skip_weights and skips:
                     scaled_skip = (
@@ -939,10 +1000,16 @@ class GPT(nn.Module):
                 if i >= psl and psl > 0:
                     lane0 = x
                     lane1 = x.clone()
-                    lane0 = self._block_with_lora_attn(self.blocks[i], lane0, x0, lora, slot, q_w, k_w, v_w, out_w)
-                    lane1 = self._block_with_lora_mlp(self.blocks[i], lane1, lora, slot, up_w, down_w)
+                    lane0 = self._block_with_lora_attn(
+                        self.blocks[i], lane0, x0, lora, slot, q_w, k_w, v_w, out_w, pass_mod=pass_mod
+                    )
+                    lane1 = self._block_with_lora_mlp(
+                        self.blocks[i], lane1, lora, slot, up_w, down_w, pass_mod=pass_mod
+                    )
                 else:
-                    x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
+                    x = self._block_with_lora(
+                        self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=pass_mod
+                    )
             else:
                 if skip_idx < self.num_skip_weights and skips:
                     scaled_skip = (
@@ -956,8 +1023,12 @@ class GPT(nn.Module):
                         lane0 = torch.lerp(scaled_skip, lane0, g)
                     else:
                         lane0 = lane0 + scaled_skip
-                lane0 = self._block_with_lora_attn(self.blocks[i], lane0, x0, lora, slot, q_w, k_w, v_w, out_w)
-                lane1 = self._block_with_lora_mlp(self.blocks[i], lane1, lora, slot, up_w, down_w)
+                lane0 = self._block_with_lora_attn(
+                    self.blocks[i], lane0, x0, lora, slot, q_w, k_w, v_w, out_w, pass_mod=pass_mod
+                )
+                lane1 = self._block_with_lora_mlp(
+                    self.blocks[i], lane1, lora, slot, up_w, down_w, pass_mod=pass_mod
+                )
             slot += 1
         if lane0 is not None:
             lm = self.lane_merge.to(dtype=lane0.dtype)
@@ -976,8 +1047,8 @@ class GPT(nn.Module):
             logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
         ).reshape(bsz, sl)
 
-    def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
-        mix = block.resid_mix.to(dtype=x.dtype)
+    def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=None):
+        mix, attn_scale, mlp_scale = block._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
@@ -1005,16 +1076,16 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
-        x_out = x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_in + attn_scale[None, None, :] * attn_out
         mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        x_out = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
+        x_out = x_out + mlp_scale[None, None, :] * mlp_out
         return x_out
 
-    def _block_with_lora_attn(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w):
-        mix = block.resid_mix.to(dtype=x.dtype)
+    def _block_with_lora_attn(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, pass_mod=None):
+        mix, attn_scale, _ = block._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
@@ -1042,14 +1113,15 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
-        return x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        return x_in + attn_scale[None, None, :] * attn_out
 
-    def _block_with_lora_mlp(self, block, x, lora, slot, up_w, down_w):
+    def _block_with_lora_mlp(self, block, x, lora, slot, up_w, down_w, pass_mod=None):
         mlp_n = block.mlp_norm(x) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        return x + block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        _, _, mlp_scale = block._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
+        return x + mlp_scale[None, None, :] * mlp_out
 
 
 class BatchedLinearLoRA(nn.Module):
@@ -1297,7 +1369,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,lane_merge",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,lane_merge,loop_pass_attn_mul,loop_pass_mlp_mul,loop_pass_resid_mul",
     ).split(",")
     if pattern
 )
