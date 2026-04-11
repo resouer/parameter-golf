@@ -737,6 +737,8 @@ class GPT(nn.Module):
             for i in range(max(0, h.num_layers - h.xsa_last_n), h.num_layers):
                 self.blocks[i].attn.use_xsa = True
         self.looping_active = False
+        self.num_loop_passes = h.num_loops + 1 if h.num_loops > 0 else 0
+        self.loop_start = h.loop_start
         if h.num_loops > 0:
             loop_seg = list(range(h.loop_start, h.loop_end + 1))
             all_indices = list(range(h.loop_start))
@@ -766,7 +768,25 @@ class GPT(nn.Module):
         self.lane_merge = (
             nn.Parameter(torch.tensor(0.5)) if self.parallel_start_layer > 0 else None
         )
+        if self.num_loop_passes > 0:
+            self.loop_embed = nn.Embedding(self.num_loop_passes, h.model_dim)
+            nn.init.zeros_(self.loop_embed.weight)
+        else:
+            self.loop_embed = None
         self._init_weights()
+
+    def _loop_pass_embedding(self, layer_idx, loop_counts, x):
+        if (
+            not self.looping_active
+            or self.loop_embed is None
+            or layer_idx != self.loop_start
+        ):
+            return x
+        pass_idx = loop_counts.get(layer_idx, 0)
+        loop_counts[layer_idx] = pass_idx + 1
+        if pass_idx >= self.num_loop_passes:
+            return x
+        return x + self.loop_embed.weight[pass_idx].to(dtype=x.dtype)[None, None, :]
 
     def _init_weights(self):
         if self.tie_embeddings:
@@ -811,6 +831,7 @@ class GPT(nn.Module):
             x = self.embed_proj(x)
         x0 = x
         skips = []
+        loop_counts = {}
         enc_iter = (
             self.encoder_indices
             if self.looping_active
@@ -825,6 +846,7 @@ class GPT(nn.Module):
             )
         )
         for i in enc_iter:
+            x = self._loop_pass_embedding(i, loop_counts, x)
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             skips.append(x)
@@ -832,6 +854,7 @@ class GPT(nn.Module):
         lane0 = None
         lane1 = None
         for skip_idx, i in enumerate(dec_iter):
+            x = self._loop_pass_embedding(i, loop_counts, x)
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if lane0 is None:
                 if skip_idx < self.num_skip_weights and skips:
@@ -897,6 +920,7 @@ class GPT(nn.Module):
             x = self.embed_proj(x)
         x0 = x
         skips = []
+        loop_counts = {}
         enc_iter = (
             self.encoder_indices
             if self.looping_active
@@ -914,6 +938,7 @@ class GPT(nn.Module):
         )
         slot = 0
         for i in enc_iter:
+            x = self._loop_pass_embedding(i, loop_counts, x)
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
             slot += 1
@@ -922,6 +947,7 @@ class GPT(nn.Module):
         lane0 = None
         lane1 = None
         for skip_idx, i in enumerate(dec_iter):
+            x = self._loop_pass_embedding(i, loop_counts, x)
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if lane0 is None:
                 if skip_idx < self.num_skip_weights and skips:
