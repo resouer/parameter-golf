@@ -1,21 +1,23 @@
 # Record: Varlen attention + fused MLP + TTT
 
-**val_loss: 2.7806 | val_bpb: 1.07643** | **~15.99 MB** | 8×H100 SXM, 600s train + ~360s TTT eval
-| Seed | SW Loss | SW BPB | TTT Loss | TTT BPB |
-|------|---------|--------|----------|---------|
-| 0 | 2.78822313 | 1.07940806 | 2.78138792 | 1.07676194 |
-| 1 | 2.78698310 | 1.07892801 | 2.78033428 | 1.07635404 |
-| 2 | 2.78652675 | 1.07875134 | 2.77993034 | 1.07619767 |
-| **Mean** | **2.78724** | **1.07903** | **2.78055** | **1.07644** |
+**val_loss: 2.77261 | val_bpb: 1.07336** | **~15.99 MB** | 8×H100 SXM, 587s train + ~340s TTT eval
+| Seed | BPB | Loss |
+|------|-----|------|
+| 0 | 1.07258208 | 2.77059090 |
+| 1 | 1.07324696 | 2.77230836 |
+| 2 | 1.07426259 | 2.77493185 |
+| **Mean** | **1.07336388** | **2.77261037** |
+| **Std** | **0.00084633** | **0.00218618** |
 
-Best PR bpb ([PR #1523](https://github.com/openai/parameter-golf/pull/1523)): 1.0778. **delta=.0014**
-Merged record bpb ([PR #1493](https://github.com/openai/parameter-golf/pull/1493)): 1.0810. **delta=.0047**
+Best PR bpb ([PR #1529](https://github.com/openai/parameter-golf/pull/1529)): bpb=1.0753 (**delta=0.0019**), loss=2.7776 (**delta=0.0050**)
 
-Increased training speed ~5% via variable length attention, a fused kernel, and grouping together small parameters, yielding ~.002 nats when comparing sliding window eval. Re-added document-based LoRA TTT which has *no inter-sequence dependence* and beats previous record by ~.003 nats.
+Merged record bpb ([PR #1493](https://github.com/openai/parameter-golf/pull/1493)): bpb=1.0810 (**delta=0.0076**), loss=2.7923 (**delta=0.0197**)
+
+Increased training speed ~5% via variable length attention, a fused MLP triton kernel (no `cutlass_evt_fusion` dep), and grouping together small parameters, yielding ~.002 nats when comparing sliding window eval. Re-added document-based LoRA TTT which has *no inter-sequence dependence* and improves over strided evaluation by ~.008 nats.
 
 ## Main changes
 
-Applied changes from [my old PR](https://github.com/openai/parameter-golf/pull/1354) to a recent record PR: [Record: SP8192 + Triple Recurrence + Banking + Fused MLP + Muon 0.97 — val_bpb 1.0778 (3-seed mean) #1523](https://github.com/openai/parameter-golf/pull/1523). Most of below is copied from my previous PR.
+Applied changes from [my old PR](https://github.com/openai/parameter-golf/pull/1354) to a recent record PR: [#1523](https://github.com/openai/parameter-golf/pull/1523). But [PR #1552](https://github.com/openai/parameter-golf/pull/1552) beat my previous bpb before I submitted the PR, so I incorporated their (orthogonal) improvements. Most of below is copied from my previous PR [#1354](https://github.com/openai/parameter-golf/pull/1354).
 
 This involves 3 things:
 
@@ -37,14 +39,17 @@ A custom Triton kernel (`linear_leaky_relu_square_kernel`) fuses the up-projecti
 
 Although it is technically legal in this competition to train on tokens from previous documents in the dataset, I am spiritually opposed to this. Under the current formulation, if the eval set was bigger, the expectation of the loss would be lower which seems broken. So in this implementation, there is score-first TTT applied to each sequence in the validation set *independently* (and efficiently using batched LoRAs), which is strictly harder.
 
-Re-adds LoRA-based TTT, based on [my old implementation](https://github.com/openai/parameter-golf/blob/main/records/track_10min_16mb/2026-03-17_LoRA_TTT/README.md), but > 2x faster which allows for using smaller chunk sizes which leads to better performance. This is an instance of "Case 3" according to [this classification](https://samacquaviva.com/projects/ttt-clarification/). The TTT gain is only ~.003 nats over sliding window evaluation, as compared to ~.007 in [my previous PR](https://github.com/openai/parameter-golf/pull/1354) and ~.006 in the most recent record which trains on the entire validation sequence. This gap is probably closeable with better hparams, I largely just took my hparams optimized for the non-looped transformer.
+Re-adds LoRA-based TTT, based on [my old implementation](https://github.com/openai/parameter-golf/blob/main/records/track_10min_16mb/2026-03-17_LoRA_TTT/README.md), but > 2x faster which allows for using smaller chunk sizes which leads to better performance. This is an instance of "Case 3" according to [this classification](https://samacquaviva.com/projects/ttt-clarification/).
 
 It's interesting to note that adding test-time training improves loss more than adding ~215 steps. These 215 steps train on `786432*215=169,082,880` tokens to gain ~.002 nats. The average sequence length in the validation set is ~200 tokens which means test-time training here gains ~.003 nats / 800 tokens on average (valid bc sequences are trained independently). So, in a way, TTT is `~(.003/800) / (.002/169082880) >= 300k` times more token efficient than pre-training: it helps to be in distribution :)
 
 ## Other small changes
 
-- Added some useful dev things, like loading from a checkpoint just for eval
-- Didn't submit minified code, instead wrote that utility into the script so that it is easier for people to build off of this
+Made some changes to make replication and dev based on this PR easier:
+
+- Load from a checkpoint just for eval
+- Didn't submit minified code, instead wrote that utility into the script when calculating file size so that it is easier for people to build off of this
+- Store unminified code in logs
 
 ## Replicating runs + dev
 

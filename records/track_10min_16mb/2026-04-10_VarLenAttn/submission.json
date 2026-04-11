@@ -2,21 +2,21 @@
     "author": "samacqua",
     "github_id": "samacqua",
     "name": "Varlen Attention + Fused MLP + doc-independent TTT",
-    "date": "2026-04-10",
+    "date": "2026-04-11",
     "track": "10min_16mb",
-    "val_loss": 2.7806,
-    "val_bpb": 1.07643,
-    "val_bpb_std": 0.000291,
+    "val_loss": 2.77261037,
+    "val_bpb": 1.07336388,
+    "val_bpb_std": 0.00084633,
     "seeds": [0, 1, 2],
     "seed_results": {
       "0": {
-        "val_bpb": 1.07676194, "artifact_bytes": 15992240
+        "val_bpb": 1.07258208, "artifact_bytes": 15996664
       },
       "1": {
-        "val_bpb": 1.07635404, "artifact_bytes": 15989679
+        "val_bpb": 1.07324696, "artifact_bytes": 15993874
       },
       "2": {
-        "val_bpb": 1.07619767, "artifact_bytes": 15994549
+        "val_bpb": 1.07426259, "artifact_bytes": 15984798
       }
     },
     "compliance": {

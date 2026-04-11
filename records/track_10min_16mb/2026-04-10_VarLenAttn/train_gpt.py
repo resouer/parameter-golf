@@ -17,7 +17,7 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.667))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.72))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -48,7 +48,8 @@ class Hyperparameters:
     loop_start = int(os.environ.get("LOOP_START", 3))
     loop_end = int(os.environ.get("LOOP_END", 5))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
-    parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 7))
+    parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 8))
+    parallel_final_lane = os.environ.get("PARALLEL_FINAL_LANE", "mean")
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -71,12 +72,12 @@ class Hyperparameters:
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     adam_wd = float(os.environ.get("ADAM_WD", 0.02))
     muon_wd = float(os.environ.get("MUON_WD", 0.095))
-    embed_wd = float(os.environ.get("EMBED_WD", 0.095))
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+    embed_wd = float(os.environ.get("EMBED_WD", 0.085))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 96))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
-    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 64))
+    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 32))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 2048))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
     ttt_grad_steps = int(os.environ.get("TTT_GRAD_STEPS", 1))
@@ -90,12 +91,9 @@ class Hyperparameters:
     ttt_eval_batches = os.environ.get("TTT_EVAL_BATCHES", "")
     ttt_output_dir = os.environ.get("TTT_OUTPUT_DIR", "")
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
-    etlb_lr = float(os.environ.get("ETLB_LR", 0.05))
-    etlb_steps = int(os.environ.get("ETLB_STEPS", 5))
-    etlb_clip = float(os.environ.get("ETLB_CLIP", 3.0))
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
-    gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 12.0))
+    gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 13.0))
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
     embed_bits = int(os.environ.get("EMBED_BITS", 8))
     matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))
@@ -729,23 +727,6 @@ class Block(nn.Module):
         ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         return x_out
 
-    def forward_attn(self, x, x0, q_w, k_w, v_w, out_w, cu_seqlens=None, max_seqlen=0):
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(
-            self.attn_norm(x_in) * self.ln_scale_factor,
-            q_w, k_w, v_w, out_w,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
-        return x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-
-    def forward_mlp(self, x, up_w, down_w):
-        return x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(
-            self.mlp_norm(x) * self.ln_scale_factor, up_w, down_w
-        )
-
-
 class GPT(nn.Module):
     def __init__(self, h):
         super().__init__()
@@ -837,8 +818,12 @@ class GPT(nn.Module):
             else None
         )
         self.parallel_start_layer = h.parallel_start_layer
-        self.lane_merge = (
-            nn.Parameter(torch.tensor(0.5)) if self.parallel_start_layer > 0 else None
+        self.parallel_final_lane = h.parallel_final_lane.lower()
+        self.parallel_post_lambdas = nn.Parameter(
+            torch.ones(h.num_layers, 2, 2, dtype=torch.float32)
+        )
+        self.parallel_resid_lambdas = nn.Parameter(
+            torch.full((h.num_layers, 2), 1.1, dtype=torch.float32)
         )
         self._init_weights()
 
@@ -878,6 +863,39 @@ class GPT(nn.Module):
             self.mlp_down_bank[i],
         )
 
+    def _parallel_block(
+        self, block_idx, lane0, lane1, x0,
+        q_w, k_w, v_w, out_w, up_w, down_w,
+        cu_seqlens=None, max_seqlen=0,
+    ):
+        block = self.blocks[block_idx]
+        mix = block.resid_mix.to(dtype=lane0.dtype)
+        attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
+        attn_out = block.attn(
+            block.attn_norm(attn_read) * block.ln_scale_factor,
+            q_w, k_w, v_w, out_w,
+            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+        )
+        attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
+        mlp_read = lane1
+        mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(
+            block.mlp_norm(mlp_read) * block.ln_scale_factor, up_w, down_w
+        )
+        attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
+        attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
+        mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        lane0 = attn_resid * lane0 + attn_post[0] * attn_out + mlp_post[0] * mlp_out
+        lane1 = mlp_resid * lane1 + attn_post[1] * attn_out + mlp_post[1] * mlp_out
+        return lane0, lane1
+
+    def _final_parallel_hidden(self, lane0, lane1):
+        if self.parallel_final_lane == "mlp":
+            return lane1
+        if self.parallel_final_lane == "attn":
+            return lane0
+        return 0.5 * (lane0 + lane1)
+
     def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -907,44 +925,36 @@ class GPT(nn.Module):
         lane1 = None
         for skip_idx, i in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            if lane0 is None:
+            if i >= psl and psl > 0:
+                if lane0 is None:
+                    lane0 = x
+                    lane1 = x
+                if skip_idx < self.num_skip_weights and skips:
+                    skip = skips.pop()
+                    w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
+                    if self.skip_gates is not None:
+                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, :]
+                        lane0 = torch.lerp(w * skip, lane0, g)
+                    else:
+                        lane0 = lane0 + w * skip
+                lane0, lane1 = self._parallel_block(
+                    i, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                )
+            else:
                 if skip_idx < self.num_skip_weights and skips:
                     scaled_skip = (
                         self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
                         * skips.pop()
                     )
                     if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[
-                            None, None, :
-                        ]
+                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
-                if i >= psl and psl > 0:
-                    lane0 = x
-                    lane1 = x.clone()
-                    lane0 = self.blocks[i].forward_attn(lane0, x0, q_w, k_w, v_w, out_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-                    lane1 = self.blocks[i].forward_mlp(lane1, up_w, down_w)
-                else:
-                    x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-            else:
-                if skip_idx < self.num_skip_weights and skips:
-                    scaled_skip = (
-                        self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
-                        * skips.pop()
-                    )
-                    if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[
-                            None, None, :
-                        ]
-                        lane0 = torch.lerp(scaled_skip, lane0, g)
-                    else:
-                        lane0 = lane0 + scaled_skip
-                lane0 = self.blocks[i].forward_attn(lane0, x0, q_w, k_w, v_w, out_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-                lane1 = self.blocks[i].forward_mlp(lane1, up_w, down_w)
+                x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         if lane0 is not None:
-            lm = self.lane_merge.to(dtype=lane0.dtype)
-            x = lm * lane0 + (1.0 - lm) * lane1
+            x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
@@ -997,45 +1007,37 @@ class GPT(nn.Module):
         lane1 = None
         for skip_idx, i in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            if lane0 is None:
+            if i >= psl and psl > 0:
+                if lane0 is None:
+                    lane0 = x
+                    lane1 = x
+                if skip_idx < self.num_skip_weights and skips:
+                    skip = skips.pop()
+                    w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
+                    if self.skip_gates is not None:
+                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, :]
+                        lane0 = torch.lerp(w * skip, lane0, g)
+                    else:
+                        lane0 = lane0 + w * skip
+                lane0, lane1 = self._parallel_block_with_lora(
+                    i, lane0, lane1, x0, lora, slot,
+                    q_w, k_w, v_w, out_w, up_w, down_w,
+                )
+            else:
                 if skip_idx < self.num_skip_weights and skips:
                     scaled_skip = (
                         self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
                         * skips.pop()
                     )
                     if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[
-                            None, None, :
-                        ]
+                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
-                if i >= psl and psl > 0:
-                    lane0 = x
-                    lane1 = x.clone()
-                    lane0 = self._block_with_lora_attn(self.blocks[i], lane0, x0, lora, slot, q_w, k_w, v_w, out_w)
-                    lane1 = self._block_with_lora_mlp(self.blocks[i], lane1, lora, slot, up_w, down_w)
-                else:
-                    x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
-            else:
-                if skip_idx < self.num_skip_weights and skips:
-                    scaled_skip = (
-                        self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
-                        * skips.pop()
-                    )
-                    if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[
-                            None, None, :
-                        ]
-                        lane0 = torch.lerp(scaled_skip, lane0, g)
-                    else:
-                        lane0 = lane0 + scaled_skip
-                lane0 = self._block_with_lora_attn(self.blocks[i], lane0, x0, lora, slot, q_w, k_w, v_w, out_w)
-                lane1 = self._block_with_lora_mlp(self.blocks[i], lane1, lora, slot, up_w, down_w)
+                x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
             slot += 1
         if lane0 is not None:
-            lm = self.lane_merge.to(dtype=lane0.dtype)
-            x = lm * lane0 + (1.0 - lm) * lane1
+            x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
@@ -1087,10 +1089,14 @@ class GPT(nn.Module):
         x_out = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
         return x_out
 
-    def _block_with_lora_attn(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w):
-        mix = block.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        n = block.attn_norm(x_in) * block.ln_scale_factor
+    def _parallel_block_with_lora(
+        self, block_idx, lane0, lane1, x0, lora, slot,
+        q_w, k_w, v_w, out_w, up_w, down_w,
+    ):
+        block = self.blocks[block_idx]
+        mix = block.resid_mix.to(dtype=lane0.dtype)
+        attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
+        n = block.attn_norm(attn_read) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
         q = (F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)).reshape(
@@ -1116,14 +1122,20 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
-        return x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-
-    def _block_with_lora_mlp(self, block, x, lora, slot, up_w, down_w):
-        mlp_n = block.mlp_norm(x) * block.ln_scale_factor
+        attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
+        mlp_read = lane1
+        mlp_n = block.mlp_norm(mlp_read) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        return x + block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_out
+        attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
+        attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
+        mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        lane0 = attn_resid * lane0 + attn_post[0] * attn_out + mlp_post[0] * mlp_out
+        lane1 = mlp_resid * lane1 + attn_post[1] * attn_out + mlp_post[1] * mlp_out
+        return lane0, lane1
 
 
 class BatchedLinearLoRA(nn.Module):
@@ -1371,7 +1383,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,lane_merge",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas",
     ).split(",")
     if pattern
 )
@@ -1399,8 +1411,10 @@ class Optimizers:
             scalar_params.append(base_model.skip_weights)
         if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
             scalar_params.append(base_model.skip_gates)
-        if base_model.lane_merge is not None:
-            scalar_params.append(base_model.lane_merge)
+        if base_model.parallel_post_lambdas is not None:
+            scalar_params.append(base_model.parallel_post_lambdas)
+        if base_model.parallel_resid_lambdas is not None:
+            scalar_params.append(base_model.parallel_resid_lambdas)
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [
             {"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}
@@ -2197,7 +2211,6 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
     byte_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     t_start = time.perf_counter()
-    local_batch_count = 0
     reusable_lora = BatchedTTTLoRA(
         h.ttt_batch_size, base_model, h.ttt_lora_rank,
         k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
@@ -2317,7 +2330,6 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
                     cur_opt.step()
             else:
                 del per_tok_loss
-        local_batch_count += 1
         batch_num = orig_batch_idx + 1
         doc_lens = [dl for _, dl in batch]
         should_report = False
@@ -2624,12 +2636,9 @@ def train_and_eval(h, device):
             h, device, val_data
         )
     _skip_training = bool(h.eval_only_path)
-    log("\nbeginning eval timer")
-    t_all_eval = time.perf_counter()
-
     torch._dynamo.reset()
     timed_eval(
-        "pre-quantization post-ema",
+        "diagnostic pre-quantization post-ema",
         eval_val,
         h,
         device,
@@ -2654,7 +2663,7 @@ def train_and_eval(h, device):
         eval_model.forward_logits, dynamic=False, fullgraph=True
     )
     timed_eval(
-        "quantized",
+        "diagnostic quantized",
         eval_val,
         h,
         device,
@@ -2664,7 +2673,7 @@ def train_and_eval(h, device):
     )
     if h.sliding_window_enabled:
         timed_eval(
-            "quantized_sliding_window",
+            "diagnostic quantized_sliding_window",
             eval_val_sliding,
             h,
             device,
@@ -2672,7 +2681,6 @@ def train_and_eval(h, device):
             eval_model,
             forward_logits_fn=compiled_forward_logits,
         )
-    ttt_compile_time = 0.0
     if h.ttt_enabled:
         del eval_model, compiled_model
         torch._dynamo.reset()
@@ -2694,8 +2702,16 @@ def train_and_eval(h, device):
                 block.attn.rotary._seq_len_cached = 0
                 block.attn.rotary(h.ttt_eval_seq_len, device, torch.bfloat16)
 
-        def _fwd_ttt(input_ids, target_ids, lora):
+        def _fwd_ttt_inner(input_ids, target_ids, lora):
             return ttt_model.forward_ttt(input_ids, target_ids, lora=lora)
+
+        _fwd_ttt_compiled_inner = None
+
+        def _fwd_ttt(input_ids, target_ids, lora):
+            nonlocal _fwd_ttt_compiled_inner
+            if _fwd_ttt_compiled_inner is None:
+                _fwd_ttt_compiled_inner = torch.compile(_fwd_ttt_inner, dynamic=True)
+            return _fwd_ttt_compiled_inner(input_ids, target_ids, lora=lora)
 
         _ttt_debug_bypass = bool(os.environ.get("TTT_DEBUG_BYPASS"))
         if _ttt_debug_bypass:
@@ -2709,9 +2725,8 @@ def train_and_eval(h, device):
                 ).reshape(bsz, sl)
             fwd_ttt_compiled = _fwd_ttt_bypass
             log("ttt_lora:DEBUG BYPASS active - using forward_logits directly (no compile warmup)")
-            ttt_compile_time = 0.0
         else:
-            fwd_ttt_compiled = torch.compile(_fwd_ttt, dynamic=True)
+            fwd_ttt_compiled = _fwd_ttt
             log(f"ttt_lora:warming up compile")
             global BOS_ID
             if BOS_ID is None:
@@ -2747,22 +2762,21 @@ def train_and_eval(h, device):
                 del wl, wo
             del val_tokens_idx
             torch.cuda.empty_cache()
-            ttt_compile_time = time.perf_counter() - t_warmup
-            log(f"ttt_lora:compile warmup done ({ttt_compile_time:.1f}s)")
+            compile_elapsed = time.perf_counter() - t_warmup
+            log(f"ttt_lora:compile warmup done ({compile_elapsed:.1f}s)")
+        log("\nbeginning TTT eval timer")
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         ttt_val_loss, ttt_val_bpb = eval_val_ttt_lora(
             h, ttt_model, device, val_data, forward_ttt_train=fwd_ttt_compiled
         )
         torch.cuda.synchronize()
+        ttt_eval_elapsed = time.perf_counter() - t_ttt
         log(
-            f"quantized_ttt_lora val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f} eval_time:{1e3*(time.perf_counter()-t_ttt):.0f}ms"
+            f"quantized_ttt_lora val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f} eval_time:{1e3*ttt_eval_elapsed:.0f}ms"
         )
+        log(f"total_eval_time:{ttt_eval_elapsed:.1f}s")
         del ttt_model
-
-    total_eval = time.perf_counter() - t_all_eval
-    log(f"total_eval_time:{total_eval - ttt_compile_time:.1f}s")
-    log(f"total_eval_time_with_compile:{total_eval:.1f}s")
 
 
 def main():
@@ -2807,6 +2821,11 @@ def main():
         for (k, v) in sorted(vars(type(h)).items()):
             if not k.startswith("_"):
                 log(f"  {k}: {v}", console=True)
+        log("=" * 100, console=False)
+        log("Source code:", console=False)
+        log("=" * 100, console=False)
+        with open(__file__, "r", encoding="utf-8") as _src:
+            log(_src.read(), console=False)
         log("=" * 100, console=False)
         log(f"Running Python {sys.version}", console=False)
         log(f"Running PyTorch {torch.__version__}", console=False)
