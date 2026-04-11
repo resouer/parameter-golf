@@ -1353,6 +1353,22 @@ class Optimizers:
             scalar_params.append(base_model.skip_gates)
         if base_model.lane_merge is not None:
             scalar_params.append(base_model.lane_merge)
+        for extra_name in (
+            "loop_pass_attn_mul",
+            "loop_pass_mlp_mul",
+            "loop_pass_resid_mul",
+            "loop_pass_attn_vec",
+            "loop_pass_mlp_vec",
+            "loop_pass_resid_vec",
+            "loop_embed",
+        ):
+            extra = getattr(base_model, extra_name, None)
+            if extra is None:
+                continue
+            if hasattr(extra, "weight"):
+                extra = extra.weight
+            if extra.numel() > 0:
+                scalar_params.append(extra)
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [
             {"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}
