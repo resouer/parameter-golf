@@ -645,10 +645,7 @@ class Block(nn.Module):
         attn_scale = self.attn_scale.to(dtype=x_dtype)
         mlp_scale = self.mlp_scale.to(dtype=x_dtype)
         if pass_mod is not None:
-            attn_mul, mlp_mul, resid_mul = pass_mod
-            attn_scale = attn_scale * attn_mul.to(dtype=x_dtype)
-            mlp_scale = mlp_scale * mlp_mul.to(dtype=x_dtype)
-            mix = mix * resid_mul.to(dtype=x_dtype)
+            attn_scale = attn_scale * pass_mod.to(dtype=x_dtype)
         return mix, attn_scale, mlp_scale
 
     def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0, pass_mod=None):
@@ -783,12 +780,8 @@ class GPT(nn.Module):
         )
         if self.num_loop_passes > 0:
             self.loop_pass_attn_vec = nn.Parameter(torch.ones(self.num_loop_passes, h.model_dim, dtype=torch.float32))
-            self.loop_pass_mlp_vec = nn.Parameter(torch.ones(self.num_loop_passes, h.model_dim, dtype=torch.float32))
-            self.loop_pass_resid_vec = nn.Parameter(torch.ones(self.num_loop_passes, 2, h.model_dim, dtype=torch.float32))
         else:
             self.loop_pass_attn_vec = None
-            self.loop_pass_mlp_vec = None
-            self.loop_pass_resid_vec = None
         self._init_weights()
 
     def _loop_pass_mod(self, layer_idx, loop_counts):
@@ -803,11 +796,7 @@ class GPT(nn.Module):
         loop_counts[layer_idx] = pass_idx + 1
         if pass_idx >= self.num_loop_passes:
             return None
-        return (
-            self.loop_pass_attn_vec[pass_idx],
-            self.loop_pass_mlp_vec[pass_idx],
-            self.loop_pass_resid_vec[pass_idx],
-        )
+        return self.loop_pass_attn_vec[pass_idx]
 
     def _init_weights(self):
         if self.tie_embeddings:
@@ -1369,7 +1358,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,lane_merge,loop_pass_attn_vec,loop_pass_mlp_vec,loop_pass_resid_vec",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,lane_merge,loop_pass_attn_vec",
     ).split(",")
     if pattern
 )
@@ -1404,8 +1393,6 @@ class Optimizers:
             "loop_pass_mlp_mul",
             "loop_pass_resid_mul",
             "loop_pass_attn_vec",
-            "loop_pass_mlp_vec",
-            "loop_pass_resid_vec",
             "loop_embed",
         ):
             extra = getattr(base_model, extra_name, None)
