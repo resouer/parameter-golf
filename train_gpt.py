@@ -91,6 +91,10 @@ class Hyperparameters:
     ttt_eval_batches = os.environ.get("TTT_EVAL_BATCHES", "")
     ttt_output_dir = os.environ.get("TTT_OUTPUT_DIR", "")
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
+    eval_hash_enabled = bool(int(os.environ.get("EVAL_HASH_ENABLED", "1")))
+    eval_hash_buckets = int(os.environ.get("EVAL_HASH_BUCKETS", 16384))
+    eval_hash_multiplier = int(os.environ.get("EVAL_HASH_MULTIPLIER", 2039))
+    eval_hash_lr_mult = float(os.environ.get("EVAL_HASH_LR_MULT", 10.0))
     etlb_lr = float(os.environ.get("ETLB_LR", 0.05))
     etlb_steps = int(os.environ.get("ETLB_STEPS", 5))
     etlb_clip = float(os.environ.get("ETLB_CLIP", 3.0))
@@ -689,6 +693,7 @@ class GPT(nn.Module):
         self.tie_embeddings = h.tie_embeddings
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
+        self.eval_hash_multiplier = h.eval_hash_multiplier
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
         if h.embedding_dim != h.model_dim:
             self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
@@ -735,6 +740,7 @@ class GPT(nn.Module):
                     yarn=h.rope_yarn,
                 )
         self.final_norm = RMSNorm()
+        self.eval_hash_emb = None
         self.lm_head = (
             None
             if h.tie_embeddings
@@ -838,6 +844,10 @@ class GPT(nn.Module):
 
     def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
         x = self.tok_emb(input_ids)
+        if self.eval_hash_emb is not None:
+            prev = torch.cat([input_ids[:, :1], input_ids[:, :-1]], dim=1)
+            hash_ids = (prev.long() * self.eval_hash_multiplier + input_ids.long()) % self.eval_hash_emb.num_embeddings
+            x = x + self.eval_hash_emb(hash_ids).to(dtype=x.dtype)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
             x = self.embed_proj(x)
@@ -939,6 +949,10 @@ class GPT(nn.Module):
 
     def forward_ttt(self, input_ids, target_ids, lora):
         x = self.tok_emb(input_ids)
+        if self.eval_hash_emb is not None:
+            prev = torch.cat([input_ids[:, :1], input_ids[:, :-1]], dim=1)
+            hash_ids = (prev.long() * self.eval_hash_multiplier + input_ids.long()) % self.eval_hash_emb.num_embeddings
+            x = x + self.eval_hash_emb(hash_ids).to(dtype=x.dtype)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
             x = self.embed_proj(x)
@@ -1187,7 +1201,7 @@ class BatchedTTTLoRA(nn.Module):
 
 
 def classify_param(name):
-    if "tok_emb" in name or "lm_head" in name:
+    if "tok_emb" in name or "lm_head" in name or "eval_hash_emb" in name:
         return "embed"
     if ".mlp." in name:
         return "mlp"
@@ -1898,6 +1912,17 @@ def deserialize(h, device):
     return eval_model
 
 
+def _maybe_attach_eval_hash_embedding(h, model, device):
+    if not h.eval_hash_enabled or model.eval_hash_emb is not None:
+        return
+    model.eval_hash_emb = nn.Embedding(h.eval_hash_buckets, h.embedding_dim).to(device=device)
+    nn.init.zeros_(model.eval_hash_emb.weight)
+    log(
+        f"eval_hash:enabled buckets={h.eval_hash_buckets} "
+        f"multiplier={h.eval_hash_multiplier} lr_mult={h.eval_hash_lr_mult}"
+    )
+
+
 def _loss_bpb(loss_sum, token_count, byte_count):
     val_loss = (loss_sum / token_count).item()
     val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
@@ -2205,15 +2230,23 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
         h.ttt_batch_size, base_model, h.ttt_lora_rank,
         k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
     ).to(device)
+    hash_params = []
+    if h.eval_hash_enabled and getattr(base_model, "eval_hash_emb", None) is not None:
+        hash_params = [base_model.eval_hash_emb.weight]
 
     def _build_opt(lora):
+        groups = [{"params": list(lora.parameters()), "lr": h.ttt_lora_lr}]
+        if hash_params:
+            groups.append(
+                {"params": hash_params, "lr": h.ttt_lora_lr * h.eval_hash_lr_mult}
+            )
         if h.ttt_optimizer == "sgd":
             return torch.optim.SGD(
-                lora.parameters(), lr=h.ttt_lora_lr,
+                groups,
                 momentum=h.ttt_beta1, weight_decay=h.ttt_weight_decay,
             )
         return torch.optim.AdamW(
-            lora.parameters(), lr=h.ttt_lora_lr,
+            groups,
             betas=(h.ttt_beta1, h.ttt_beta2),
             eps=1e-10, weight_decay=h.ttt_weight_decay, fused=True,
         )
@@ -2653,6 +2686,7 @@ def train_and_eval(h, device):
     if h.distributed:
         dist.barrier()
     eval_model = deserialize(h, device)
+    _maybe_attach_eval_hash_embedding(h, eval_model, device)
     if h.num_loops > 0:
         eval_model.looping_active = True
     compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
@@ -2684,6 +2718,7 @@ def train_and_eval(h, device):
         torch._dynamo.reset()
         torch.cuda.empty_cache()
         ttt_model = deserialize(h, device)
+        _maybe_attach_eval_hash_embedding(h, ttt_model, device)
         if h.num_loops > 0:
             ttt_model.looping_active = True
         for p in ttt_model.parameters():
