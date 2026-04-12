@@ -779,6 +779,11 @@ class GPT(nn.Module):
             nn.Parameter(torch.tensor(0.5)) if self.parallel_start_layer > 0 else None
         )
         if self.num_loop_passes > 0:
+            self.loop_embed = nn.Embedding(self.num_loop_passes, h.model_dim)
+            nn.init.zeros_(self.loop_embed.weight)
+        else:
+            self.loop_embed = None
+        if self.num_loop_passes > 0:
             self.loop_pass_attn_vec = nn.Parameter(torch.ones(self.num_loop_passes, h.model_dim, dtype=torch.float32))
         else:
             self.loop_pass_attn_vec = None
@@ -799,6 +804,19 @@ class GPT(nn.Module):
         if pass_idx >= self.num_loop_passes:
             return None
         return self.loop_pass_attn_vec[pass_idx]
+
+    def _loop_pass_embedding(self, layer_idx, loop_counts, x):
+        if (
+            not self.looping_active
+            or self.loop_embed is None
+            or layer_idx != self.loop_start
+        ):
+            return x
+        pass_idx = loop_counts.get(layer_idx, 0)
+        loop_counts[layer_idx] = pass_idx + 1
+        if pass_idx >= self.num_loop_passes:
+            return x
+        return x + self.loop_embed.weight[pass_idx].to(dtype=x.dtype)[None, None, :]
 
     def _init_weights(self):
         if self.tie_embeddings:
@@ -858,6 +876,7 @@ class GPT(nn.Module):
             )
         )
         for i in enc_iter:
+            x = self._loop_pass_embedding(i, loop_counts, x)
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             pass_mod = self._loop_pass_mod(i, loop_counts)
             x = self.blocks[i](
@@ -869,6 +888,7 @@ class GPT(nn.Module):
         lane0 = None
         lane1 = None
         for skip_idx, i in enumerate(dec_iter):
+            x = self._loop_pass_embedding(i, loop_counts, x)
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             pass_mod = self._loop_pass_mod(i, loop_counts)
             if lane0 is None:
@@ -962,6 +982,7 @@ class GPT(nn.Module):
         )
         slot = 0
         for i in enc_iter:
+            x = self._loop_pass_embedding(i, loop_counts, x)
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             pass_mod = self._loop_pass_mod(i, loop_counts)
             x = self._block_with_lora(
@@ -973,6 +994,7 @@ class GPT(nn.Module):
         lane0 = None
         lane1 = None
         for skip_idx, i in enumerate(dec_iter):
+            x = self._loop_pass_embedding(i, loop_counts, x)
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             pass_mod = self._loop_pass_mod(i, loop_counts)
             if lane0 is None:
@@ -1360,7 +1382,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,lane_merge,loop_pass_attn_vec",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,lane_merge,loop_pass_attn_vec,loop_embed",
     ).split(",")
     if pattern
 )
