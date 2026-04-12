@@ -334,8 +334,8 @@ def apply_tapin_v4_v6(
         wlen = int(wlens[bi])
         s_start = 0 if ws == 0 else (window_size - stride)
 
-        ids_i32 = x_batch[bi, :wlen].to(torch.int32).cpu().numpy()
-        ent_f = entropies[bi, :wlen].float().cpu().numpy()
+        ids_i32 = x_batch[bi, :wlen].detach().to(torch.int32).cpu().numpy()
+        ent_f = entropies[bi, :wlen].detach().float().cpu().numpy()
 
         cross_base = 0
         lost_np = _EMPTY_INT32
