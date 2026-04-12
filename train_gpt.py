@@ -91,6 +91,22 @@ class Hyperparameters:
     ttt_eval_batches = os.environ.get("TTT_EVAL_BATCHES", "")
     ttt_output_dir = os.environ.get("TTT_OUTPUT_DIR", "")
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
+    tapin_enabled = bool(int(os.environ.get("TAPIN_ENABLED", "1")))
+    tapin_mix_w = float(os.environ.get("TAPIN_MIX_W", 0.02))
+    tapin_min_match = int(os.environ.get("TAPIN_MIN_MATCH", 1))
+    tapin_max_match = int(os.environ.get("TAPIN_MAX_MATCH", 100))
+    tapin_ent_min = float(os.environ.get("TAPIN_ENT_MIN", 0.0))
+    tapin_allow_fallback = bool(int(os.environ.get("TAPIN_ALLOW_FALLBACK", "0")))
+    tapin_cross_enabled = tapin_enabled and bool(int(os.environ.get("TAPIN_CROSS_ENABLED", "1")))
+    tapin_v4_enabled = tapin_enabled and bool(int(os.environ.get("TAPIN_V4_ENABLED", str(int(tapin_enabled)))))
+    tapin_v4_entropy_min = float(os.environ.get("TAPIN_V4_ENTROPY_MIN", str(tapin_ent_min)))
+    tapin_v4_top_k = int(os.environ.get("TAPIN_V4_TOP_K", 1000))
+    tapin_v4_boost_per_match = float(os.environ.get("TAPIN_V4_BOOST_PER_MATCH", str(tapin_mix_w)))
+    tapin_v4_min_match = int(os.environ.get("TAPIN_V4_MIN_MATCH", str(tapin_min_match)))
+    tapin_v4_max_match = int(os.environ.get("TAPIN_V4_MAX_MATCH", str(tapin_max_match)))
+    tapin_v6_cross_window = tapin_cross_enabled and bool(int(os.environ.get("TAPIN_V6_CROSS", str(int(tapin_cross_enabled)))))
+    tapin_v6_cross_w = float(os.environ.get("TAPIN_V6_CROSS_W", 0.06))
+    tapin_enabled = tapin_v4_enabled or tapin_v6_cross_window
     etlb_lr = float(os.environ.get("ETLB_LR", 0.05))
     etlb_steps = int(os.environ.get("ETLB_STEPS", 5))
     etlb_clip = float(os.environ.get("ETLB_CLIP", 3.0))
@@ -165,6 +181,8 @@ class ValidationData:
             self.has_leading_space_lut,
             self.is_boundary_token_lut,
         ) = build_sentencepiece_luts(self.sp, h.vocab_size, device)
+        bos_token_id = int(self.sp.bos_id())
+        self.bos_token_id = bos_token_id if bos_token_id >= 0 else 1
 
 
 def build_sentencepiece_luts(sp, vocab_size, device):
@@ -938,6 +956,13 @@ class GPT(nn.Module):
         )
 
     def forward_ttt(self, input_ids, target_ids, lora):
+        logits = self.forward_ttt_logits(input_ids, lora=lora)
+        bsz, sl, V = logits.shape
+        return F.cross_entropy(
+            logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
+        ).reshape(bsz, sl)
+
+    def forward_ttt_logits(self, input_ids, lora):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
@@ -1032,11 +1057,7 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits + lora.lm_head_lora(x)
-        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
-        bsz, sl, V = logits.shape
-        return F.cross_entropy(
-            logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
-        ).reshape(bsz, sl)
+        return self.logit_softcap * torch.tanh(logits / self.logit_softcap)
 
     def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=None):
         mix, attn_scale, mlp_scale = block._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
@@ -1844,8 +1865,25 @@ def _compressed_code_size(code):
     return len(code_raw), len(wrapper)
 
 
+def _submission_code_paths(h):
+    here = Path(__file__).resolve()
+    paths = [here]
+    if h.tapin_enabled:
+        paths.append(here.with_name("tapin_v6.py"))
+    return paths
+
+
 def serialize(h, base_model, code):
-    code_bytes_uncompressed, code_bytes = _compressed_code_size(code)
+    code_paths = _submission_code_paths(h)
+    missing = [str(path) for path in code_paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"Submission code files missing: {missing}")
+    code_bytes_uncompressed = 0
+    code_bytes = 0
+    for path in code_paths:
+        raw_size, wrapped_size = _compressed_code_size(path.read_text(encoding="utf-8"))
+        code_bytes_uncompressed += raw_size
+        code_bytes += wrapped_size
     if h.is_main_process:
         torch.save(base_model.state_dict(), h.model_path)
         model_bytes = os.path.getsize(h.model_path)
@@ -1991,6 +2029,7 @@ def eval_val_sliding(h, device, val_data, base_model, forward_logits_fn=None, ba
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    tapin_state = _make_tapin_state(h)
     total_batches = (len(my_windows) + batch_seqs - 1) // batch_seqs
     is_master = h.rank == 0
     cu_bucket = 64
@@ -2032,8 +2071,11 @@ def eval_val_sliding(h, device, val_data, base_model, forward_logits_fn=None, ba
             cu_seqlens[:len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32, device=device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = run_forward_logits(x_cat, cu_seqlens=cu_seqlens, max_seqlen=seq_len)
+            logits = _maybe_apply_tapin_logits(
+                h, logits.float(), x_cat, batch_ws, [sr[1] for sr in score_ranges], val_data, tapin_state
+            )
             flat_nll = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
+                logits.reshape(-1, logits.size(-1)),
                 y_cat,
                 reduction="none",
             )
@@ -2142,7 +2184,54 @@ def _accumulate_bpb(
     byte_sum += (tok_bytes * mask_f64).sum()
     token_count += chunk_lens.to(torch.float64).sum()
 
-def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
+
+def _make_tapin_state(h):
+    if not h.tapin_enabled:
+        return None
+    try:
+        from tapin_v6 import apply_tapin_v4_v6
+    except Exception as e:
+        if not h.tapin_allow_fallback:
+            raise RuntimeError(f"Tap-In enabled but unavailable: {e}") from e
+        if h.is_main_process:
+            log(f"tapin:disabled (import/runtime error: {e})")
+        h.tapin_enabled = False
+        return None
+    return {
+        "_apply": apply_tapin_v4_v6,
+        "_stats": {"fires": 0, "cross_fires": 0, "within_fires": 0},
+    }
+
+
+def _maybe_apply_tapin_logits(h, logits, x_batch, ws_list, wlens, val_data, tapin_state):
+    if not h.tapin_enabled or tapin_state is None:
+        return logits
+    apply_tapin_v4_v6 = tapin_state["_apply"]
+    if logits.size(0) == 1 and len(ws_list) > 1:
+        packed = logits.clone()
+        offset = 0
+        for ws, wlen in zip(ws_list, wlens):
+            next_offset = offset + int(wlen)
+            if next_offset > packed.size(1):
+                raise ValueError("Tap-In packed window metadata exceeds packed logits length")
+            window_logits = packed[:, offset:next_offset].contiguous()
+            window_x = x_batch[:, offset:next_offset].contiguous()
+            packed[:, offset:next_offset] = apply_tapin_v4_v6(
+                window_logits, window_x, [int(ws)], [int(wlen)],
+                val_data.val_tokens.numpy(), tapin_state, h,
+                bos_token_id=val_data.bos_token_id,
+            )
+            offset = next_offset
+        if offset != packed.size(1):
+            raise ValueError("Tap-In packed window metadata does not cover packed logits")
+        return packed
+    return apply_tapin_v4_v6(
+        logits, x_batch, ws_list, wlens,
+        val_data.val_tokens.numpy(), tapin_state, h,
+        bos_token_id=val_data.bos_token_id,
+    )
+
+def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train, forward_ttt_logits):
     global BOS_ID
     if BOS_ID is None:
         BOS_ID = 1
@@ -2201,6 +2290,7 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     t_start = time.perf_counter()
     local_batch_count = 0
+    tapin_state = _make_tapin_state(h)
     reusable_lora = BatchedTTTLoRA(
         h.ttt_batch_size, base_model, h.ttt_lora_rank,
         k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
@@ -2290,7 +2380,16 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
             y = torch.where(valid, gathered_gpu[:, 1 : context_size + 1], 0)
             ctx_pos = torch.arange(context_size, device=device, dtype=torch.int64)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
+                logits = forward_ttt_logits(x, lora=cur_lora)
+            if tapin_state is not None:
+                logits = _maybe_apply_tapin_logits(
+                    h, logits.float(), x, tok_starts.tolist(), tok_wls.tolist(), val_data, tapin_state
+                )
+            per_tok_loss = F.cross_entropy(
+                logits.float().reshape(-1, logits.size(-1)),
+                y.reshape(-1),
+                reduction="none",
+            ).reshape(bsz, context_size)
             with torch.no_grad():
                 _accumulate_bpb(
                     per_tok_loss,
@@ -2703,6 +2802,9 @@ def train_and_eval(h, device):
         def _fwd_ttt(input_ids, target_ids, lora):
             return ttt_model.forward_ttt(input_ids, target_ids, lora=lora)
 
+        def _fwd_ttt_logits(input_ids, lora):
+            return ttt_model.forward_ttt_logits(input_ids, lora=lora)
+
         _ttt_debug_bypass = bool(os.environ.get("TTT_DEBUG_BYPASS"))
         _ttt_compile_warmup = bool(int(os.environ.get("TTT_COMPILE_WARMUP", "0")))
         if _ttt_debug_bypass:
@@ -2714,11 +2816,17 @@ def train_and_eval(h, device):
                 return F.cross_entropy(
                     logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
                 ).reshape(bsz, sl)
+            def _fwd_ttt_logits_bypass(input_ids, lora):
+                logits = ttt_model.forward_logits(input_ids)
+                dummy = lora.q_loras[0].B.sum() * 0
+                return logits + dummy
             fwd_ttt_compiled = _fwd_ttt_bypass
+            fwd_ttt_logits_compiled = _fwd_ttt_logits_bypass
             log("ttt_lora:DEBUG BYPASS active - using forward_logits directly (no compile warmup)")
             ttt_compile_time = 0.0
         elif _ttt_compile_warmup:
             fwd_ttt_compiled = torch.compile(_fwd_ttt, dynamic=True)
+            fwd_ttt_logits_compiled = torch.compile(_fwd_ttt_logits, dynamic=True)
             log(f"ttt_lora:warming up compile")
             global BOS_ID
             if BOS_ID is None:
@@ -2747,6 +2855,8 @@ def train_and_eval(h, device):
                     yw = row_w[1 : ctx_len + 1].unsqueeze(0).expand(bsz, -1).contiguous()
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         ptl = fwd_ttt_compiled(xw, yw, lora=wl)
+                        logits_w = fwd_ttt_logits_compiled(xw, lora=wl)
+                    _ = logits_w.shape
                     ptl[:, : min(h.ttt_chunk_size, ctx_len)].mean(dim=-1).sum().backward()
                     wo.step()
                     wo.zero_grad(set_to_none=True)
@@ -2756,12 +2866,18 @@ def train_and_eval(h, device):
             log(f"ttt_lora:compile warmup done ({ttt_compile_time:.1f}s)")
         else:
             fwd_ttt_compiled = torch.compile(_fwd_ttt, dynamic=True)
+            fwd_ttt_logits_compiled = _fwd_ttt_logits
             log("ttt_lora:compile warmup skipped")
             ttt_compile_time = 0.0
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         ttt_val_loss, ttt_val_bpb = eval_val_ttt_lora(
-            h, ttt_model, device, val_data, forward_ttt_train=fwd_ttt_compiled
+            h,
+            ttt_model,
+            device,
+            val_data,
+            forward_ttt_train=fwd_ttt_compiled,
+            forward_ttt_logits=fwd_ttt_logits_compiled,
         )
         torch.cuda.synchronize()
         log(
