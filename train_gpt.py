@@ -968,19 +968,11 @@ class GPT(nn.Module):
             pass_mod = self._loop_pass_mod(i, loop_counts)
             if self._parallel_active_for_layer(i) and psl > 0:
                 if lane0 is None or lane1 is None:
+                    lane0 = x
+                    lane1 = x.clone()
                     if skip_idx < self.num_skip_weights and skips:
                         skip = skips.pop()
-                        if self.parallel_skip_lane0_only:
-                            x = self._apply_skip_single(x, skip, skip_idx)
-                            lane0 = x
-                            lane1 = x.clone()
-                        else:
-                            lane0 = x
-                            lane1 = x.clone()
-                            lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skip, skip_idx)
-                    else:
-                        lane0 = x
-                        lane1 = x.clone()
+                        lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skip, skip_idx)
                 elif skip_idx < self.num_skip_weights and skips:
                     lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skips.pop(), skip_idx)
                 lane0, lane1 = self._parallel_block(
@@ -1055,19 +1047,11 @@ class GPT(nn.Module):
             pass_mod = self._loop_pass_mod(i, loop_counts)
             if self._parallel_active_for_layer(i) and psl > 0:
                 if lane0 is None or lane1 is None:
+                    lane0 = x
+                    lane1 = x.clone()
                     if skip_idx < self.num_skip_weights and skips:
                         skip = skips.pop()
-                        if self.parallel_skip_lane0_only:
-                            x = self._apply_skip_single(x, skip, skip_idx)
-                            lane0 = x
-                            lane1 = x.clone()
-                        else:
-                            lane0 = x
-                            lane1 = x.clone()
-                            lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skip, skip_idx)
-                    else:
-                        lane0 = x
-                        lane1 = x.clone()
+                        lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skip, skip_idx)
                 elif skip_idx < self.num_skip_weights and skips:
                     lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skips.pop(), skip_idx)
                 lane0, lane1 = self._parallel_block_with_lora(
