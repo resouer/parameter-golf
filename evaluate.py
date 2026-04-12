@@ -25,8 +25,6 @@ import time
 
 WORKSPACE = os.path.expanduser("~/autoresearch/pgolf")
 os.makedirs(WORKSPACE, exist_ok=True)
-HEARTBEAT_DIR = os.path.join(WORKSPACE, "heartbeats")
-os.makedirs(HEARTBEAT_DIR, exist_ok=True)
 
 DEFAULT_THRESHOLD = float(os.environ.get("AUTORESEARCH_THRESHOLD", "1.1164"))
 DEFAULT_TIMEOUT = 2700  # 45 min
@@ -123,16 +121,16 @@ else
     VOCAB=$(python3 << 'PYEOF'
 import re, sys
 f = open('train_gpt.py').read()
-m = re.search(r'VOCAB_SIZE.*?,\s*(\d+)', f)
+m = re.search(r'VOCAB_SIZE.*?,\\s*(\\d+)', f)
 if m: print(m.group(1)); sys.exit()
 try:
     import lzma, base64
-    m2 = re.search(r"b85decode\([b]?['\"](.+?)['\"]\)", f, re.DOTALL)
+    m2 = re.search(r"b85decode\\([b]?['\\\"](.+?)['\\\"]\\)", f, re.DOTALL)
     if m2:
         blob = m2.group(1)
         try: code = lzma.decompress(base64.b85decode(blob)).decode()
         except: code = lzma.decompress(base64.b85decode(blob), format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2}]).decode()
-        m3 = re.search(r'VOCAB_SIZE.*?,\s*(\d+)', code)
+        m3 = re.search(r'VOCAB_SIZE.*?,\\s*(\\d+)', code)
         if m3: print(m3.group(1)); sys.exit()
 except Exception: pass
 print('1024')
@@ -150,7 +148,7 @@ if [ "$VOCAB" = "998" ]; then
     SCYLLA_DIR="./data/datasets/fineweb10B_scylla"
     if [ ! -f "$SCYLLA_DIR/.download_complete" ]; then
         echo "data_setup: downloading Scylla data from HuggingFace..."
-        pip install -q huggingface_hub 2>/dev/null || true
+        PIP_NO_CACHE_DIR=1 pip install -q --no-cache-dir huggingface_hub 2>/dev/null || true
         python3 -c "from huggingface_hub import snapshot_download; snapshot_download('anthonym21/fineweb10B-scylla', local_dir='$SCYLLA_DIR', repo_type='dataset')"
         touch "$SCYLLA_DIR/.download_complete"
         echo "data_setup: Scylla download complete"
@@ -173,21 +171,24 @@ fi
 """
 
     clone_setup = f"""
+rm -rf /workspace/pgolf /root/.cache/pip ~/.cache/pip /tmp/pip-cache
+mkdir -p /workspace
 if [ -n "$PGOLF_GIT_TOKEN" ]; then
     CLONE_URL="https://x-access-token:${{PGOLF_GIT_TOKEN}}@github.com/{owner}/{repo}.git"
 else
     CLONE_URL="{REPO_URL}"
 fi
-GIT_TERMINAL_PROMPT=0 git clone --quiet "$CLONE_URL" /workspace/pgolf
+GIT_TERMINAL_PROMPT=0 git clone --quiet --filter=blob:none --no-tags "$CLONE_URL" /workspace/pgolf
 """
 
     return f"""set -e
-pip install -q sentencepiece huggingface-hub tiktoken zstandard brotli 2>/dev/null || true
+PIP_NO_CACHE_DIR=1 pip install -q --no-cache-dir sentencepiece huggingface-hub tiktoken zstandard brotli 2>/dev/null || true
 
 {clone_setup}
 cd /workspace/pgolf
 git fetch origin {f'{branch}' if branch else '--all'}
 git checkout {commit_sha}
+rm -rf .git /root/.cache/pip ~/.cache/pip /tmp/pip-cache
 
 export PYTHONUNBUFFERED=1
 
@@ -331,77 +332,6 @@ def _get_job_status(job_name, job_id=None):
 
 def _log_path(job_id):
     return os.path.join(WORKSPACE, f"run_{job_id}.log")
-
-
-def _heartbeat_path(job_id=None):
-    if job_id:
-        return os.path.join(HEARTBEAT_DIR, f"{job_id}.json")
-    return os.path.join(WORKSPACE, "heartbeat-latest.json")
-
-
-def _log_snapshot(log_file, max_tail_lines=8):
-    if not log_file or not os.path.exists(log_file):
-        return {
-            "exists": False,
-            "line_count": 0,
-            "size_bytes": 0,
-            "mtime": None,
-            "tail": [],
-        }
-    st = os.stat(log_file)
-    with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-        lines = f.read().splitlines()
-    return {
-        "exists": True,
-        "line_count": len(lines),
-        "size_bytes": st.st_size,
-        "mtime": int(st.st_mtime),
-        "tail": lines[-max_tail_lines:],
-    }
-
-
-def _heartbeat_state_label(job_status, log_snapshot, now_ts=None):
-    now_ts = int(now_ts or time.time())
-    if job_status == "queueing":
-        return "queued"
-    if job_status in ("completed", "failed", "stopped", "timeout"):
-        return job_status
-    if not log_snapshot["exists"] or log_snapshot["line_count"] == 0:
-        return "starting"
-    mtime = log_snapshot.get("mtime")
-    if mtime is None:
-        return "running"
-    if now_ts - mtime <= 90:
-        return "streaming"
-    return "quiet-running"
-
-
-def _write_heartbeat(kind, job_id=None, job_name=None, status=None, branch=None,
-                     commit=None, log_file=None, started_at=None, extra=None):
-    now = int(time.time())
-    snapshot = _log_snapshot(log_file)
-    payload = {
-        "kind": kind,
-        "job_id": job_id,
-        "job_name": job_name,
-        "status": status,
-        "state_label": _heartbeat_state_label(status, snapshot, now_ts=now),
-        "branch": branch,
-        "commit": commit,
-        "log_file": log_file,
-        "started_at": started_at,
-        "updated_at": now,
-        "elapsed_s": None if started_at is None else max(0, now - int(started_at)),
-        "log": snapshot,
-    }
-    if extra:
-        payload.update(extra)
-    for path in {_heartbeat_path(), _heartbeat_path(job_id)}:
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, sort_keys=True)
-        except Exception:
-            pass
 
 
 def _has_final_results_content(content):
@@ -674,8 +604,6 @@ def main():
     commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     _log(f"branch={branch} commit={commit[:7]}")
 
-    started_at = int(time.time())
-
     # 2. Create job
     try:
         job_name, job_id = _create_job(commit, node_group=args.node_group, branch=branch)
@@ -688,17 +616,6 @@ def main():
     _main_state["log_file"] = log_file
     log_thread = threading.Thread(target=_stream_job_logs, args=(job_id, log_file), daemon=True)
     log_thread.start()
-    _write_heartbeat(
-        kind="eval",
-        job_id=job_id,
-        job_name=job_name,
-        status="created",
-        branch=branch,
-        commit=commit[:7],
-        log_file=log_file,
-        started_at=started_at,
-        extra={"threshold": args.threshold},
-    )
 
     # 4. Poll job status independently
     start = time.time()
@@ -707,17 +624,6 @@ def main():
         status = _get_job_status(job_name, job_id)
         elapsed = int(time.time() - start)
         _log(f"[{elapsed}s] {job_name}: {status}")
-        _write_heartbeat(
-            kind="eval",
-            job_id=job_id,
-            job_name=job_name,
-            status=status,
-            branch=branch,
-            commit=commit[:7],
-            log_file=log_file,
-            started_at=started_at,
-            extra={"threshold": args.threshold},
-        )
 
         if status in ("completed", "failed", "stopped"):
             log_thread.join(timeout=15)
@@ -736,17 +642,6 @@ def main():
         _log(f"Timeout after {args.timeout}s, stopping job")
         _stop_job_safe(job_id)
         log_thread.join(timeout=5)
-        _write_heartbeat(
-            kind="eval",
-            job_id=job_id,
-            job_name=job_name,
-            status="timeout",
-            branch=branch,
-            commit=commit[:7],
-            log_file=log_file,
-            started_at=started_at,
-            extra={"threshold": args.threshold},
-        )
         _output(False, error=f"job timeout after {args.timeout}s")
 
     # 5. Parse results from log
@@ -1074,17 +969,6 @@ def preflight(node_group=None, commit=None):
     job_name, job_id = _create_job(commit, ng, branch=branch)
     log_file = _log_path(job_id)
     _log(f"Job: {job_name} ({job_id})")
-    started_at = int(time.time())
-    _write_heartbeat(
-        kind="preflight",
-        job_id=job_id,
-        job_name=job_name,
-        status="created",
-        branch=branch,
-        commit=commit[:7],
-        log_file=log_file,
-        started_at=started_at,
-    )
 
     # Stream + poll
     stream_thread = threading.Thread(target=_stream_job_logs, args=(job_id, log_file), daemon=True)
@@ -1097,16 +981,6 @@ def preflight(node_group=None, commit=None):
         status = _get_job_status(job_name, job_id)
         elapsed = int(time.time() - start)
         _log(f"[preflight] [{elapsed}s] {status}")
-        _write_heartbeat(
-            kind="preflight",
-            job_id=job_id,
-            job_name=job_name,
-            status=status,
-            branch=branch,
-            commit=commit[:7],
-            log_file=log_file,
-            started_at=started_at,
-        )
         if status in ("completed", "failed", "stopped"):
             break
 
@@ -1152,21 +1026,6 @@ def preflight(node_group=None, commit=None):
     _log(f"  OVERALL:    {'PASS' if all_pass else 'FAIL'}")
     if not all_pass:
         _log(f"  Failed checks: {[k for k,v in checks.items() if not v]}")
-    _write_heartbeat(
-        kind="preflight",
-        job_id=job_id,
-        job_name=job_name,
-        status="completed" if all_pass else status,
-        branch=branch,
-        commit=commit[:7],
-        log_file=log_file,
-        started_at=started_at,
-        extra={
-            "preflight_pass": all_pass,
-            "preflight_checks": checks,
-            "details": results,
-        },
-    )
     return all_pass
 
 
