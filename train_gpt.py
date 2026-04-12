@@ -76,7 +76,7 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 96))
-    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.00015))
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 72))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 2048))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
@@ -1865,6 +1865,14 @@ def _compressed_code_size(code):
     return len(code_raw), len(wrapper)
 
 
+_SUBMISSION_BUNDLE_LOADER = (
+    b'import lzma,json,os\n'
+    b'with open(os.path.join(os.path.dirname(__file__),"code.lzma"),"rb") as f:bundle=json.loads(lzma.decompress(f.read()))\n'
+    b'for n,c in bundle.items():open(os.path.join(os.path.dirname(__file__),n),"w").write(c)\n'
+    b'exec(compile(bundle["train_gpt.py"],"train_gpt.py","exec"))\n'
+)
+
+
 def _submission_code_paths(h):
     here = Path(__file__).resolve()
     paths = [here]
@@ -1873,17 +1881,20 @@ def _submission_code_paths(h):
     return paths
 
 
+def _bundle_submission_code(code_paths):
+    bundle = json.dumps(
+        {path.name: path.read_text(encoding="utf-8") for path in code_paths},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return len(bundle), len(_SUBMISSION_BUNDLE_LOADER) + len(lzma.compress(bundle))
+
+
 def serialize(h, base_model, code):
     code_paths = _submission_code_paths(h)
     missing = [str(path) for path in code_paths if not path.exists()]
     if missing:
         raise FileNotFoundError(f"Submission code files missing: {missing}")
-    code_bytes_uncompressed = 0
-    code_bytes = 0
-    for path in code_paths:
-        raw_size, wrapped_size = _compressed_code_size(path.read_text(encoding="utf-8"))
-        code_bytes_uncompressed += raw_size
-        code_bytes += wrapped_size
+    code_bytes_uncompressed, code_bytes = _bundle_submission_code(code_paths)
     if h.is_main_process:
         torch.save(base_model.state_dict(), h.model_path)
         model_bytes = os.path.getsize(h.model_path)
