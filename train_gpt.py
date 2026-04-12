@@ -793,8 +793,8 @@ class GPT(nn.Module):
         ):
             return None
         loop_span = self.loop_end - self.loop_start + 1
-        visit_idx = loop_counts.get("__loop_visit_count", 0)
-        loop_counts["__loop_visit_count"] = visit_idx + 1
+        visit_idx = loop_counts.get("_lv", 0)
+        loop_counts["_lv"] = visit_idx + 1
         pass_idx = visit_idx // loop_span
         if pass_idx >= self.num_loop_passes:
             return None
@@ -2077,9 +2077,15 @@ def _find_docs(all_tokens):
 
 def _build_ttt_global_batches(doc_entries, h, ascending=False):
     batch_size = h.ttt_batch_size
+    window_size = batch_size * 8
+    scheduled = []
+    for start in range(0, len(doc_entries), window_size):
+        window = list(doc_entries[start : start + window_size])
+        window.sort(key=lambda x: x[1][1], reverse=not ascending)
+        scheduled.extend(window)
     global_batches = [
-        doc_entries[i : i + batch_size]
-        for i in range(0, len(doc_entries), batch_size)
+        scheduled[i : i + batch_size]
+        for i in range(0, len(scheduled), batch_size)
     ]
     return list(enumerate(global_batches))
 
