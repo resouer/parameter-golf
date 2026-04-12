@@ -50,6 +50,7 @@ class Hyperparameters:
     loop_end = int(os.environ.get("LOOP_END", 5))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 7))
+    loop_embed_dim = int(os.environ.get("LOOP_EMBED_DIM", 128))
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -778,8 +779,9 @@ class GPT(nn.Module):
         self.lane_merge = (
             nn.Parameter(torch.tensor(0.5)) if self.parallel_start_layer > 0 else None
         )
+        self.loop_embed_dim = min(h.model_dim, h.loop_embed_dim)
         if self.num_loop_passes > 0:
-            self.loop_embed = nn.Embedding(self.num_loop_passes, h.model_dim)
+            self.loop_embed = nn.Embedding(self.num_loop_passes, self.loop_embed_dim)
             nn.init.zeros_(self.loop_embed.weight)
         else:
             self.loop_embed = None
@@ -816,7 +818,10 @@ class GPT(nn.Module):
         loop_counts[layer_idx] = pass_idx + 1
         if pass_idx >= self.num_loop_passes:
             return x
-        return x + self.loop_embed.weight[pass_idx].to(dtype=x.dtype)[None, None, :]
+        emb = self.loop_embed.weight[pass_idx].to(dtype=x.dtype)
+        if self.loop_embed_dim < x.size(-1):
+            emb = F.pad(emb, (0, x.size(-1) - self.loop_embed_dim))
+        return x + emb[None, None, :]
 
     def _init_weights(self):
         if self.tie_embeddings:
