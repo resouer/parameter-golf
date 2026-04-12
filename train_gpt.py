@@ -2332,8 +2332,11 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
         if eval_batch_set is not None:
             should_report = batch_num in eval_batch_set
         else:
-            # should_report = local_batch_count % 10 == 0
-            should_report = True
+            should_report = (
+                batch_num == queue_len
+                or local_batch_count == 1
+                or local_batch_count % 64 == 0
+            )
         if should_report:
             cur_tokens = token_count.item()
             cur_loss_val = loss_sum.item()
