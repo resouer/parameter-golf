@@ -2077,12 +2077,7 @@ def _find_docs(all_tokens):
 
 def _build_ttt_global_batches(doc_entries, h, ascending=False):
     batch_size = h.ttt_batch_size
-    window_size = batch_size * 8
-    scheduled = []
-    for start in range(0, len(doc_entries), window_size):
-        window = list(doc_entries[start : start + window_size])
-        window.sort(key=lambda x: x[1][1], reverse=not ascending)
-        scheduled.extend(window)
+    scheduled = sorted(doc_entries, key=lambda x: x[1][1], reverse=not ascending)
     global_batches = [
         scheduled[i : i + batch_size]
         for i in range(0, len(scheduled), batch_size)
@@ -2709,6 +2704,7 @@ def train_and_eval(h, device):
             return ttt_model.forward_ttt(input_ids, target_ids, lora=lora)
 
         _ttt_debug_bypass = bool(os.environ.get("TTT_DEBUG_BYPASS"))
+        _ttt_compile_warmup = bool(int(os.environ.get("TTT_COMPILE_WARMUP", "0")))
         if _ttt_debug_bypass:
             def _fwd_ttt_bypass(input_ids, target_ids, lora):
                 logits = ttt_model.forward_logits(input_ids)
@@ -2721,7 +2717,7 @@ def train_and_eval(h, device):
             fwd_ttt_compiled = _fwd_ttt_bypass
             log("ttt_lora:DEBUG BYPASS active - using forward_logits directly (no compile warmup)")
             ttt_compile_time = 0.0
-        else:
+        elif _ttt_compile_warmup:
             fwd_ttt_compiled = torch.compile(_fwd_ttt, dynamic=True)
             log(f"ttt_lora:warming up compile")
             global BOS_ID
@@ -2758,6 +2754,10 @@ def train_and_eval(h, device):
             torch.cuda.empty_cache()
             ttt_compile_time = time.perf_counter() - t_warmup
             log(f"ttt_lora:compile warmup done ({ttt_compile_time:.1f}s)")
+        else:
+            fwd_ttt_compiled = torch.compile(_fwd_ttt, dynamic=True)
+            log("ttt_lora:compile warmup skipped")
+            ttt_compile_time = 0.0
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         ttt_val_loss, ttt_val_bpb = eval_val_ttt_lora(
