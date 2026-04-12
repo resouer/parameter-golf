@@ -79,7 +79,7 @@ class Hyperparameters:
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 64))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 2048))
-    ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
+    ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 128))
     ttt_grad_steps = int(os.environ.get("TTT_GRAD_STEPS", 1))
     ttt_weight_decay = float(os.environ.get("TTT_WEIGHT_DECAY", 0.5))
     ttt_beta1 = float(os.environ.get("TTT_BETA1", 0))
