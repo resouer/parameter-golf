@@ -294,14 +294,10 @@ def apply_tapin_v4_v6(
     bsz, _, vocab_size = logits.shape
     device = logits.device
 
-    log_probs = F.log_softmax(logits.float(), dim=-1)
-    probs = log_probs.exp()
-    entropies = -(probs * log_probs).sum(dim=-1)
-
     top_k = min(int(h.tapin_v4_top_k), vocab_size)
     if top_k <= 0:
         return logits
-    topk_ids = logits.topk(top_k, dim=-1).indices
+    topk_ids = logits.topk(top_k, dim=-1, sorted=False).indices
 
     ent_min = float(h.tapin_v4_entropy_min)
     min_match = int(h.tapin_v4_min_match)
@@ -335,7 +331,13 @@ def apply_tapin_v4_v6(
         s_start = 0 if ws == 0 else (window_size - stride)
 
         ids_i32 = x_batch[bi, :wlen].detach().to(torch.int32).cpu().numpy()
-        ent_f = entropies[bi, :wlen].detach().float().cpu().numpy()
+        if ent_min > 0.0:
+            row_logits = logits[bi, :wlen].float()
+            row_log_probs = F.log_softmax(row_logits, dim=-1)
+            row_probs = row_log_probs.exp()
+            ent_f = -(row_probs * row_log_probs).sum(dim=-1).detach().cpu().numpy()
+        else:
+            ent_f = np.zeros(wlen, dtype=np.float32)
 
         cross_base = 0
         lost_np = _EMPTY_INT32
@@ -401,22 +403,33 @@ def apply_tapin_v4_v6(
         stats["cross_fires"] += n_cross_total
         stats["within_fires"] += n_fires_total - n_cross_total
 
-    cur_log_p = log_probs[bi_t, pos_t]
-    sym_log_p = cur_log_p.gather(1, tok_t.unsqueeze(1)).squeeze(1)
-    sym_p = sym_log_p.exp()
+    chunk = 256
+    for start in range(0, pos_t.numel(), chunk):
+        stop = start + chunk
+        bi_s = bi_t[start:stop]
+        pos_s = pos_t[start:stop]
+        tok_s = tok_t[start:stop]
+        cross_s = cross_mask[start:stop]
+        ml_s = ml_t[start:stop]
+        vote_s = vote_t[start:stop]
 
-    base_w = torch.where(
-        cross_mask,
-        torch.full_like(cross_mask, cross_w, dtype=torch.float32),
-        torch.full_like(cross_mask, mix_w, dtype=torch.float32),
-    )
-    length_mult = 1.0 + 0.15 * (ml_t - min_match)
-    vote_mult = 1.0 + 0.20 * torch.log(vote_t.clamp(min=1.0))
-    w_per_fire = torch.clamp(base_w * length_mult * vote_mult, max=0.50)
+        row_logits = logits[bi_s, pos_s].float()
+        row_log_probs = F.log_softmax(row_logits, dim=-1)
+        sym_log_p = row_log_probs.gather(1, tok_s.unsqueeze(1)).squeeze(1)
+        sym_p = sym_log_p.exp()
 
-    log_one_minus_w = torch.log1p(-w_per_fire + 1e-10)
-    new_log_p = cur_log_p + log_one_minus_w.unsqueeze(1)
-    new_sym_log_p = torch.log((1.0 - w_per_fire) * sym_p + w_per_fire + 1e-30)
-    new_log_p.scatter_(1, tok_t.unsqueeze(1), new_sym_log_p.unsqueeze(1))
-    logits[bi_t, pos_t] = new_log_p.to(logits.dtype)
+        base_w = torch.where(
+            cross_s,
+            torch.full_like(cross_s, cross_w, dtype=torch.float32),
+            torch.full_like(cross_s, mix_w, dtype=torch.float32),
+        )
+        length_mult = 1.0 + 0.15 * (ml_s - min_match)
+        vote_mult = 1.0 + 0.20 * torch.log(vote_s.clamp(min=1.0))
+        w_per_fire = torch.clamp(base_w * length_mult * vote_mult, max=0.50)
+
+        log_one_minus_w = torch.log1p(-w_per_fire + 1e-10)
+        row_log_probs = row_log_probs + log_one_minus_w.unsqueeze(1)
+        new_sym_log_p = torch.log((1.0 - w_per_fire) * sym_p + w_per_fire + 1e-30)
+        row_log_probs.scatter_(1, tok_s.unsqueeze(1), new_sym_log_p.unsqueeze(1))
+        logits[bi_s, pos_s] = row_log_probs.to(logits.dtype)
     return logits

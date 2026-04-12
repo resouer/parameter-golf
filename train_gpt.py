@@ -2379,20 +2379,20 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train, forwar
             x = torch.where(valid, gathered_gpu[:, :context_size], 0)
             y = torch.where(valid, gathered_gpu[:, 1 : context_size + 1], 0)
             ctx_pos = torch.arange(context_size, device=device, dtype=torch.int64)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = forward_ttt_logits(x, lora=cur_lora)
-            if tapin_state is not None:
-                logits = _maybe_apply_tapin_logits(
-                    h, logits.float(), x, tok_starts.tolist(), tok_wls.tolist(), val_data, tapin_state
-                )
-            per_tok_loss = F.cross_entropy(
-                logits.float().reshape(-1, logits.size(-1)),
-                y.reshape(-1),
-                reduction="none",
-            ).reshape(bsz, context_size)
             with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    score_logits = forward_ttt_logits(x, lora=cur_lora)
+                if tapin_state is not None:
+                    score_logits = _maybe_apply_tapin_logits(
+                        h, score_logits.float(), x, tok_starts.tolist(), tok_wls.tolist(), val_data, tapin_state
+                    )
+                score_tok_loss = F.cross_entropy(
+                    score_logits.float().reshape(-1, score_logits.size(-1)),
+                    y.reshape(-1),
+                    reduction="none",
+                ).reshape(bsz, context_size)
                 _accumulate_bpb(
-                    per_tok_loss,
+                    score_tok_loss,
                     x,
                     y,
                     chunk_offsets,
@@ -2408,9 +2408,8 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train, forwar
             if needs_train:
                 activate_chunk_mask = (num_chunks_t - 1 > ci).float()
                 for gi in range(h.ttt_grad_steps):
-                    if gi > 0:
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
                     per_doc = per_tok_loss[
                         :, chunk_offset : chunk_offset + chunk_size
                     ].mean(dim=-1)
@@ -2418,7 +2417,7 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train, forwar
                     (per_doc * activate_chunk_mask).sum().backward()
                     cur_opt.step()
             else:
-                del per_tok_loss
+                del score_tok_loss
         local_batch_count += 1
         batch_num = orig_batch_idx + 1
         doc_lens = [dl for _, dl in batch]
