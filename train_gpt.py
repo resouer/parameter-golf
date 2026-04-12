@@ -53,7 +53,7 @@ class Hyperparameters:
     parallel_final_lane = os.environ.get("PARALLEL_FINAL_LANE", "mean").lower()
     parallel_freeze_lane0 = bool(int(os.environ.get("PARALLEL_FREEZE_LANE0", "0")))
     parallel_identity_init = bool(int(os.environ.get("PARALLEL_IDENTITY_INIT", "1")))
-    parallel_skip_lane0_only = bool(int(os.environ.get("PARALLEL_SKIP_LANE0_ONLY", "1")))
+    parallel_skip_lane0_only = bool(int(os.environ.get("PARALLEL_SKIP_LANE0_ONLY", "0")))
     parallel_mlp_read_mix = bool(int(os.environ.get("PARALLEL_MLP_READ_MIX", "0")))
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
