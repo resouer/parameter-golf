@@ -50,6 +50,11 @@ class Hyperparameters:
     loop_end = int(os.environ.get("LOOP_END", 5))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 7))
+    parallel_final_lane = os.environ.get("PARALLEL_FINAL_LANE", "mean").lower()
+    parallel_freeze_lane0 = bool(int(os.environ.get("PARALLEL_FREEZE_LANE0", "0")))
+    parallel_identity_init = bool(int(os.environ.get("PARALLEL_IDENTITY_INIT", "1")))
+    parallel_skip_lane0_only = bool(int(os.environ.get("PARALLEL_SKIP_LANE0_ONLY", "1")))
+    parallel_mlp_read_mix = bool(int(os.environ.get("PARALLEL_MLP_READ_MIX", "0")))
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -648,9 +653,13 @@ class Block(nn.Module):
             attn_scale = attn_scale * pass_mod.to(dtype=x_dtype)
         return mix, attn_scale, mlp_scale
 
+    def _mix_with_x0(self, x, x0, pass_mod=None):
+        mix, _, _ = self._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
+        return mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
     def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0, pass_mod=None):
-        mix, attn_scale, mlp_scale = self._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        _, attn_scale, mlp_scale = self._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
+        x_in = self._mix_with_x0(x, x0, pass_mod=pass_mod)
         attn_out = self.attn(
             self.attn_norm(x_in) * self.ln_scale_factor,
             q_w, k_w, v_w, out_w,
@@ -664,8 +673,8 @@ class Block(nn.Module):
         return x_out
 
     def forward_attn(self, x, x0, q_w, k_w, v_w, out_w, cu_seqlens=None, max_seqlen=0, pass_mod=None):
-        mix, attn_scale, _ = self._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        _, attn_scale, _ = self._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
+        x_in = self._mix_with_x0(x, x0, pass_mod=pass_mod)
         attn_out = self.attn(
             self.attn_norm(x_in) * self.ln_scale_factor,
             q_w, k_w, v_w, out_w,
@@ -775,9 +784,37 @@ class GPT(nn.Module):
             else None
         )
         self.parallel_start_layer = h.parallel_start_layer
+        self.parallel_final_lane = h.parallel_final_lane
+        self.parallel_freeze_lane0 = h.parallel_freeze_lane0
+        self.parallel_identity_init = h.parallel_identity_init
+        self.parallel_skip_lane0_only = h.parallel_skip_lane0_only
+        self.parallel_mlp_read_mix = h.parallel_mlp_read_mix
+        if self.parallel_final_lane not in ("attn", "mean", "mlp"):
+            raise ValueError(
+                "PARALLEL_FINAL_LANE must be one of 'attn', 'mean', or 'mlp', "
+                f"got {h.parallel_final_lane!r}"
+            )
         self.lane_merge = (
             nn.Parameter(torch.tensor(0.5)) if self.parallel_start_layer > 0 else None
         )
+        if self.parallel_start_layer > 0:
+            if self.parallel_identity_init:
+                self.parallel_post_lambdas = nn.Parameter(
+                    torch.ones(h.num_layers, 2, 2, dtype=torch.float32)
+                )
+                self.parallel_resid_lambdas = nn.Parameter(
+                    torch.full((h.num_layers, 2), 1.1, dtype=torch.float32)
+                )
+            else:
+                self.parallel_post_lambdas = nn.Parameter(
+                    torch.ones(h.num_layers, 2, 2, dtype=torch.float32)
+                )
+                self.parallel_resid_lambdas = nn.Parameter(
+                    torch.ones(h.num_layers, 2, dtype=torch.float32)
+                )
+        else:
+            self.parallel_post_lambdas = None
+            self.parallel_resid_lambdas = None
         if self.num_loop_passes > 0:
             self.loop_pass_attn_vec = nn.Parameter(torch.ones(self.num_loop_passes, h.model_dim, dtype=torch.float32))
         else:
@@ -836,6 +873,58 @@ class GPT(nn.Module):
             self.mlp_down_bank[i],
         )
 
+    def _parallel_active_for_layer(self, physical_idx):
+        return physical_idx >= self.parallel_start_layer
+
+    def _apply_skip_single(self, x, skip, skip_idx):
+        scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skip
+        if self.skip_gates is None:
+            return x + scaled_skip
+        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+        return torch.lerp(scaled_skip, x, g)
+
+    def _apply_skip_parallel(self, lane0, lane1, skip, skip_idx):
+        skip0 = skip1 = skip
+        w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
+        if self.parallel_skip_lane0_only:
+            if self.skip_gates is None:
+                next_lane0 = lane0 if self.parallel_freeze_lane0 else lane0 + w * skip0
+                return next_lane0, lane1
+            g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, :]
+            next_lane0 = lane0 if self.parallel_freeze_lane0 else torch.lerp(w * skip0, lane0, g)
+            return next_lane0, lane1
+        if self.skip_gates is None:
+            next_lane0 = lane0 if self.parallel_freeze_lane0 else lane0 + w * skip0
+            return next_lane0, lane1 + w * skip1
+        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, :]
+        next_lane0 = lane0 if self.parallel_freeze_lane0 else torch.lerp(w * skip0, lane0, g)
+        return next_lane0, torch.lerp(w * skip1, lane1, g)
+
+    def _final_parallel_hidden(self, lane0, lane1):
+        if self.parallel_final_lane == "mlp":
+            return lane1
+        if self.parallel_final_lane == "attn":
+            return lane0
+        return 0.5 * (lane0 + lane1)
+
+    def _parallel_block(self, block_idx, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=None):
+        block = self.blocks[block_idx]
+        attn_read = block._mix_with_x0(lane0, x0, pass_mod=pass_mod)
+        attn_full = block.forward_attn(lane0, x0, q_w, k_w, v_w, out_w, pass_mod=pass_mod)
+        attn_out = attn_full - attn_read
+        mlp_read = block._mix_with_x0(lane1, x0, pass_mod=pass_mod) if self.parallel_mlp_read_mix else lane1
+        mlp_full = block.forward_mlp(mlp_read, up_w, down_w, pass_mod=pass_mod)
+        mlp_out = mlp_full - mlp_read
+        attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
+        attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
+        mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        next_lane0 = lane0
+        if not self.parallel_freeze_lane0:
+            next_lane0 = attn_resid * lane0 + attn_post[0] * attn_out + mlp_post[0] * mlp_out
+        next_lane1 = mlp_resid * lane1 + attn_post[1] * attn_out + mlp_post[1] * mlp_out
+        return next_lane0, next_lane1
+
     def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -871,53 +960,26 @@ class GPT(nn.Module):
         for skip_idx, i in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             pass_mod = self._loop_pass_mod(i, loop_counts)
-            if lane0 is None:
-                if skip_idx < self.num_skip_weights and skips:
-                    scaled_skip = (
-                        self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
-                        * skips.pop()
-                    )
-                    if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[
-                            None, None, :
-                        ]
-                        x = torch.lerp(scaled_skip, x, g)
-                    else:
-                        x = x + scaled_skip
-                if i >= psl and psl > 0:
+            if self._parallel_active_for_layer(i) and psl > 0:
+                if lane0 is None or lane1 is None:
+                    if self.parallel_skip_lane0_only and skip_idx < self.num_skip_weights and skips:
+                        x = self._apply_skip_single(x, skips.pop(), skip_idx)
                     lane0 = x
                     lane1 = x.clone()
-                    lane0 = self.blocks[i].forward_attn(
-                        lane0, x0, q_w, k_w, v_w, out_w,
-                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, pass_mod=pass_mod,
-                    )
-                    lane1 = self.blocks[i].forward_mlp(lane1, up_w, down_w, pass_mod=pass_mod)
-                else:
-                    x = self.blocks[i](
-                        x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
-                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, pass_mod=pass_mod,
-                    )
+                elif skip_idx < self.num_skip_weights and skips:
+                    lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skips.pop(), skip_idx)
+                lane0, lane1 = self._parallel_block(
+                    i, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=pass_mod
+                )
             else:
                 if skip_idx < self.num_skip_weights and skips:
-                    scaled_skip = (
-                        self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
-                        * skips.pop()
-                    )
-                    if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[
-                            None, None, :
-                        ]
-                        lane0 = torch.lerp(scaled_skip, lane0, g)
-                    else:
-                        lane0 = lane0 + scaled_skip
-                lane0 = self.blocks[i].forward_attn(
-                    lane0, x0, q_w, k_w, v_w, out_w,
+                    x = self._apply_skip_single(x, skips.pop(), skip_idx)
+                x = self.blocks[i](
+                    x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
                     cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, pass_mod=pass_mod,
                 )
-                lane1 = self.blocks[i].forward_mlp(lane1, up_w, down_w, pass_mod=pass_mod)
         if lane0 is not None:
-            lm = self.lane_merge.to(dtype=lane0.dtype)
-            x = lm * lane0 + (1.0 - lm) * lane1
+            x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
@@ -975,55 +1037,26 @@ class GPT(nn.Module):
         for skip_idx, i in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             pass_mod = self._loop_pass_mod(i, loop_counts)
-            if lane0 is None:
-                if skip_idx < self.num_skip_weights and skips:
-                    scaled_skip = (
-                        self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
-                        * skips.pop()
-                    )
-                    if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[
-                            None, None, :
-                        ]
-                        x = torch.lerp(scaled_skip, x, g)
-                    else:
-                        x = x + scaled_skip
-                if i >= psl and psl > 0:
+            if self._parallel_active_for_layer(i) and psl > 0:
+                if lane0 is None or lane1 is None:
+                    if self.parallel_skip_lane0_only and skip_idx < self.num_skip_weights and skips:
+                        x = self._apply_skip_single(x, skips.pop(), skip_idx)
                     lane0 = x
                     lane1 = x.clone()
-                    lane0 = self._block_with_lora_attn(
-                        self.blocks[i], lane0, x0, lora, slot, q_w, k_w, v_w, out_w, pass_mod=pass_mod
-                    )
-                    lane1 = self._block_with_lora_mlp(
-                        self.blocks[i], lane1, lora, slot, up_w, down_w, pass_mod=pass_mod
-                    )
-                else:
-                    x = self._block_with_lora(
-                        self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=pass_mod
-                    )
+                elif skip_idx < self.num_skip_weights and skips:
+                    lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skips.pop(), skip_idx)
+                lane0, lane1 = self._parallel_block_with_lora(
+                    i, lane0, lane1, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=pass_mod
+                )
             else:
                 if skip_idx < self.num_skip_weights and skips:
-                    scaled_skip = (
-                        self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
-                        * skips.pop()
-                    )
-                    if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[
-                            None, None, :
-                        ]
-                        lane0 = torch.lerp(scaled_skip, lane0, g)
-                    else:
-                        lane0 = lane0 + scaled_skip
-                lane0 = self._block_with_lora_attn(
-                    self.blocks[i], lane0, x0, lora, slot, q_w, k_w, v_w, out_w, pass_mod=pass_mod
-                )
-                lane1 = self._block_with_lora_mlp(
-                    self.blocks[i], lane1, lora, slot, up_w, down_w, pass_mod=pass_mod
+                    x = self._apply_skip_single(x, skips.pop(), skip_idx)
+                x = self._block_with_lora(
+                    self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=pass_mod
                 )
             slot += 1
         if lane0 is not None:
-            lm = self.lane_merge.to(dtype=lane0.dtype)
-            x = lm * lane0 + (1.0 - lm) * lane1
+            x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
@@ -1113,6 +1146,28 @@ class GPT(nn.Module):
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
         _, _, mlp_scale = block._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
         return x + mlp_scale[None, None, :] * mlp_out
+
+    def _parallel_block_with_lora(self, block_idx, lane0, lane1, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=None):
+        block = self.blocks[block_idx]
+        attn_read = block._mix_with_x0(lane0, x0, pass_mod=pass_mod)
+        attn_full = self._block_with_lora_attn(
+            block, lane0, x0, lora, slot, q_w, k_w, v_w, out_w, pass_mod=pass_mod
+        )
+        attn_out = attn_full - attn_read
+        mlp_read = block._mix_with_x0(lane1, x0, pass_mod=pass_mod) if self.parallel_mlp_read_mix else lane1
+        mlp_full = self._block_with_lora_mlp(
+            block, mlp_read, lora, slot, up_w, down_w, pass_mod=pass_mod
+        )
+        mlp_out = mlp_full - mlp_read
+        attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
+        attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
+        mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
+        next_lane0 = lane0
+        if not self.parallel_freeze_lane0:
+            next_lane0 = attn_resid * lane0 + attn_post[0] * attn_out + mlp_post[0] * mlp_out
+        next_lane1 = mlp_resid * lane1 + attn_post[1] * attn_out + mlp_post[1] * mlp_out
+        return next_lane0, next_lane1
 
 
 class BatchedLinearLoRA(nn.Module):
@@ -1360,7 +1415,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,lane_merge,loop_pass_attn_vec",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,lane_merge,loop_pass_attn_vec,parallel_post_lambdas,parallel_resid_lambdas",
     ).split(",")
     if pattern
 )
@@ -1396,6 +1451,8 @@ class Optimizers:
             "loop_pass_resid_mul",
             "loop_pass_attn_vec",
             "loop_embed",
+            "parallel_post_lambdas",
+            "parallel_resid_lambdas",
         ):
             extra = getattr(base_model, extra_name, None)
             if extra is None:
