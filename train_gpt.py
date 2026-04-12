@@ -800,11 +800,14 @@ class GPT(nn.Module):
         if self.parallel_start_layer > 0:
             if self.parallel_identity_init:
                 self.parallel_post_lambdas = nn.Parameter(
-                    torch.ones(h.num_layers, 2, 2, dtype=torch.float32)
+                    torch.zeros(h.num_layers, 2, 2, dtype=torch.float32)
                 )
                 self.parallel_resid_lambdas = nn.Parameter(
-                    torch.full((h.num_layers, 2), 1.1, dtype=torch.float32)
+                    torch.ones(h.num_layers, 2, dtype=torch.float32)
                 )
+                with torch.no_grad():
+                    self.parallel_post_lambdas[:, 0, 0].fill_(1.0)
+                    self.parallel_post_lambdas[:, 1, 1].fill_(1.0)
             else:
                 self.parallel_post_lambdas = nn.Parameter(
                     torch.ones(h.num_layers, 2, 2, dtype=torch.float32)
@@ -907,10 +910,13 @@ class GPT(nn.Module):
             return lane0
         return 0.5 * (lane0 + lane1)
 
-    def _parallel_block(self, block_idx, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=None):
+    def _parallel_block(self, block_idx, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0, pass_mod=None):
         block = self.blocks[block_idx]
         attn_read = block._mix_with_x0(lane0, x0, pass_mod=pass_mod)
-        attn_full = block.forward_attn(lane0, x0, q_w, k_w, v_w, out_w, pass_mod=pass_mod)
+        attn_full = block.forward_attn(
+            lane0, x0, q_w, k_w, v_w, out_w,
+            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, pass_mod=pass_mod,
+        )
         attn_out = attn_full - attn_read
         mlp_read = block._mix_with_x0(lane1, x0, pass_mod=pass_mod) if self.parallel_mlp_read_mix else lane1
         mlp_full = block.forward_mlp(mlp_read, up_w, down_w, pass_mod=pass_mod)
@@ -962,14 +968,24 @@ class GPT(nn.Module):
             pass_mod = self._loop_pass_mod(i, loop_counts)
             if self._parallel_active_for_layer(i) and psl > 0:
                 if lane0 is None or lane1 is None:
-                    if self.parallel_skip_lane0_only and skip_idx < self.num_skip_weights and skips:
-                        x = self._apply_skip_single(x, skips.pop(), skip_idx)
-                    lane0 = x
-                    lane1 = x.clone()
+                    if skip_idx < self.num_skip_weights and skips:
+                        skip = skips.pop()
+                        if self.parallel_skip_lane0_only:
+                            x = self._apply_skip_single(x, skip, skip_idx)
+                            lane0 = x
+                            lane1 = x.clone()
+                        else:
+                            lane0 = x
+                            lane1 = x.clone()
+                            lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skip, skip_idx)
+                    else:
+                        lane0 = x
+                        lane1 = x.clone()
                 elif skip_idx < self.num_skip_weights and skips:
                     lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skips.pop(), skip_idx)
                 lane0, lane1 = self._parallel_block(
-                    i, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=pass_mod
+                    i, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, pass_mod=pass_mod
                 )
             else:
                 if skip_idx < self.num_skip_weights and skips:
@@ -1039,10 +1055,19 @@ class GPT(nn.Module):
             pass_mod = self._loop_pass_mod(i, loop_counts)
             if self._parallel_active_for_layer(i) and psl > 0:
                 if lane0 is None or lane1 is None:
-                    if self.parallel_skip_lane0_only and skip_idx < self.num_skip_weights and skips:
-                        x = self._apply_skip_single(x, skips.pop(), skip_idx)
-                    lane0 = x
-                    lane1 = x.clone()
+                    if skip_idx < self.num_skip_weights and skips:
+                        skip = skips.pop()
+                        if self.parallel_skip_lane0_only:
+                            x = self._apply_skip_single(x, skip, skip_idx)
+                            lane0 = x
+                            lane1 = x.clone()
+                        else:
+                            lane0 = x
+                            lane1 = x.clone()
+                            lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skip, skip_idx)
+                    else:
+                        lane0 = x
+                        lane1 = x.clone()
                 elif skip_idx < self.num_skip_weights and skips:
                     lane0, lane1 = self._apply_skip_parallel(lane0, lane1, skips.pop(), skip_idx)
                 lane0, lane1 = self._parallel_block_with_lora(
@@ -1886,6 +1911,17 @@ def _rebank_state_dict(flat_sd, num_layers, model_dim, kv_dim, hidden_dim):
     return sd
 
 
+def _upgrade_parallel_state_dict_compat(state_dict, model):
+    if not isinstance(state_dict, dict):
+        return state_dict
+    for name in ("parallel_post_lambdas", "parallel_resid_lambdas"):
+        if name not in state_dict:
+            target = getattr(model, name, None)
+            if target is not None:
+                state_dict[name] = target.detach().cpu().clone()
+    return state_dict
+
+
 def _compressed_code_size(code):
     code_raw = code.encode("utf-8")
     try:
@@ -1951,6 +1987,7 @@ def deserialize(h, device):
     kv_dim = h.num_kv_heads * head_dim
     hidden_dim = int(h.mlp_mult * h.model_dim)
     deq_state = _rebank_state_dict(deq_flat, h.num_layers, h.model_dim, kv_dim, hidden_dim)
+    deq_state = _upgrade_parallel_state_dict_compat(deq_state, eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
     return eval_model
 
@@ -2671,7 +2708,9 @@ def train_and_eval(h, device):
         log(f"eval_only:loading checkpoint from {h.eval_only_path}")
         base_model = GPT(h).to(device).bfloat16()
         restore_fp32_params(base_model)
-        base_model.load_state_dict(torch.load(h.eval_only_path, map_location=device))
+        eval_state = torch.load(h.eval_only_path, map_location=device)
+        eval_state = _upgrade_parallel_state_dict_compat(eval_state, base_model)
+        base_model.load_state_dict(eval_state)
         if h.num_loops > 0:
             base_model.looping_active = True
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
