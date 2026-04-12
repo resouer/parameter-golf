@@ -792,8 +792,10 @@ class GPT(nn.Module):
             or layer_idx > self.loop_end
         ):
             return None
-        pass_idx = loop_counts.get(layer_idx, 0)
-        loop_counts[layer_idx] = pass_idx + 1
+        loop_span = self.loop_end - self.loop_start + 1
+        visit_idx = loop_counts.get("__loop_visit_count", 0)
+        loop_counts["__loop_visit_count"] = visit_idx + 1
+        pass_idx = visit_idx // loop_span
         if pass_idx >= self.num_loop_passes:
             return None
         return self.loop_pass_attn_vec[pass_idx]
@@ -2075,15 +2077,11 @@ def _find_docs(all_tokens):
 
 def _build_ttt_global_batches(doc_entries, h, ascending=False):
     batch_size = h.ttt_batch_size
-    global_doc_entries = sorted(doc_entries, key=lambda x: x[1][1])
     global_batches = [
-        global_doc_entries[i : i + batch_size]
-        for i in range(0, len(global_doc_entries), batch_size)
+        doc_entries[i : i + batch_size]
+        for i in range(0, len(doc_entries), batch_size)
     ]
-    indexed = list(enumerate(global_batches))
-    if not ascending:
-        indexed.sort(key=lambda ib: -max(dl for _, (_, dl) in ib[1]))
-    return indexed
+    return list(enumerate(global_batches))
 
 
 def _init_batch_counter(path):
