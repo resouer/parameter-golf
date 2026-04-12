@@ -50,7 +50,7 @@ class Hyperparameters:
     loop_end = int(os.environ.get("LOOP_END", 5))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 7))
-    loop_embed_dim = int(os.environ.get("LOOP_EMBED_DIM", 128))
+    loop_embed_dim = int(os.environ.get("LOOP_EMBED_DIM", 512))
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -77,7 +77,7 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 96))
-    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.00015))
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 72))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 2048))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
@@ -1856,6 +1856,24 @@ def _rebank_state_dict(flat_sd, num_layers, model_dim, kv_dim, hidden_dim):
     return sd
 
 
+def _upgrade_loop_embed_state_dict_compat(state_dict, model):
+    if not isinstance(state_dict, dict):
+        return state_dict
+    target = getattr(model, "loop_embed", None)
+    if target is None or "loop_embed.weight" not in state_dict:
+        return state_dict
+    src = state_dict["loop_embed.weight"]
+    dst_shape = tuple(target.weight.shape)
+    if tuple(src.shape) == dst_shape:
+        return state_dict
+    upgraded = target.weight.detach().cpu().clone()
+    rows = min(upgraded.shape[0], src.shape[0])
+    cols = min(upgraded.shape[1], src.shape[1])
+    upgraded[:rows, :cols] = src[:rows, :cols]
+    state_dict["loop_embed.weight"] = upgraded
+    return state_dict
+
+
 def _compressed_code_size(code):
     code_raw = code.encode("utf-8")
     try:
@@ -1871,8 +1889,21 @@ def _compressed_code_size(code):
     return len(code_raw), len(wrapper)
 
 
+_SUBMISSION_BUNDLE_LOADER = (
+    b'import lzma,json,os\n'
+    b'with open(os.path.join(os.path.dirname(__file__),"code.lzma"),"rb") as f:bundle=json.loads(lzma.decompress(f.read()))\n'
+    b'for n,c in bundle.items():open(os.path.join(os.path.dirname(__file__),n),"w").write(c)\n'
+    b'exec(compile(bundle["train_gpt.py"],"train_gpt.py","exec"))\n'
+)
+
+
+def _bundle_submission_code(path):
+    bundle = json.dumps({"train_gpt.py": path.read_text(encoding="utf-8")}, separators=(",", ":")).encode("utf-8")
+    return len(bundle), len(_SUBMISSION_BUNDLE_LOADER) + len(lzma.compress(bundle))
+
+
 def serialize(h, base_model, code):
-    code_bytes_uncompressed, code_bytes = _compressed_code_size(code)
+    code_bytes_uncompressed, code_bytes = _bundle_submission_code(Path(__file__).resolve())
     if h.is_main_process:
         torch.save(base_model.state_dict(), h.model_path)
         model_bytes = os.path.getsize(h.model_path)
@@ -1921,6 +1952,7 @@ def deserialize(h, device):
     kv_dim = h.num_kv_heads * head_dim
     hidden_dim = int(h.mlp_mult * h.model_dim)
     deq_state = _rebank_state_dict(deq_flat, h.num_layers, h.model_dim, kv_dim, hidden_dim)
+    deq_state = _upgrade_loop_embed_state_dict_compat(deq_state, eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
     return eval_model
 
@@ -2641,7 +2673,9 @@ def train_and_eval(h, device):
         log(f"eval_only:loading checkpoint from {h.eval_only_path}")
         base_model = GPT(h).to(device).bfloat16()
         restore_fp32_params(base_model)
-        base_model.load_state_dict(torch.load(h.eval_only_path, map_location=device))
+        eval_state = torch.load(h.eval_only_path, map_location=device)
+        eval_state = _upgrade_loop_embed_state_dict_compat(eval_state, base_model)
+        base_model.load_state_dict(eval_state)
         if h.num_loops > 0:
             base_model.looping_active = True
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
