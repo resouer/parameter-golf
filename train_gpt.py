@@ -77,7 +77,7 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 96))
-    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.000075))
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 72))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 2048))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
