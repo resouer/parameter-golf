@@ -102,6 +102,8 @@ class Hyperparameters:
     embed_bits = int(os.environ.get("EMBED_BITS", 8))
     matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 2e1))
+    mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 12.0))
+    attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1701,7 +1703,14 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough (float16)"
             continue
-        cs = h.embed_clip_sigmas if "tok_emb" in name else h.matrix_clip_sigmas
+        if "tok_emb" in name:
+            cs = h.embed_clip_sigmas
+        elif ".mlp." in name:
+            cs = h.mlp_clip_sigmas
+        elif ".attn." in name:
+            cs = h.attn_clip_sigmas
+        else:
+            cs = h.matrix_clip_sigmas
         bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
         q, s = gptq_quantize_weight(
             t, hessians[name], clip_sigmas=cs, clip_range=2 ** (bits - 1) - 1
