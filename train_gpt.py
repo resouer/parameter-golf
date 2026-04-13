@@ -1654,7 +1654,7 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
     return hessians
 
 
-def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
+def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=64):
     W_orig = w.float().clone()
     rows, cols = W_orig.shape
     H = H.float().clone()
