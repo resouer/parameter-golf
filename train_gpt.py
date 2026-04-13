@@ -811,11 +811,12 @@ class GPT(nn.Module):
         if (
             not self.looping_active
             or self.loop_embed is None
-            or layer_idx != self.loop_start
+            or layer_idx < self.loop_start
+            or layer_idx > self.loop_end
         ):
             return x
-        pass_idx = loop_counts.get(layer_idx, 0)
-        loop_counts[layer_idx] = pass_idx + 1
+        loop_span = self.loop_end - self.loop_start + 1
+        pass_idx = loop_counts.get("_lv", 0) // loop_span
         if pass_idx >= self.num_loop_passes:
             return x
         emb = self.loop_embed.weight[pass_idx].to(dtype=x.dtype)
