@@ -18,7 +18,7 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.667))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.75))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -55,7 +55,7 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.022))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.026))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.97))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -72,8 +72,8 @@ class Hyperparameters:
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     adam_wd = float(os.environ.get("ADAM_WD", 0.02))
     muon_wd = float(os.environ.get("MUON_WD", 0.095))
-    embed_wd = float(os.environ.get("EMBED_WD", 0.095))
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+    embed_wd = float(os.environ.get("EMBED_WD", 0.085))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 96))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
@@ -98,9 +98,11 @@ class Hyperparameters:
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 12.0))
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
-    embed_bits = int(os.environ.get("EMBED_BITS", 8))
+    embed_bits = int(os.environ.get("EMBED_BITS", 7))
     matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))
-    embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 2e1))
+    embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 15.0))
+    mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 12.0))
+    attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1674,7 +1676,14 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough (float16)"
             continue
-        cs = h.embed_clip_sigmas if "tok_emb" in name else h.matrix_clip_sigmas
+        if "tok_emb" in name:
+            cs = h.embed_clip_sigmas
+        elif ".mlp." in name:
+            cs = h.mlp_clip_sigmas
+        elif ".attn." in name:
+            cs = h.attn_clip_sigmas
+        else:
+            cs = h.matrix_clip_sigmas
         bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
         q, s = gptq_quantize_weight(
             t, hessians[name], clip_sigmas=cs, clip_range=2 ** (bits - 1) - 1

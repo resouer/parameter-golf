@@ -9,3 +9,4 @@ datasets
 tiktoken
 sentencepiece
 brotli
+flash-attn-3
