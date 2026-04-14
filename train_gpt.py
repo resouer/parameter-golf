@@ -101,7 +101,7 @@ class Hyperparameters:
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
     embed_bits = int(os.environ.get("EMBED_BITS", 7))
     matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))
-    embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 15.0))
+    embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 14.0))
     mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 12.0))
     attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ

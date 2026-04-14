@@ -60,7 +60,13 @@ LEP_CLI = os.environ.get("PGOLF_LEP_CLI", "lep")
 # ---------------------------------------------------------------------------
 
 def _run(cmd, check=False, timeout=30):
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode("utf-8", "replace")
+        stderr = e.stderr if isinstance(e.stderr, str) else (e.stderr or b"").decode("utf-8", "replace")
+        stderr = (stderr + f"\nTIMEOUT after {timeout}s").strip()
+        r = subprocess.CompletedProcess(cmd, 124, stdout=stdout, stderr=stderr)
     if check and r.returncode != 0:
         raise RuntimeError(f"Command failed: {cmd}\n{r.stderr}")
     return r
