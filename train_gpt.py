@@ -78,6 +78,11 @@ class Hyperparameters:
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 96))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
+    ttt_scalar_qgain_enabled = bool(int(os.environ.get("TTT_SCALAR_QGAIN_ENABLED", "1")))
+    ttt_scalar_qgain_lr = float(os.environ.get("TTT_SCALAR_QGAIN_LR", 0.01))
+    ttt_scalar_qgain_momentum = float(
+        os.environ.get("TTT_SCALAR_QGAIN_MOMENTUM", 0.9)
+    )
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 72))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 2048))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
@@ -964,7 +969,7 @@ class GPT(nn.Module):
             reduction="mean",
         )
 
-    def forward_ttt(self, input_ids, target_ids, lora):
+    def forward_ttt(self, input_ids, target_ids, lora=None, scalar_ttt=None):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
@@ -993,7 +998,7 @@ class GPT(nn.Module):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             pass_mod = self._loop_pass_mod(i, loop_counts)
             x = self._block_with_lora(
-                self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=pass_mod
+                self.blocks[i], x, x0, lora, scalar_ttt, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=pass_mod
             )
             slot += 1
             skips.append(x)
@@ -1021,14 +1026,14 @@ class GPT(nn.Module):
                     lane0 = x
                     lane1 = x.clone()
                     lane0 = self._block_with_lora_attn(
-                        self.blocks[i], lane0, x0, lora, slot, q_w, k_w, v_w, out_w, pass_mod=pass_mod
+                        self.blocks[i], lane0, x0, lora, scalar_ttt, slot, q_w, k_w, v_w, out_w, pass_mod=pass_mod
                     )
                     lane1 = self._block_with_lora_mlp(
                         self.blocks[i], lane1, lora, slot, up_w, down_w, pass_mod=pass_mod
                     )
                 else:
                     x = self._block_with_lora(
-                        self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=pass_mod
+                        self.blocks[i], x, x0, lora, scalar_ttt, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=pass_mod
                     )
             else:
                 if skip_idx < self.num_skip_weights and skips:
@@ -1044,7 +1049,7 @@ class GPT(nn.Module):
                     else:
                         lane0 = lane0 + scaled_skip
                 lane0 = self._block_with_lora_attn(
-                    self.blocks[i], lane0, x0, lora, slot, q_w, k_w, v_w, out_w, pass_mod=pass_mod
+                    self.blocks[i], lane0, x0, lora, scalar_ttt, slot, q_w, k_w, v_w, out_w, pass_mod=pass_mod
                 )
                 lane1 = self._block_with_lora_mlp(
                     self.blocks[i], lane1, lora, slot, up_w, down_w, pass_mod=pass_mod
@@ -1060,78 +1065,87 @@ class GPT(nn.Module):
             logits = F.linear(x, self.tok_emb.weight)
         else:
             logits = self.lm_head(x)
-        logits = logits + lora.lm_head_lora(x)
+        if lora is not None:
+            logits = logits + lora.lm_head_lora(x)
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         bsz, sl, V = logits.shape
         return F.cross_entropy(
             logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
         ).reshape(bsz, sl)
 
-    def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=None):
+    def _block_with_lora(self, block, x, x0, lora, scalar_ttt, slot, q_w, k_w, v_w, out_w, up_w, down_w, pass_mod=None):
         mix, attn_scale, mlp_scale = block._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
-        q = (F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)).reshape(
-            bsz, seqlen, attn.num_heads, attn.head_dim
-        )
+        q = F.linear(n, q_w.to(n.dtype))
+        if lora is not None:
+            q = q + lora.q_loras[slot](n)
+        q = q.reshape(bsz, seqlen, attn.num_heads, attn.head_dim)
         k = F.linear(n, k_w.to(n.dtype))
-        if lora.k_loras is not None:
+        if lora is not None and lora.k_loras is not None:
             k = k + lora.k_loras[slot](n)
         k = k.reshape(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
-        v = (F.linear(n, v_w.to(n.dtype)) + lora.v_loras[slot](n)).reshape(
-            bsz, seqlen, attn.num_kv_heads, attn.head_dim
-        )
+        v = F.linear(n, v_w.to(n.dtype))
+        if lora is not None:
+            v = v + lora.v_loras[slot](n)
+        v = v.reshape(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = attn.rotary(seqlen, n.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
         k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
         q = q * attn.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        if scalar_ttt is not None:
+            q = q * scalar_ttt.q_gain_mul[:, slot].to(dtype=q.dtype)[:, None, :, None]
         y = flash_attn_3_func(q, k, v, causal=True)
         if attn.use_xsa:
             y = attn._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
         attn_out = F.linear(y, out_w.to(n.dtype))
-        if lora.o_loras is not None:
+        if lora is not None and lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
         x_out = x_in + attn_scale[None, None, :] * attn_out
         mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
-        if lora.mlp_loras is not None:
+        if lora is not None and lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
         x_out = x_out + mlp_scale[None, None, :] * mlp_out
         return x_out
 
-    def _block_with_lora_attn(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, pass_mod=None):
+    def _block_with_lora_attn(self, block, x, x0, lora, scalar_ttt, slot, q_w, k_w, v_w, out_w, pass_mod=None):
         mix, attn_scale, _ = block._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
-        q = (F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)).reshape(
-            bsz, seqlen, attn.num_heads, attn.head_dim
-        )
+        q = F.linear(n, q_w.to(n.dtype))
+        if lora is not None:
+            q = q + lora.q_loras[slot](n)
+        q = q.reshape(bsz, seqlen, attn.num_heads, attn.head_dim)
         k = F.linear(n, k_w.to(n.dtype))
-        if lora.k_loras is not None:
+        if lora is not None and lora.k_loras is not None:
             k = k + lora.k_loras[slot](n)
         k = k.reshape(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
-        v = (F.linear(n, v_w.to(n.dtype)) + lora.v_loras[slot](n)).reshape(
-            bsz, seqlen, attn.num_kv_heads, attn.head_dim
-        )
+        v = F.linear(n, v_w.to(n.dtype))
+        if lora is not None:
+            v = v + lora.v_loras[slot](n)
+        v = v.reshape(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = attn.rotary(seqlen, n.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
         k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
         q = q * attn.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        if scalar_ttt is not None:
+            q = q * scalar_ttt.q_gain_mul[:, slot].to(dtype=q.dtype)[:, None, :, None]
         y = flash_attn_3_func(q, k, v, causal=True)
         if attn.use_xsa:
             y = attn._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
         attn_out = F.linear(y, out_w.to(n.dtype))
-        if lora.o_loras is not None:
+        if lora is not None and lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
         return x_in + attn_scale[None, None, :] * attn_out
 
@@ -1213,6 +1227,24 @@ class BatchedTTTLoRA(nn.Module):
                 if loras is not None:
                     for lora in loras:
                         lora.reset()
+
+
+class BatchedTTTQGain(nn.Module):
+    def __init__(self, bsz, model):
+        super().__init__()
+        self.bsz = bsz
+        if getattr(model, "looping_active", False):
+            num_slots = len(model.encoder_indices) + len(model.decoder_indices)
+        else:
+            num_slots = len(model.blocks)
+        num_heads = model.blocks[0].attn.num_heads
+        self.q_gain_mul = nn.Parameter(
+            torch.ones(bsz, num_slots, num_heads, dtype=torch.float32)
+        )
+
+    def reset(self):
+        with torch.no_grad():
+            self.q_gain_mul.fill_(1.0)
 
 
 def classify_param(name):
@@ -2227,9 +2259,15 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
             random.Random(h.seed).sample(range(len(docs)), sample_n)
         )
         doc_entries = [(i, docs[i]) for i in sampled_indices]
-    log(
-        f"ttt_lora:docs:{len(doc_entries)} rank:{h.ttt_lora_rank} lr:{h.ttt_lora_lr} chunk:{h.ttt_chunk_size}"
-    )
+    ttt_mode = "qgain" if h.ttt_scalar_qgain_enabled else "lora"
+    if h.ttt_scalar_qgain_enabled:
+        log(
+            f"ttt_qgain:docs:{len(doc_entries)} lr:{h.ttt_scalar_qgain_lr} chunk:{h.ttt_chunk_size}"
+        )
+    else:
+        log(
+            f"ttt_lora:docs:{len(doc_entries)} rank:{h.ttt_lora_rank} lr:{h.ttt_lora_lr} chunk:{h.ttt_chunk_size}"
+        )
     if os.environ.get("TTT_DEBUG_BYPASS") and h.rank == 0:
         test_doc = doc_entries[0][1]
         ds, dl = test_doc
@@ -2269,24 +2307,34 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     t_start = time.perf_counter()
     local_batch_count = 0
-    reusable_lora = BatchedTTTLoRA(
-        h.ttt_batch_size, base_model, h.ttt_lora_rank,
-        k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
-    ).to(device)
+    if h.ttt_scalar_qgain_enabled:
+        reusable_adapter = BatchedTTTQGain(h.ttt_batch_size, base_model).to(device)
+    else:
+        reusable_adapter = BatchedTTTLoRA(
+            h.ttt_batch_size, base_model, h.ttt_lora_rank,
+            k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
+        ).to(device)
 
-    def _build_opt(lora):
+    def _build_opt(adapter):
+        if h.ttt_scalar_qgain_enabled:
+            return torch.optim.SGD(
+                adapter.parameters(),
+                lr=h.ttt_scalar_qgain_lr,
+                momentum=h.ttt_scalar_qgain_momentum,
+                weight_decay=0.0,
+            )
         if h.ttt_optimizer == "sgd":
             return torch.optim.SGD(
-                lora.parameters(), lr=h.ttt_lora_lr,
+                adapter.parameters(), lr=h.ttt_lora_lr,
                 momentum=h.ttt_beta1, weight_decay=h.ttt_weight_decay,
             )
         return torch.optim.AdamW(
-            lora.parameters(), lr=h.ttt_lora_lr,
+            adapter.parameters(), lr=h.ttt_lora_lr,
             betas=(h.ttt_beta1, h.ttt_beta2),
             eps=1e-10, weight_decay=h.ttt_weight_decay, fused=True,
         )
 
-    reusable_opt = _build_opt(reusable_lora)
+    reusable_opt = _build_opt(reusable_adapter)
     progress_f = None
     if h.ttt_output_dir and h.rank == 0:
         os.makedirs(h.ttt_output_dir, exist_ok=True)
@@ -2302,22 +2350,25 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
         prev_loss = loss_sum.item()
         prev_bytes = byte_sum.item()
         prev_tokens = token_count.item()
-        if bsz == reusable_lora.bsz:
-            reusable_lora.reset()
+        if bsz == reusable_adapter.bsz:
+            reusable_adapter.reset()
             for s in reusable_opt.state.values():
                 for k, v in s.items():
                     if isinstance(v, torch.Tensor):
                         v.zero_()
                     elif k == "step":
                         s[k] = 0
-            cur_lora = reusable_lora
+            cur_adapter = reusable_adapter
             cur_opt = reusable_opt
         else:
-            cur_lora = BatchedTTTLoRA(
-                bsz, base_model, h.ttt_lora_rank,
-                k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
-            ).to(device)
-            cur_opt = _build_opt(cur_lora)
+            if h.ttt_scalar_qgain_enabled:
+                cur_adapter = BatchedTTTQGain(bsz, base_model).to(device)
+            else:
+                cur_adapter = BatchedTTTLoRA(
+                    bsz, base_model, h.ttt_lora_rank,
+                    k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
+                ).to(device)
+            cur_opt = _build_opt(cur_adapter)
         pred_lens = [doc_len - 1 for _, doc_len in batch]
         num_chunks = [(pl + chunk_size - 1) // chunk_size for pl in pred_lens]
         max_nc = max(num_chunks)
@@ -2358,7 +2409,10 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
             y = torch.where(valid, gathered_gpu[:, 1 : context_size + 1], 0)
             ctx_pos = torch.arange(context_size, device=device, dtype=torch.int64)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
+                if h.ttt_scalar_qgain_enabled:
+                    per_tok_loss = forward_ttt_train(x, y, scalar_ttt=cur_adapter)
+                else:
+                    per_tok_loss = forward_ttt_train(x, y, lora=cur_adapter)
             with torch.no_grad():
                 _accumulate_bpb(
                     per_tok_loss,
@@ -2379,7 +2433,10 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
                 for gi in range(h.ttt_grad_steps):
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
+                            if h.ttt_scalar_qgain_enabled:
+                                per_tok_loss = forward_ttt_train(x, y, scalar_ttt=cur_adapter)
+                            else:
+                                per_tok_loss = forward_ttt_train(x, y, lora=cur_adapter)
                     per_doc = per_tok_loss[
                         :, chunk_offset : chunk_offset + chunk_size
                     ].mean(dim=-1)
@@ -2431,7 +2488,7 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
                     }) + "\n"
                 )
                 progress_f.flush()
-        del cur_lora, cur_opt
+        del cur_adapter, cur_opt
     finally:
         if progress_f is not None:
             progress_f.close()
@@ -2770,15 +2827,22 @@ def train_and_eval(h, device):
                 block.attn.rotary._seq_len_cached = 0
                 block.attn.rotary(h.ttt_eval_seq_len, device, torch.bfloat16)
 
-        def _fwd_ttt(input_ids, target_ids, lora):
-            return ttt_model.forward_ttt(input_ids, target_ids, lora=lora)
+        def _fwd_ttt(input_ids, target_ids, lora=None, scalar_ttt=None):
+            return ttt_model.forward_ttt(
+                input_ids, target_ids, lora=lora, scalar_ttt=scalar_ttt
+            )
 
         _ttt_debug_bypass = bool(os.environ.get("TTT_DEBUG_BYPASS"))
         _ttt_compile_warmup = bool(int(os.environ.get("TTT_COMPILE_WARMUP", "0")))
         if _ttt_debug_bypass:
-            def _fwd_ttt_bypass(input_ids, target_ids, lora):
+            def _fwd_ttt_bypass(input_ids, target_ids, lora=None, scalar_ttt=None):
                 logits = ttt_model.forward_logits(input_ids)
-                dummy = lora.q_loras[0].B.sum() * 0
+                if lora is not None:
+                    dummy = lora.q_loras[0].B.sum() * 0
+                elif scalar_ttt is not None:
+                    dummy = scalar_ttt.q_gain_mul.sum() * 0
+                else:
+                    dummy = 0.0
                 logits = logits + dummy
                 bsz, sl, V = logits.shape
                 return F.cross_entropy(
@@ -2796,18 +2860,27 @@ def train_and_eval(h, device):
             t_warmup = time.perf_counter()
             warmup_bszes = [h.ttt_batch_size]
             for bsz in warmup_bszes:
-                wl = BatchedTTTLoRA(
-                    bsz, ttt_model, h.ttt_lora_rank,
-                    k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
-                ).to(device)
-                wo = torch.optim.AdamW(
-                    wl.parameters(),
-                    lr=h.ttt_lora_lr,
-                    betas=(h.ttt_beta1, h.ttt_beta2),
-                    eps=1e-10,
-                    weight_decay=h.ttt_weight_decay,
-                    fused=True,
-                )
+                if h.ttt_scalar_qgain_enabled:
+                    wl = BatchedTTTQGain(bsz, ttt_model).to(device)
+                    wo = torch.optim.SGD(
+                        wl.parameters(),
+                        lr=h.ttt_scalar_qgain_lr,
+                        momentum=h.ttt_scalar_qgain_momentum,
+                        weight_decay=0.0,
+                    )
+                else:
+                    wl = BatchedTTTLoRA(
+                        bsz, ttt_model, h.ttt_lora_rank,
+                        k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
+                    ).to(device)
+                    wo = torch.optim.AdamW(
+                        wl.parameters(),
+                        lr=h.ttt_lora_lr,
+                        betas=(h.ttt_beta1, h.ttt_beta2),
+                        eps=1e-10,
+                        weight_decay=h.ttt_weight_decay,
+                        fused=True,
+                    )
                 for ctx_len in (h.ttt_chunk_size, h.ttt_eval_seq_len):
                     row_w = (
                         torch.arange(ctx_len + 1, device=device, dtype=torch.int64)
@@ -2816,7 +2889,10 @@ def train_and_eval(h, device):
                     xw = row_w[:ctx_len].unsqueeze(0).expand(bsz, -1).contiguous()
                     yw = row_w[1 : ctx_len + 1].unsqueeze(0).expand(bsz, -1).contiguous()
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        ptl = fwd_ttt_compiled(xw, yw, lora=wl)
+                        if h.ttt_scalar_qgain_enabled:
+                            ptl = fwd_ttt_compiled(xw, yw, scalar_ttt=wl)
+                        else:
+                            ptl = fwd_ttt_compiled(xw, yw, lora=wl)
                     ptl[:, : min(h.ttt_chunk_size, ctx_len)].mean(dim=-1).sum().backward()
                     wo.step()
                     wo.zero_grad(set_to_none=True)

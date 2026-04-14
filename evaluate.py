@@ -645,10 +645,26 @@ def main():
 
         time.sleep(30)
     else:
-        _log(f"Timeout after {args.timeout}s, stopping job")
-        _stop_job_safe(job_id)
+        _log(f"Timeout after {args.timeout}s, attempting final status + log capture before stopping")
+        final_status = _get_job_status(job_name, job_id)
+        try:
+            _robust_log_capture(job_id, log_file)
+        except Exception:
+            pass
         log_thread.join(timeout=5)
-        _output(False, error=f"job timeout after {args.timeout}s")
+        if os.path.exists(log_file):
+            with open(log_file) as f:
+                timeout_log_content = f.read()
+            timeout_results = _extract_results(timeout_log_content)
+            if timeout_results.get("val_bpb") is not None:
+                status = "completed" if final_status == "unknown" else final_status
+            else:
+                status = final_status
+        else:
+            status = final_status
+        if status not in ("completed", "failed", "stopped"):
+            _stop_job_safe(job_id)
+            _output(False, error=f"job timeout after {args.timeout}s")
 
     # 5. Parse results from log
     if not os.path.exists(log_file):
@@ -734,6 +750,9 @@ def _run_seed(seed, commit, node_group, timeout):
         r = _extract_results(log_content)
         val_bpb = r.get("val_bpb")
         bytes_total = r.get("bytes_total", 0)
+        if status == "timeout" and val_bpb is not None:
+            final_status = _get_job_status(job_name, job_id)
+            status = "completed" if final_status == "unknown" else final_status
 
     _log(f"[seed-{seed}] DONE: val_bpb={val_bpb}, bytes={bytes_total}, status={status}")
     return {
