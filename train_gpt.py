@@ -1152,7 +1152,7 @@ class GPT(nn.Module):
     def _block_with_lora_mlp(self, block, x, lora, slot, up_w, down_w, pass_mod=None):
         mlp_n = block.mlp_norm(x) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
-        if lora.mlp_loras is not None:
+        if lora is not None and lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
         _, _, mlp_scale = block._pass_modulated_controls(x.dtype, pass_mod=pass_mod)
         return x + mlp_scale[None, None, :] * mlp_out
