@@ -1,4 +1,4 @@
-import base64, collections, copy, fcntl, glob, io, json, lzma, math, os
+import base64, collections, copy, fcntl, glob, io, json, lzma, math, os, struct
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import nn
@@ -1788,8 +1788,12 @@ def _byte_unshuffle(data):
     return out.tobytes()
 
 
-def _compress(data, compressor):
-    data = _byte_shuffle(data)
+_SPLIT_STREAM_MAGIC = b"PGSS1"
+
+
+def _compress(data, compressor, *, shuffle=True):
+    if shuffle:
+        data = _byte_shuffle(data)
     if compressor == "lzma":
         return lzma.compress(data, preset=6)
     elif compressor == "brotli":
@@ -1799,7 +1803,7 @@ def _compress(data, compressor):
     raise ValueError(f"Unknown compressor: {compressor!r}")
 
 
-def _decompress(data, compressor):
+def _decompress(data, compressor, *, shuffle=True):
     if compressor == "lzma":
         raw = lzma.decompress(data)
     elif compressor == "brotli":
@@ -1808,8 +1812,46 @@ def _decompress(data, compressor):
         raw = brotli.decompress(data)
     else:
         raise ValueError(f"Unknown compressor: {compressor!r}")
-    raw = _byte_unshuffle(raw)
+    if shuffle:
+        raw = _byte_unshuffle(raw)
     return raw
+
+
+def _pack_split_streams(streams):
+    header = []
+    payload = bytearray()
+    for name, codec, shuffle, blob in streams:
+        header.append(
+            {
+                "name": name,
+                "codec": codec,
+                "shuffle": bool(shuffle),
+                "len": len(blob),
+            }
+        )
+        payload.extend(blob)
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    return _SPLIT_STREAM_MAGIC + struct.pack("<I", len(header_bytes)) + header_bytes + payload
+
+
+def _unpack_split_streams(blob):
+    if len(blob) < 9 or blob[:5] != _SPLIT_STREAM_MAGIC:
+        return None
+    header_len = struct.unpack("<I", blob[5:9])[0]
+    header_bytes = blob[9 : 9 + header_len]
+    header = json.loads(header_bytes.decode("utf-8"))
+    payload = blob[9 + header_len :]
+    streams = {}
+    off = 0
+    for item in header:
+        n = item["len"]
+        streams[item["name"]] = {
+            "codec": item["codec"],
+            "shuffle": item["shuffle"],
+            "blob": payload[off : off + n],
+        }
+        off += n
+    return streams
 
 
 def _unbank_state_dict(state_dict, num_layers):
@@ -1933,17 +1975,38 @@ def serialize(h, base_model, code):
     )
     log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter()-t0:.1f}s")
     quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, h)
-    quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = _compress(quant_raw, h.compressor)
+    q_only = {}
+    scale_only = {}
+    passthrough_only = {}
+    for name, tensor in quant_result.items():
+        if name.endswith(".q"):
+            q_only[name] = tensor
+        elif name.endswith(".scale"):
+            scale_only[name] = tensor
+        else:
+            passthrough_only[name] = tensor
+    q_buf = io.BytesIO()
+    torch.save(q_only, q_buf)
+    scale_buf = io.BytesIO()
+    torch.save(scale_only, scale_buf)
+    passthrough_buf = io.BytesIO()
+    torch.save(passthrough_only, passthrough_buf)
+    meta_blob = json.dumps(quant_meta, separators=(",", ":")).encode("utf-8")
+    quant_blob = _pack_split_streams(
+        [
+            ("q", "brotli", True, _compress(q_buf.getvalue(), "brotli", shuffle=True)),
+            ("s", "lzma", True, _compress(scale_buf.getvalue(), "lzma", shuffle=True)),
+            ("p", "lzma", True, _compress(passthrough_buf.getvalue(), "lzma", shuffle=True)),
+            ("m", "lzma", False, _compress(meta_blob, "lzma", shuffle=False)),
+        ]
+    )
     quant_file_bytes = len(quant_blob)
     bytes_total = quant_file_bytes + code_bytes
     if h.is_main_process:
         with open(h.quantized_model_path, "wb") as f:
             f.write(quant_blob)
-        log(f"Serialized model quantized+{h.compressor}: {quant_file_bytes} bytes")
-        log(f"Total submission size quantized+{h.compressor}: {bytes_total} bytes")
+        log(f"Serialized model split-stream quantized: {quant_file_bytes} bytes")
+        log(f"Total submission size split-stream quantized: {bytes_total} bytes")
     return bytes_total, quant_file_bytes
 
 
@@ -1953,10 +2016,56 @@ def deserialize(h, device):
     flat_template = _unbank_state_dict(eval_model.state_dict(), h.num_layers)
     with open(h.quantized_model_path, "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(
-        io.BytesIO(_decompress(quant_blob_disk, h.compressor)), map_location="cpu"
-    )
-    deq_flat = dequantize_mixed(quant_state["w"], quant_state["m"], flat_template)
+    split_streams = _unpack_split_streams(quant_blob_disk)
+    if split_streams is None:
+        quant_state = torch.load(
+            io.BytesIO(_decompress(quant_blob_disk, h.compressor)), map_location="cpu"
+        )
+        quant_result = quant_state["w"]
+        quant_meta = quant_state["m"]
+    else:
+        q_only = torch.load(
+            io.BytesIO(
+                _decompress(
+                    split_streams["q"]["blob"],
+                    split_streams["q"]["codec"],
+                    shuffle=split_streams["q"]["shuffle"],
+                )
+            ),
+            map_location="cpu",
+        )
+        scale_only = torch.load(
+            io.BytesIO(
+                _decompress(
+                    split_streams["s"]["blob"],
+                    split_streams["s"]["codec"],
+                    shuffle=split_streams["s"]["shuffle"],
+                )
+            ),
+            map_location="cpu",
+        )
+        passthrough_only = torch.load(
+            io.BytesIO(
+                _decompress(
+                    split_streams["p"]["blob"],
+                    split_streams["p"]["codec"],
+                    shuffle=split_streams["p"]["shuffle"],
+                )
+            ),
+            map_location="cpu",
+        )
+        quant_meta = json.loads(
+            _decompress(
+                split_streams["m"]["blob"],
+                split_streams["m"]["codec"],
+                shuffle=split_streams["m"]["shuffle"],
+            ).decode("utf-8")
+        )
+        quant_result = {}
+        quant_result.update(q_only)
+        quant_result.update(scale_only)
+        quant_result.update(passthrough_only)
+    deq_flat = dequantize_mixed(quant_result, quant_meta, flat_template)
     head_dim = h.model_dim // h.num_heads
     kv_dim = h.num_kv_heads * head_dim
     hidden_dim = int(h.mlp_mult * h.model_dim)
