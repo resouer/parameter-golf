@@ -1,4 +1,4 @@
-import base64, collections, copy, fcntl, glob, io, json, lzma, math, os
+import base64, collections, copy, fcntl, glob, io, json, lzma, math, os, unicodedata
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import nn
@@ -95,6 +95,11 @@ class Hyperparameters:
     etlb_lr = float(os.environ.get("ETLB_LR", 0.05))
     etlb_steps = int(os.environ.get("ETLB_STEPS", 5))
     etlb_clip = float(os.environ.get("ETLB_CLIP", 3.0))
+    prefix_class_bias_enabled = bool(int(os.environ.get("PREFIX_CLASS_BIAS_ENABLED", "1")))
+    prefix_class_bias_scale = float(os.environ.get("PREFIX_CLASS_BIAS_SCALE", 0.12))
+    prefix_class_bias_pseudocount = float(
+        os.environ.get("PREFIX_CLASS_BIAS_PSEUDOCOUNT", 0.5)
+    )
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 12.0))
@@ -168,6 +173,13 @@ class ValidationData:
             self.has_leading_space_lut,
             self.is_boundary_token_lut,
         ) = build_sentencepiece_luts(self.sp, h.vocab_size, device)
+        (
+            self.prefix_context_class_lut,
+            self.prefix_target_class_lut,
+            self.prefix_target_class_mask,
+        ) = build_prefix_class_luts(
+            self.sp, h.vocab_size, self.has_leading_space_lut, self.is_boundary_token_lut, device
+        )
 
 
 def build_sentencepiece_luts(sp, vocab_size, device):
@@ -195,6 +207,44 @@ def build_sentencepiece_luts(sp, vocab_size, device):
         torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
+    )
+
+
+def build_prefix_class_luts(
+    sp, vocab_size, has_leading_space_lut, is_boundary_token_lut, device
+):
+    sp_vocab_size = int(sp.vocab_size())
+    table_size = max(sp_vocab_size, vocab_size)
+    context_cls_np = np.zeros((table_size,), dtype=np.int16)
+    target_cls_np = np.zeros((table_size,), dtype=np.int16)
+    target_mask_np = np.zeros((2, table_size), dtype=np.bool_)
+    punctuation_like = np.zeros((table_size,), dtype=np.bool_)
+    for token_id in range(sp_vocab_size):
+        if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
+            continue
+        if sp.is_byte(token_id):
+            piece = ""
+        else:
+            piece = sp.id_to_piece(token_id)
+            if piece.startswith("▁"):
+                piece = piece[1:]
+        if piece:
+            punctuation_like[token_id] = all(
+                unicodedata.category(ch).startswith("P") for ch in piece
+            )
+    has_ls_np = has_leading_space_lut.cpu().numpy()
+    is_boundary_np = is_boundary_token_lut.cpu().numpy()
+    # target classes: 0 = other/continuation, 1 = word-start
+    target_cls_np[has_ls_np] = 1
+    target_mask_np[0, :] = target_cls_np == 0
+    target_mask_np[1, :] = target_cls_np == 1
+    # context classes: 0 = continuation/default, 1 = word-start, 2 = boundaryish
+    context_cls_np[has_ls_np] = 1
+    context_cls_np[is_boundary_np | punctuation_like] = 2
+    return (
+        torch.tensor(context_cls_np, dtype=torch.int16, device=device),
+        torch.tensor(target_cls_np, dtype=torch.int16, device=device),
+        torch.tensor(target_mask_np, dtype=torch.bool, device=device),
     )
 
 
@@ -964,7 +1014,7 @@ class GPT(nn.Module):
             reduction="mean",
         )
 
-    def forward_ttt(self, input_ids, target_ids, lora):
+    def forward_ttt_logits(self, input_ids, lora):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
@@ -1062,6 +1112,12 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
         logits = logits + lora.lm_head_lora(x)
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return logits
+
+    def forward_ttt(self, input_ids, target_ids, lora, return_logits=False):
+        logits = self.forward_ttt_logits(input_ids, lora)
+        if return_logits:
+            return logits
         bsz, sl, V = logits.shape
         return F.cross_entropy(
             logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
@@ -2210,6 +2266,69 @@ def _accumulate_bpb(
     byte_sum += (tok_bytes * mask_f64).sum()
     token_count += chunk_lens.to(torch.float64).sum()
 
+
+def _prefix_class_scored_nll(
+    logits,
+    x,
+    y,
+    class_counts,
+    context_class_lut,
+    target_class_lut,
+    target_class_mask,
+    bias_scale,
+):
+    if bias_scale <= 0:
+        bsz, sl, vocab = logits.shape
+        return F.cross_entropy(
+            logits.float().reshape(-1, vocab),
+            y.reshape(-1),
+            reduction="none",
+        ).reshape(bsz, sl)
+    logits_f = logits.float()
+    bsz, sl, vocab = logits_f.shape
+    ctx_cls = context_class_lut[x].long()
+    tgt_cls = target_class_lut[y].long()
+    probs = class_counts / class_counts.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    bias_table = bias_scale * torch.log(probs.clamp_min(1e-6))
+    pos_bias = bias_table[torch.arange(bsz, device=logits.device)[:, None], ctx_cls]
+    target_logits = logits_f.gather(-1, y.unsqueeze(-1)).squeeze(-1)
+    denom_terms = []
+    for cls_idx in range(target_class_mask.size(0)):
+        mask = target_class_mask[cls_idx, :vocab].view(1, 1, vocab)
+        cls_lse = torch.logsumexp(logits_f.masked_fill(~mask, float("-inf")), dim=-1)
+        denom_terms.append(cls_lse + pos_bias[..., cls_idx])
+    biased_log_denom = torch.logsumexp(torch.stack(denom_terms, dim=-1), dim=-1)
+    target_bias = pos_bias.gather(-1, tgt_cls.unsqueeze(-1)).squeeze(-1)
+    return -target_logits - target_bias + biased_log_denom
+
+
+def _update_prefix_class_counts(
+    class_counts,
+    x,
+    y,
+    valid,
+    chunk_offsets,
+    chunk_lens,
+    context_class_lut,
+    target_class_lut,
+):
+    pos = torch.arange(x.size(1), device=x.device, dtype=torch.int64).unsqueeze(0)
+    chunk_mask = (
+        (chunk_lens.unsqueeze(1) > 0)
+        & (pos >= chunk_offsets.unsqueeze(1))
+        & (pos < (chunk_offsets + chunk_lens).unsqueeze(1))
+        & valid
+    )
+    ctx_cls = context_class_lut[x].long()
+    tgt_cls = target_class_lut[y].long()
+    for ctx_idx in range(class_counts.size(1)):
+        ctx_mask = chunk_mask & (ctx_cls == ctx_idx)
+        if not ctx_mask.any():
+            continue
+        for tgt_idx in range(class_counts.size(2)):
+            hits = (ctx_mask & (tgt_cls == tgt_idx)).sum(dim=1).to(torch.float32)
+            class_counts[:, ctx_idx, tgt_idx] += hits
+
 def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
     global BOS_ID
     if BOS_ID is None:
@@ -2273,6 +2392,12 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
         h.ttt_batch_size, base_model, h.ttt_lora_rank,
         k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
     ).to(device)
+    reusable_class_counts = torch.full(
+        (h.ttt_batch_size, 3, 2),
+        h.prefix_class_bias_pseudocount,
+        device=device,
+        dtype=torch.float32,
+    )
 
     def _build_opt(lora):
         if h.ttt_optimizer == "sgd":
@@ -2312,12 +2437,20 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
                         s[k] = 0
             cur_lora = reusable_lora
             cur_opt = reusable_opt
+            reusable_class_counts.fill_(h.prefix_class_bias_pseudocount)
+            cur_class_counts = reusable_class_counts
         else:
             cur_lora = BatchedTTTLoRA(
                 bsz, base_model, h.ttt_lora_rank,
                 k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
             ).to(device)
             cur_opt = _build_opt(cur_lora)
+            cur_class_counts = torch.full(
+                (bsz, 3, 2),
+                h.prefix_class_bias_pseudocount,
+                device=device,
+                dtype=torch.float32,
+            )
         pred_lens = [doc_len - 1 for _, doc_len in batch]
         num_chunks = [(pl + chunk_size - 1) // chunk_size for pl in pred_lens]
         max_nc = max(num_chunks)
@@ -2358,10 +2491,27 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
             y = torch.where(valid, gathered_gpu[:, 1 : context_size + 1], 0)
             ctx_pos = torch.arange(context_size, device=device, dtype=torch.int64)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
+                logits = forward_ttt_train(x, y, lora=cur_lora, return_logits=True)
+            bsz_logits, sl_logits, vocab_logits = logits.shape
+            per_tok_loss = F.cross_entropy(
+                logits.float().reshape(-1, vocab_logits),
+                y.reshape(-1),
+                reduction="none",
+            ).reshape(bsz_logits, sl_logits)
+            with torch.no_grad():
+                scored_per_tok_loss = _prefix_class_scored_nll(
+                    logits,
+                    x,
+                    y,
+                    cur_class_counts,
+                    val_data.prefix_context_class_lut,
+                    val_data.prefix_target_class_lut,
+                    val_data.prefix_target_class_mask,
+                    h.prefix_class_bias_scale if h.prefix_class_bias_enabled else 0.0,
+                )
             with torch.no_grad():
                 _accumulate_bpb(
-                    per_tok_loss,
+                    scored_per_tok_loss,
                     x,
                     y,
                     chunk_offsets,
@@ -2379,15 +2529,29 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
                 for gi in range(h.ttt_grad_steps):
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
+                            logits = forward_ttt_train(x, y, lora=cur_lora, return_logits=True)
+                        per_tok_loss = F.cross_entropy(
+                            logits.float().reshape(-1, vocab_logits),
+                            y.reshape(-1),
+                            reduction="none",
+                        ).reshape(bsz_logits, sl_logits)
                     per_doc = per_tok_loss[
                         :, chunk_offset : chunk_offset + chunk_size
                     ].mean(dim=-1)
                     cur_opt.zero_grad(set_to_none=True)
                     (per_doc * activate_chunk_mask).sum().backward()
                     cur_opt.step()
-            else:
-                del per_tok_loss
+            _update_prefix_class_counts(
+                cur_class_counts,
+                x,
+                y,
+                valid,
+                chunk_offsets,
+                chunk_lens,
+                val_data.prefix_context_class_lut,
+                val_data.prefix_target_class_lut,
+            )
+            del per_tok_loss, scored_per_tok_loss, logits
         local_batch_count += 1
         batch_num = orig_batch_idx + 1
         doc_lens = [dl for _, dl in batch]
@@ -2431,7 +2595,7 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
                     }) + "\n"
                 )
                 progress_f.flush()
-        del cur_lora, cur_opt
+        del cur_lora, cur_opt, cur_class_counts
     finally:
         if progress_f is not None:
             progress_f.close()
@@ -2770,8 +2934,10 @@ def train_and_eval(h, device):
                 block.attn.rotary._seq_len_cached = 0
                 block.attn.rotary(h.ttt_eval_seq_len, device, torch.bfloat16)
 
-        def _fwd_ttt(input_ids, target_ids, lora):
-            return ttt_model.forward_ttt(input_ids, target_ids, lora=lora)
+        def _fwd_ttt(input_ids, target_ids, lora, return_logits=False):
+            return ttt_model.forward_ttt(
+                input_ids, target_ids, lora=lora, return_logits=return_logits
+            )
 
         _ttt_debug_bypass = bool(os.environ.get("TTT_DEBUG_BYPASS"))
         _ttt_compile_warmup = bool(int(os.environ.get("TTT_COMPILE_WARMUP", "0")))
