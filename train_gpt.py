@@ -96,7 +96,7 @@ class Hyperparameters:
     etlb_steps = int(os.environ.get("ETLB_STEPS", 5))
     etlb_clip = float(os.environ.get("ETLB_CLIP", 3.0))
     prefix_class_bias_enabled = bool(int(os.environ.get("PREFIX_CLASS_BIAS_ENABLED", "1")))
-    prefix_class_bias_scale = float(os.environ.get("PREFIX_CLASS_BIAS_SCALE", 0.12))
+    prefix_class_bias_scale = float(os.environ.get("PREFIX_CLASS_BIAS_SCALE", 0.11))
     prefix_class_bias_pseudocount = float(
         os.environ.get("PREFIX_CLASS_BIAS_PSEUDOCOUNT", 0.5)
     )
