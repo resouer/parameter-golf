@@ -104,6 +104,14 @@ class Hyperparameters:
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 14.0))
     mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 12.0))
     attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
+    ngram_doc_expert_enabled = bool(int(os.environ.get("NGRAM_DOC_EXPERT_ENABLED", "1")))
+    ngram_order = int(os.environ.get("NGRAM_ORDER", 6))
+    ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", 2))
+    ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", 131072))
+    ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", 2))
+    ngram_alpha_base = float(os.environ.get("NGRAM_ALPHA_BASE", 0.04))
+    ngram_alpha_range = float(os.environ.get("NGRAM_ALPHA_RANGE", 0.16))
+    ngram_alpha_center = float(os.environ.get("NGRAM_ALPHA_CENTER", 4.0))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -964,7 +972,7 @@ class GPT(nn.Module):
             reduction="mean",
         )
 
-    def forward_ttt(self, input_ids, target_ids, lora):
+    def forward_ttt_logits(self, input_ids, lora):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
@@ -1061,7 +1069,12 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits + lora.lm_head_lora(x)
-        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+
+    def forward_ttt(self, input_ids, target_ids, lora, return_logits=False):
+        logits = self.forward_ttt_logits(input_ids, lora)
+        if return_logits:
+            return logits
         bsz, sl, V = logits.shape
         return F.cross_entropy(
             logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
@@ -1972,6 +1985,122 @@ def _loss_bpb(loss_sum, token_count, byte_count):
     return val_loss, val_bpb
 
 
+NGRAM_PRIMES = np.array(
+    [
+        np.uint64(36313),
+        np.uint64(27191),
+        np.uint64(51647),
+        np.uint64(81929),
+        np.uint64(131071),
+        np.uint64(65537),
+        np.uint64(104729),
+        np.uint64(49157),
+    ],
+    dtype=np.uint64,
+)
+
+
+class StrictDocBackoffMixer:
+    """Per-document strict-causal backoff expert.
+
+    The state resets per document batch, so score-time behavior stays doc-local
+    and does not depend on any global validation reordering.
+    """
+
+    def __init__(
+        self,
+        batch_size,
+        *,
+        num_buckets,
+        max_order,
+        min_order,
+        min_count,
+        alpha_base,
+        alpha_range,
+        alpha_center,
+    ):
+        if num_buckets <= 0 or (num_buckets & (num_buckets - 1)) != 0:
+            raise ValueError(f"NGRAM_BUCKETS must be a positive power of two, got {num_buckets}")
+        if min_order < 2 or max_order < min_order:
+            raise ValueError(f"Invalid n-gram order range: min={min_order} max={max_order}")
+        self.batch_size = batch_size
+        self.max_order = max_order
+        self.min_order = min_order
+        self.min_count = float(min_count)
+        self.alpha_base = alpha_base
+        self.alpha_range = alpha_range
+        self.alpha_center = alpha_center
+        self.mask = np.uint64(num_buckets - 1)
+        self.tables_dtype = np.uint16
+        self.max_count = np.iinfo(self.tables_dtype).max
+        n_orders = max_order - min_order + 1
+        shape = (batch_size, n_orders, num_buckets)
+        self.ctx_tables = np.zeros(shape, dtype=self.tables_dtype)
+        self.full_tables = np.zeros(shape, dtype=self.tables_dtype)
+
+    def reset(self):
+        self.ctx_tables.fill(0)
+        self.full_tables.fill(0)
+
+    def score_chunk(self, doc_idx, doc_tokens, target_positions, neural_target_probs, entropy):
+        mixed = neural_target_probs.copy()
+        mixed_mask = np.zeros(len(neural_target_probs), dtype=bool)
+        key_cache = []
+        for order in range(self.max_order, self.min_order - 1, -1):
+            oi = order - self.min_order
+            ctx_width = order - 1
+            valid = target_positions >= ctx_width
+            valid_idx = np.nonzero(valid)[0]
+            if len(valid_idx) == 0:
+                key_cache.append((oi, np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)))
+                continue
+            pos = target_positions[valid_idx]
+            ctx_hash = np.zeros(len(pos), dtype=np.uint64)
+            for k in range(ctx_width):
+                tok = doc_tokens[pos - ctx_width + k].astype(np.uint64)
+                ctx_hash ^= tok * NGRAM_PRIMES[k % len(NGRAM_PRIMES)]
+            ctx_key = (ctx_hash & self.mask).astype(np.int64)
+            tgt = doc_tokens[pos].astype(np.uint64)
+            full_key = (
+                (ctx_hash ^ (tgt * NGRAM_PRIMES[ctx_width % len(NGRAM_PRIMES)])) & self.mask
+            ).astype(np.int64)
+            key_cache.append((oi, ctx_key, full_key))
+            unmixed_idx = valid_idx[~mixed_mask[valid_idx]]
+            if len(unmixed_idx) == 0:
+                continue
+            local_keep = ~mixed_mask[valid_idx]
+            local_ctx = self.ctx_tables[doc_idx, oi, ctx_key[local_keep]].astype(np.float64)
+            can_mix = local_ctx >= self.min_count
+            if not can_mix.any():
+                continue
+            mix_idx = unmixed_idx[can_mix]
+            local_full = self.full_tables[doc_idx, oi, full_key[local_keep][can_mix]].astype(np.float64)
+            p_ng = np.minimum(local_full, local_ctx[can_mix]) / np.maximum(local_ctx[can_mix], 1.0)
+            p_ng = np.clip(p_ng, 0.0, 1.0)
+            alpha = self.alpha_base + self.alpha_range / (
+                1.0 + np.exp(-2.0 * (entropy[mix_idx] - self.alpha_center))
+            )
+            alpha = np.clip(alpha, 0.0, 0.95)
+            mixed[mix_idx] = (1.0 - alpha) * mixed[mix_idx] + alpha * p_ng
+            mixed_mask[mix_idx] = True
+        self._update_doc(doc_idx, key_cache)
+        return mixed
+
+    def _update_doc(self, doc_idx, key_cache):
+        for oi, ctx_key, full_key in key_cache:
+            if len(ctx_key) > 0:
+                self._sparse_accumulate_counts(self.ctx_tables[doc_idx, oi], ctx_key)
+            if len(full_key) > 0:
+                self._sparse_accumulate_counts(self.full_tables[doc_idx, oi], full_key)
+
+    def _sparse_accumulate_counts(self, table, keys):
+        uniq, counts = np.unique(keys, return_counts=True)
+        idx = uniq.astype(np.intp, copy=False)
+        updated = table[idx].astype(np.uint32) + counts.astype(np.uint32, copy=False)
+        np.minimum(updated, self.max_count, out=updated)
+        table[idx] = updated.astype(self.tables_dtype, copy=False)
+
+
 def eval_val(h, device, val_data, model, forward_logits_fn=None):
     seq_len = h.eval_seq_len
     local_batch_tokens = h.val_batch_tokens // (h.world_size * h.grad_accum_steps)
@@ -2230,6 +2359,12 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
     log(
         f"ttt_lora:docs:{len(doc_entries)} rank:{h.ttt_lora_rank} lr:{h.ttt_lora_lr} chunk:{h.ttt_chunk_size}"
     )
+    if h.ngram_doc_expert_enabled:
+        log(
+            "ngram_doc_expert:"
+            f"order:{h.ngram_min_order}-{h.ngram_order} buckets:{h.ngram_buckets} "
+            f"min_count:{h.ngram_min_count} alpha:{h.ngram_alpha_base}+{h.ngram_alpha_range}"
+        )
     if os.environ.get("TTT_DEBUG_BYPASS") and h.rank == 0:
         test_doc = doc_entries[0][1]
         ds, dl = test_doc
@@ -2269,10 +2404,25 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     t_start = time.perf_counter()
     local_batch_count = 0
+    all_tokens_np = all_tokens_idx.numpy()
     reusable_lora = BatchedTTTLoRA(
         h.ttt_batch_size, base_model, h.ttt_lora_rank,
         k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
     ).to(device)
+    reusable_ngram = (
+        StrictDocBackoffMixer(
+            h.ttt_batch_size,
+            num_buckets=h.ngram_buckets,
+            max_order=h.ngram_order,
+            min_order=h.ngram_min_order,
+            min_count=h.ngram_min_count,
+            alpha_base=h.ngram_alpha_base,
+            alpha_range=h.ngram_alpha_range,
+            alpha_center=h.ngram_alpha_center,
+        )
+        if h.ngram_doc_expert_enabled
+        else None
+    )
 
     def _build_opt(lora):
         if h.ttt_optimizer == "sgd":
@@ -2304,6 +2454,8 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
         prev_tokens = token_count.item()
         if bsz == reusable_lora.bsz:
             reusable_lora.reset()
+            if reusable_ngram is not None:
+                reusable_ngram.reset()
             for s in reusable_opt.state.values():
                 for k, v in s.items():
                     if isinstance(v, torch.Tensor):
@@ -2312,12 +2464,28 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
                         s[k] = 0
             cur_lora = reusable_lora
             cur_opt = reusable_opt
+            cur_ngram = reusable_ngram
         else:
             cur_lora = BatchedTTTLoRA(
                 bsz, base_model, h.ttt_lora_rank,
                 k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
             ).to(device)
             cur_opt = _build_opt(cur_lora)
+            cur_ngram = (
+                StrictDocBackoffMixer(
+                    bsz,
+                    num_buckets=h.ngram_buckets,
+                    max_order=h.ngram_order,
+                    min_order=h.ngram_min_order,
+                    min_count=h.ngram_min_count,
+                    alpha_base=h.ngram_alpha_base,
+                    alpha_range=h.ngram_alpha_range,
+                    alpha_center=h.ngram_alpha_center,
+                )
+                if h.ngram_doc_expert_enabled
+                else None
+            )
+        doc_token_views = [all_tokens_np[doc_start : doc_start + doc_len] for doc_start, doc_len in batch]
         pred_lens = [doc_len - 1 for _, doc_len in batch]
         num_chunks = [(pl + chunk_size - 1) // chunk_size for pl in pred_lens]
         max_nc = max(num_chunks)
@@ -2358,10 +2526,66 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
             y = torch.where(valid, gathered_gpu[:, 1 : context_size + 1], 0)
             ctx_pos = torch.arange(context_size, device=device, dtype=torch.int64)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
+                logits = forward_ttt_train(
+                    x,
+                    y,
+                    lora=cur_lora,
+                    return_logits=h.ngram_doc_expert_enabled,
+                )
+            if h.ngram_doc_expert_enabled:
+                bsz_logits, sl_logits, vocab_logits = logits.shape
+                per_tok_loss = F.cross_entropy(
+                    logits.float().reshape(-1, vocab_logits),
+                    y.reshape(-1),
+                    reduction="none",
+                ).reshape(bsz_logits, sl_logits)
+                scored_per_tok_loss = per_tok_loss.detach().clone()
+                chunk_logits = logits[:, chunk_offset : chunk_offset + chunk_size].float()
+                chunk_targets = y[:, chunk_offset : chunk_offset + chunk_size]
+                with torch.no_grad():
+                    chunk_log_probs = F.log_softmax(chunk_logits, dim=-1)
+                    chunk_probs = chunk_log_probs.exp()
+                    target_prob_np = (
+                        chunk_probs.gather(-1, chunk_targets.unsqueeze(-1))
+                        .squeeze(-1)
+                        .to(torch.float64)
+                        .cpu()
+                        .numpy()
+                    )
+                    entropy_np = (
+                        -(chunk_probs * chunk_log_probs).sum(dim=-1)
+                        .to(torch.float64)
+                        .cpu()
+                        .numpy()
+                    )
+                    for b in range(bsz):
+                        chunk_len = int(chunk_lens_cpu[b].item())
+                        if chunk_len <= 0:
+                            continue
+                        target_positions = np.arange(
+                            ci * chunk_size + 1,
+                            ci * chunk_size + chunk_len + 1,
+                            dtype=np.int64,
+                        )
+                        mixed_probs = cur_ngram.score_chunk(
+                            b,
+                            doc_token_views[b],
+                            target_positions,
+                            target_prob_np[b, :chunk_len],
+                            entropy_np[b, :chunk_len],
+                        )
+                        mixed_nll = -np.log(np.clip(mixed_probs, 1e-9, 1.0))
+                        scored_per_tok_loss[
+                            b, chunk_offset : chunk_offset + chunk_len
+                        ] = torch.from_numpy(mixed_nll).to(
+                            device=device, dtype=per_tok_loss.dtype
+                        )
+            else:
+                per_tok_loss = logits
+                scored_per_tok_loss = per_tok_loss
             with torch.no_grad():
                 _accumulate_bpb(
-                    per_tok_loss,
+                    scored_per_tok_loss,
                     x,
                     y,
                     chunk_offsets,
@@ -2386,8 +2610,11 @@ def eval_val_ttt_lora(h, base_model, device, val_data, forward_ttt_train):
                     cur_opt.zero_grad(set_to_none=True)
                     (per_doc * activate_chunk_mask).sum().backward()
                     cur_opt.step()
+            if h.ngram_doc_expert_enabled:
+                del logits, scored_per_tok_loss
             else:
-                del per_tok_loss
+                del scored_per_tok_loss
+            del per_tok_loss
         local_batch_count += 1
         batch_num = orig_batch_idx + 1
         doc_lens = [dl for _, dl in batch]
@@ -2770,22 +2997,30 @@ def train_and_eval(h, device):
                 block.attn.rotary._seq_len_cached = 0
                 block.attn.rotary(h.ttt_eval_seq_len, device, torch.bfloat16)
 
-        def _fwd_ttt(input_ids, target_ids, lora):
-            return ttt_model.forward_ttt(input_ids, target_ids, lora=lora)
+        def _fwd_ttt(input_ids, target_ids, lora, return_logits=False):
+            return ttt_model.forward_ttt(
+                input_ids, target_ids, lora=lora, return_logits=return_logits
+            )
 
         _ttt_debug_bypass = bool(os.environ.get("TTT_DEBUG_BYPASS"))
         _ttt_compile_warmup = bool(int(os.environ.get("TTT_COMPILE_WARMUP", "0")))
         if _ttt_debug_bypass:
-            def _fwd_ttt_bypass(input_ids, target_ids, lora):
+            def _fwd_ttt_bypass(input_ids, target_ids, lora, return_logits=False):
                 logits = ttt_model.forward_logits(input_ids)
                 dummy = lora.q_loras[0].B.sum() * 0
                 logits = logits + dummy
+                if return_logits:
+                    return logits
                 bsz, sl, V = logits.shape
                 return F.cross_entropy(
                     logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
                 ).reshape(bsz, sl)
             fwd_ttt_compiled = _fwd_ttt_bypass
             log("ttt_lora:DEBUG BYPASS active - using forward_logits directly (no compile warmup)")
+            ttt_compile_time = 0.0
+        elif h.ngram_doc_expert_enabled:
+            fwd_ttt_compiled = _fwd_ttt
+            log("ttt_lora:ngram expert uses eager forward_ttt (skip compile for mixed return shapes)")
             ttt_compile_time = 0.0
         elif _ttt_compile_warmup:
             fwd_ttt_compiled = torch.compile(_fwd_ttt, dynamic=True)
