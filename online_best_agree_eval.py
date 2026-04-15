@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import math
 import os
 import subprocess
@@ -95,21 +96,28 @@ class OnlineNgramLib:
 
 
 def ensure_online_ngram_lib() -> Path:
-    if ONLINE_NGRAM_LIB.exists():
-        return ONLINE_NGRAM_LIB
     if not ONLINE_NGRAM_SRC.exists():
         raise FileNotFoundError(f"Missing native helper source: {ONLINE_NGRAM_SRC}")
-    cmd = [
-        "cc",
-        "-O3",
-        "-shared",
-        "-fPIC",
-        "-std=c99",
-        str(ONLINE_NGRAM_SRC),
-        "-o",
-        str(ONLINE_NGRAM_LIB),
-    ]
-    subprocess.run(cmd, check=True)
+    lock_path = ONLINE_NGRAM_LIB.with_suffix(".lock")
+    with open(lock_path, "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        if ONLINE_NGRAM_LIB.exists() and ONLINE_NGRAM_LIB.stat().st_size > 0:
+            return ONLINE_NGRAM_LIB
+        tmp_lib = ONLINE_NGRAM_LIB.with_suffix(f".tmp.{os.getpid()}.so")
+        if tmp_lib.exists():
+            tmp_lib.unlink()
+        cmd = [
+            "cc",
+            "-O3",
+            "-shared",
+            "-fPIC",
+            "-std=c99",
+            str(ONLINE_NGRAM_SRC),
+            "-o",
+            str(tmp_lib),
+        ]
+        subprocess.run(cmd, check=True)
+        os.replace(tmp_lib, ONLINE_NGRAM_LIB)
     return ONLINE_NGRAM_LIB
 
 
