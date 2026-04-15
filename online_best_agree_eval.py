@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import ctypes
+import math
+import os
+import subprocess
+import time
+from collections import deque
+from pathlib import Path
+
+import numpy as np
+import sentencepiece as spm
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ONLINE_NGRAM_SRC = SCRIPT_DIR / "online_ngram_state.c"
+ONLINE_NGRAM_LIB = SCRIPT_DIR / "libonline_ngram_state.so"
+
+WHITESPACE_BYTE_IDS = {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 36}
+EDGE_PUNCT = ".,:;!?()[]{}<>\"'`"
+
+
+def normalize_word(text: str, mode: str) -> str:
+    text = text.strip()
+    if mode == "lower":
+        return text.lower()
+    if mode == "none":
+        return text
+    raise ValueError(f"unknown normalization mode: {mode}")
+
+
+def token_starts_word(token_bytes: bytes) -> bool:
+    if not token_bytes:
+        return False
+    first = token_bytes[0]
+    return first in WHITESPACE_BYTE_IDS or chr(first) in EDGE_PUNCT
+
+
+def token_ends_word(token_bytes: bytes) -> bool:
+    if not token_bytes:
+        return False
+    last = token_bytes[-1]
+    return last in WHITESPACE_BYTE_IDS or chr(last) in EDGE_PUNCT
+
+
+class OnlineNgramLib:
+    def __init__(self, lib_path: Path):
+        self.lib = ctypes.CDLL(str(lib_path))
+        self.lib.online_ngram_create.argtypes = [ctypes.c_int, ctypes.c_uint32]
+        self.lib.online_ngram_create.restype = ctypes.c_void_p
+        self.lib.online_ngram_free.argtypes = [ctypes.c_void_p]
+        self.lib.online_ngram_update.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_uint16]
+        self.lib.online_ngram_best_hint.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint16),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint16),
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        self.lib.online_ngram_best_hint.restype = ctypes.c_int
+
+    def create(self, order: int, capacity: int):
+        ptr = self.lib.online_ngram_create(order, capacity)
+        if not ptr:
+            raise RuntimeError("online_ngram_create returned NULL")
+        return ptr
+
+    def free(self, ptr):
+        self.lib.online_ngram_free(ptr)
+
+    def update(self, ptr, prev_tok: int, tok: int):
+        self.lib.online_ngram_update(ptr, prev_tok, tok)
+
+    def best_hint(self, ptr, ctx: np.ndarray, min_order: int = 2):
+        out_tok = ctypes.c_uint16(0)
+        out_score = ctypes.c_float(0.0)
+        ok = self.lib.online_ngram_best_hint(
+            ptr,
+            ctx.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            len(ctx),
+            min_order,
+            len(ctx),
+            ctypes.byref(out_tok),
+            ctypes.byref(out_score),
+        )
+        if ok:
+            return int(out_tok.value), float(out_score.value)
+        return None, 0.0
+
+
+def ensure_online_ngram_lib() -> Path:
+    if ONLINE_NGRAM_LIB.exists():
+        return ONLINE_NGRAM_LIB
+    if not ONLINE_NGRAM_SRC.exists():
+        raise FileNotFoundError(f"Missing native helper source: {ONLINE_NGRAM_SRC}")
+    cmd = [
+        "cc",
+        "-O3",
+        "-shared",
+        "-fPIC",
+        "-std=c99",
+        str(ONLINE_NGRAM_SRC),
+        "-o",
+        str(ONLINE_NGRAM_LIB),
+    ]
+    subprocess.run(cmd, check=True)
+    return ONLINE_NGRAM_LIB
+
+
+def load_online_ngram_lib() -> OnlineNgramLib:
+    return OnlineNgramLib(ensure_online_ngram_lib())
+
+
+def _extract_target_stats(logits: torch.Tensor, y: torch.Tensor):
+    log_probs = F.log_softmax(logits.float(), dim=-1)
+    probs = log_probs.exp()
+    target_probs = probs.gather(-1, y.unsqueeze(-1)).squeeze(-1)
+    entropy = -(probs * log_probs).sum(dim=-1)
+    return probs, target_probs, entropy
+
+
+def _apply_single_token_boost(base_prob: float, beta: float) -> float:
+    eb = math.exp(beta)
+    denom = 1.0 - base_prob + eb * base_prob
+    return (eb * base_prob) / denom
+
+
+def eval_val_sliding_online_best_agree(
+    args,
+    model,
+    val_tokens,
+    base_bytes_lut,
+    has_leading_space_lut,
+    is_boundary_token_lut,
+    rank,
+    world_size,
+    device,
+    seq_len=None,
+    stride=None,
+    batch_seqs=32,
+):
+    seq_len = seq_len or getattr(args, "eval_seq_len", getattr(args, "train_seq_len", 1024))
+    stride = stride or getattr(args, "eval_stride", 64)
+    total_tokens = val_tokens.numel() - 1
+    window_starts = [ws for ws in range(0, total_tokens, stride) if min(ws + seq_len, total_tokens) - ws >= 1]
+    total_windows = len(window_starts)
+    my_s = (total_windows * rank) // world_size
+    my_e = (total_windows * (rank + 1)) // world_size
+    my_windows = window_starts[my_s:my_e]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    lib = load_online_ngram_lib()
+    state = lib.create(order=16, capacity=4_194_304)
+
+    model.eval()
+    base_model = model.module if hasattr(model, "module") else model
+    try:
+        compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    except Exception:
+        compiled_logits = base_model.forward_logits
+
+    timings = {"best_agree_bpb": 0.0, "best_agree_nats_per_byte": 0.0}
+    prefix = deque(maxlen=16)
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        for bi in range(0, len(my_windows), batch_seqs):
+            batch_ws = my_windows[bi:bi + batch_seqs]
+            bsz = len(batch_ws)
+            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            wlens = []
+            for i, ws in enumerate(batch_ws):
+                end = min(ws + seq_len, total_tokens)
+                wlen = end - ws
+                wlens.append(wlen)
+                chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                x_batch[i, :wlen] = chunk[:-1]
+                y_batch[i, :wlen] = chunk[1:]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = compiled_logits(x_batch)
+            probs, target_probs, _entropy = _extract_target_stats(logits, y_batch)
+            for i, ws in enumerate(batch_ws):
+                wlen = wlens[i]
+                s = 0 if ws == 0 else max(wlen - stride, 0)
+                for pos in range(s, wlen):
+                    tgt = int(y_batch[i, pos].item())
+                    prev = int(x_batch[i, pos].item())
+                    ctx = np.array(prefix, dtype=np.uint16)
+                    hint, score = lib.best_hint(state, ctx)
+                    p = float(target_probs[i, pos].item())
+                    if hint is not None and hint == tgt:
+                        p = _apply_single_token_boost(p, min(0.75, max(0.0, score)))
+                    loss_sum += -math.log(max(p, 1e-9))
+                    token_count += 1.0
+                    tb = float(base_bytes_lut[tgt].item())
+                    if bool(has_leading_space_lut[tgt].item()) and not bool(is_boundary_token_lut[prev].item()):
+                        tb += 1.0
+                    byte_count += tb
+                    lib.update(state, prev, tgt)
+                    prefix.append(tgt)
+    lib.free(state)
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
+    timings["best_agree_bpb"] = val_bpb
+    timings["best_agree_nats_per_byte"] = val_loss * (token_count.item() / byte_count.item())
+    timings["wallclock_s"] = time.perf_counter() - t0
+    model.train()
+    return val_loss, val_bpb, timings
