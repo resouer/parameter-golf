@@ -7,7 +7,6 @@ import math
 import os
 import subprocess
 import time
-from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -185,7 +184,8 @@ def eval_val_sliding_online_best_agree(
         compiled_logits = base_model.forward_logits
 
     timings = {"best_agree_bpb": 0.0, "best_agree_nats_per_byte": 0.0}
-    prefix = deque(maxlen=16)
+    prefix_buf = np.zeros(16, dtype=np.uint16)
+    prefix_len = 0
     t0 = time.perf_counter()
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
@@ -216,7 +216,7 @@ def eval_val_sliding_online_best_agree(
                 for pos in range(s, wlen):
                     tgt = int(y_row[pos])
                     prev = int(x_row[pos])
-                    ctx = np.array(prefix, dtype=np.uint16)
+                    ctx = prefix_buf[:prefix_len]
                     hint, score = lib.best_hint(state, ctx)
                     p = float(prob_row[pos])
                     if hint is not None and hint == tgt:
@@ -228,7 +228,21 @@ def eval_val_sliding_online_best_agree(
                         tb += 1.0
                     byte_count += tb
                     lib.update(state, prev, tgt)
-                    prefix.append(tgt)
+                    if prefix_len < prefix_buf.size:
+                        prefix_buf[prefix_len] = tgt
+                        prefix_len += 1
+                    else:
+                        prefix_buf[:-1] = prefix_buf[1:]
+                        prefix_buf[-1] = tgt
+            if rank == 0 and (bi == 0 or ((bi // batch_seqs) + 1) % 100 == 0):
+                elapsed = time.perf_counter() - t0
+                rl = float(loss_sum.item() / token_count.item()) if token_count.item() > 0 else 0.0
+                rb = float((rl / math.log(2.0)) * token_count.item() / byte_count.item()) if byte_count.item() > 0 else 0.0
+                print(
+                    f"online_best_agree_progress: batch {(bi // batch_seqs) + 1}/{(len(my_windows) + batch_seqs - 1) // batch_seqs} "
+                    f"tokens:{int(token_count.item())} running_loss:{rl:.4f} running_bpb:{rb:.4f} elapsed:{elapsed:.1f}s",
+                    flush=True,
+                )
     lib.free(state)
 
     if dist.is_available() and dist.is_initialized():
