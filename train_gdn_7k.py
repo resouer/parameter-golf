@@ -266,9 +266,18 @@ def eval_val_sliding(model: nn.Module, val_tokens: Tensor, base_bytes_lut: Tenso
 
 def main():
     args = Hyperparameters()
-    pilot_done = Path(f"/tmp/w40_done_{args.run_id}")
+    pilot_key = (
+        os.environ.get("W40_PILOT_KEY")
+        or os.environ.get("TORCHELASTIC_RUN_ID")
+        or os.environ.get("MASTER_PORT")
+        or "default"
+    )
+    pilot_done = Path(f"/tmp/w40_done_{pilot_key}")
     if args.w40_single_gpu_pilot and args.distributed and args.local_rank != 0:
-        print(f"w40_pilot: rank {args.local_rank} waiting while rank0 runs single-GPU feasibility", flush=True)
+        print(
+            f"w40_pilot: rank {args.local_rank} waiting on {pilot_done} while rank0 runs single-GPU feasibility",
+            flush=True,
+        )
         while not pilot_done.exists():
             time.sleep(5)
         return
@@ -298,7 +307,7 @@ def main():
         if args.w40_single_gpu_pilot:
             print(
                 f"w40_pilot: single-GPU feasibility mode train_batch_tokens={args.train_batch_tokens} "
-                f"val_batch_size={args.val_batch_size}",
+                f"val_batch_size={args.val_batch_size} sentinel={pilot_done}",
                 flush=True,
             )
         print(f"Arch: {args.arch_mode}", flush=True)
@@ -356,6 +365,12 @@ def main():
     if rank == 0:
         print(f"pre-quantization post-ema val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f}", flush=True)
         print("FLA feasibility pilot finished before quantization integration", flush=True)
+        print(
+            f'results_json: {{"val_bpb": {val_bpb:.8f}, "val_loss": {val_loss:.8f}, '
+            f'"bytes_total": 0, "peak_memory_mib": {torch.cuda.max_memory_allocated()//1024//1024}, '
+            f'"w40_feasibility_only": true}}',
+            flush=True,
+        )
         pilot_done.touch()
     if args.distributed:
         dist.destroy_process_group()
