@@ -102,9 +102,11 @@ if _USE_NAIVE:
     except Exception as e:
         print(f"[FLA] Failed to apply naive fallback patch: {e}", flush=True)
 
-from fla.layers import GatedDeltaNet, GatedDeltaProduct, Mamba2
+from fla.layers.gated_deltanet import GatedDeltaNet
+from fla.layers.gated_deltaproduct import GatedDeltaProduct
+from fla.layers.mamba2 import Mamba2
 try:
-    from fla.layers import RWKV7Attention
+    from fla.layers.rwkv7 import RWKV7Attention
 except ImportError:
     RWKV7Attention = None  # type: ignore
 

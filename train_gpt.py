@@ -47,7 +47,7 @@ def _ensure_w40_vendor_on_path() -> None:
 def _ensure_fla_vendor_installed() -> None:
     _ensure_w40_vendor_on_path()
     try:
-        from fla.layers import GatedDeltaNet  # noqa: F401
+        from fla.layers.gated_deltanet import GatedDeltaNet  # noqa: F401
         print("w40_wrapper: local vendor layered import already works", flush=True)
         return
     except Exception:
@@ -59,7 +59,7 @@ def _ensure_fla_vendor_installed() -> None:
         fcntl.flock(lockf, fcntl.LOCK_EX)
         _ensure_w40_vendor_on_path()
         try:
-            from fla.layers import GatedDeltaNet  # noqa: F401
+            from fla.layers.gated_deltanet import GatedDeltaNet  # noqa: F401
             print("w40_wrapper: local vendor layered import became available after lock wait", flush=True)
             return
         except Exception:
@@ -84,7 +84,7 @@ def _ensure_fla_vendor_installed() -> None:
         )
         importlib.invalidate_caches()
         _ensure_w40_vendor_on_path()
-        from fla.layers import GatedDeltaNet  # noqa: F401
+        from fla.layers.gated_deltanet import GatedDeltaNet  # noqa: F401
         print("w40_wrapper: vendored FLA layered import succeeded", flush=True)
 
 
