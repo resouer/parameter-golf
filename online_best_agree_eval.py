@@ -170,6 +170,9 @@ def eval_val_sliding_online_best_agree(
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    base_bytes_cpu = base_bytes_lut.cpu().numpy()
+    has_space_cpu = has_leading_space_lut.cpu().numpy()
+    is_boundary_cpu = is_boundary_token_lut.cpu().numpy()
 
     lib = load_online_ngram_lib()
     state = lib.create(order=16, capacity=4_194_304)
@@ -201,21 +204,27 @@ def eval_val_sliding_online_best_agree(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = compiled_logits(x_batch)
             probs, target_probs, _entropy = _extract_target_stats(logits, y_batch)
+            x_cpu = x_batch.cpu().numpy()
+            y_cpu = y_batch.cpu().numpy()
+            target_probs_cpu = target_probs.cpu().numpy()
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
+                y_row = y_cpu[i]
+                x_row = x_cpu[i]
+                prob_row = target_probs_cpu[i]
                 for pos in range(s, wlen):
-                    tgt = int(y_batch[i, pos].item())
-                    prev = int(x_batch[i, pos].item())
+                    tgt = int(y_row[pos])
+                    prev = int(x_row[pos])
                     ctx = np.array(prefix, dtype=np.uint16)
                     hint, score = lib.best_hint(state, ctx)
-                    p = float(target_probs[i, pos].item())
+                    p = float(prob_row[pos])
                     if hint is not None and hint == tgt:
                         p = _apply_single_token_boost(p, min(0.75, max(0.0, score)))
                     loss_sum += -math.log(max(p, 1e-9))
                     token_count += 1.0
-                    tb = float(base_bytes_lut[tgt].item())
-                    if bool(has_leading_space_lut[tgt].item()) and not bool(is_boundary_token_lut[prev].item()):
+                    tb = float(base_bytes_cpu[tgt])
+                    if bool(has_space_cpu[tgt]) and not bool(is_boundary_cpu[prev]):
                         tb += 1.0
                     byte_count += tb
                     lib.update(state, prev, tgt)
