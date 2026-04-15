@@ -1913,9 +1913,11 @@ def load_online_best_agree_eval_mod():
     global _ONLINE_BEST_AGREE_EVAL_MOD
     if _ONLINE_BEST_AGREE_EVAL_MOD is None:
         helper_path = Path(__file__).resolve().parent / "online_best_agree_eval.py"
+        print(f"w41_online: loading helper module from {helper_path}", flush=True)
         _ONLINE_BEST_AGREE_EVAL_MOD = load_local_module(
             helper_path, "w41_online_best_agree_eval_runtime"
         )
+        print("w41_online: helper module import succeeded", flush=True)
     return _ONLINE_BEST_AGREE_EVAL_MOD
 
 

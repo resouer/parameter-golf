@@ -99,13 +99,16 @@ def ensure_online_ngram_lib() -> Path:
     if not ONLINE_NGRAM_SRC.exists():
         raise FileNotFoundError(f"Missing native helper source: {ONLINE_NGRAM_SRC}")
     lock_path = ONLINE_NGRAM_LIB.with_suffix(".lock")
+    print(f"w41_online: ensuring native helper {ONLINE_NGRAM_LIB}", flush=True)
     with open(lock_path, "w") as lockf:
         fcntl.flock(lockf, fcntl.LOCK_EX)
         if ONLINE_NGRAM_LIB.exists() and ONLINE_NGRAM_LIB.stat().st_size > 0:
+            print("w41_online: native helper already present", flush=True)
             return ONLINE_NGRAM_LIB
         tmp_lib = ONLINE_NGRAM_LIB.with_suffix(f".tmp.{os.getpid()}.so")
         if tmp_lib.exists():
             tmp_lib.unlink()
+        print(f"w41_online: compiling native helper -> {tmp_lib}", flush=True)
         cmd = [
             "cc",
             "-O3",
@@ -118,10 +121,12 @@ def ensure_online_ngram_lib() -> Path:
         ]
         subprocess.run(cmd, check=True)
         os.replace(tmp_lib, ONLINE_NGRAM_LIB)
+        print("w41_online: native helper compile finished", flush=True)
     return ONLINE_NGRAM_LIB
 
 
 def load_online_ngram_lib() -> OnlineNgramLib:
+    print("w41_online: loading native helper with ctypes", flush=True)
     return OnlineNgramLib(ensure_online_ngram_lib())
 
 
