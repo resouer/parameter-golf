@@ -37,7 +37,19 @@ def _ensure_fla_installed() -> None:
         return
     except ImportError:
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--no-cache-dir", "flash-linear-attention==0.4.2"],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-cache-dir",
+                "--ignore-installed",
+                "safetensors==0.7.0",
+                "tokenizers==0.22.2",
+                "transformers==5.5.4",
+                "fla-core==0.4.2",
+                "flash-linear-attention==0.4.2",
+            ],
             stdout=sys.stderr,
             stderr=sys.stderr,
         )
