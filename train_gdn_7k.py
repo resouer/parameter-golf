@@ -16,6 +16,7 @@ import os
 import random
 import sys
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -361,18 +362,34 @@ def main():
     if rank == 0:
         print(f"stopping_early: wallclock_cap train_time: {1e3*(time.perf_counter()-t0):.0f}ms step: {step}/{args.iterations}", flush=True)
     base = model.module if hasattr(model, "module") else model
-    base.load_state_dict({name: t.to(dtype=base.state_dict()[name].dtype) for name, t in ema_state.items()}, strict=True)
-    val_loss, val_bpb = eval_val_sliding(base, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, rank, world_size, device, seq_len=args.eval_seq_len, stride=args.eval_stride, batch_seqs=64)
-    if rank == 0:
-        print(f"pre-quantization post-ema val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f}", flush=True)
-        print("FLA feasibility pilot finished before quantization integration", flush=True)
-        print(
-            f'results_json: {{"val_bpb": {val_bpb:.8f}, "val_loss": {val_loss:.8f}, '
-            f'"bytes_total": 0, "peak_memory_mib": {torch.cuda.max_memory_allocated()//1024//1024}, '
-            f'"w40_feasibility_only": true}}',
-            flush=True,
-        )
-        pilot_done.touch()
+    try:
+        if rank == 0:
+            print("final_eval:barrier_enter", flush=True)
+        if args.distributed:
+            dist.barrier()
+        if rank == 0:
+            print("final_eval:barrier_done", flush=True)
+            print("final_eval:start", flush=True)
+        base.load_state_dict({name: t.to(dtype=base.state_dict()[name].dtype) for name, t in ema_state.items()}, strict=True)
+        if rank == 0:
+            print("final_eval:ema_loaded", flush=True)
+        val_loss, val_bpb = eval_val_sliding(base, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, rank, world_size, device, seq_len=args.eval_seq_len, stride=args.eval_stride, batch_seqs=64)
+        if rank == 0:
+            print("final_eval:done", flush=True)
+            print(f"pre-quantization post-ema val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f}", flush=True)
+            print("FLA feasibility pilot finished before quantization integration", flush=True)
+            print(
+                f'results_json: {{"val_bpb": {val_bpb:.8f}, "val_loss": {val_loss:.8f}, '
+                f'"bytes_total": 0, "peak_memory_mib": {torch.cuda.max_memory_allocated()//1024//1024}, '
+                f'"w40_feasibility_only": true}}',
+                flush=True,
+            )
+            pilot_done.touch()
+    except Exception:
+        if rank == 0:
+            print("final_eval:exception", flush=True)
+            traceback.print_exc()
+        raise
     if args.distributed:
         dist.destroy_process_group()
 

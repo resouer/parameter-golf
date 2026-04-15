@@ -107,9 +107,25 @@ def _normalize_status_text(value):
         return "failed"
     if v in ("stopped", "cancelled", "canceled"):
         return "stopped"
-    if v in ("running", "pending", "starting", "queueing", "queued"):
+    if v in ("running",):
         return "running"
+    if v in ("pending", "starting", "queueing", "queued"):
+        return "queueing"
     return None
+
+
+def _extract_json_object(text):
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    blob = text[start : end + 1]
+    try:
+        return json.loads(blob)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -328,14 +344,13 @@ def _get_job_status(job_name, job_id=None):
     else:
         result = _run(f"{LEP_CLI} job get -n {job_name}")
     output = result.stdout + result.stderr
-    try:
-        payload = json.loads(result.stdout)
-        status_blob = payload.get("status", {}) if isinstance(payload, dict) else {}
-        state = _normalize_status_text(status_blob.get("state"))
-        if state:
-            return state
-    except Exception:
-        pass
+    for candidate in (result.stdout, output):
+        payload = _extract_json_object(candidate)
+        if isinstance(payload, dict):
+            status_blob = payload.get("status", {})
+            state = _normalize_status_text(status_blob.get("state"))
+            if state:
+                return state
     for line in output.split("\n"):
         ll = line.lower().strip()
         if "status" in ll or "state" in ll:
@@ -343,7 +358,7 @@ def _get_job_status(job_name, job_id=None):
             if state:
                 return state
     # Fallback: check job lists
-    for state in ["running", "completed", "failed", "stopped"]:
+    for state in ["queueing", "running", "completed", "failed", "stopped"]:
         r = _run(f"{LEP_CLI} job list -s {state}")
         if job_name in r.stdout or (job_id and job_id in r.stdout):
             return state
