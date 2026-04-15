@@ -155,7 +155,7 @@ def eval_val_sliding_online_best_agree(
     device,
     seq_len=None,
     stride=None,
-    batch_seqs=32,
+    batch_seqs=64,
 ):
     seq_len = seq_len or getattr(args, "eval_seq_len", getattr(args, "train_seq_len", 1024))
     stride = stride or getattr(args, "eval_stride", 64)
@@ -174,7 +174,7 @@ def eval_val_sliding_online_best_agree(
     is_boundary_cpu = is_boundary_token_lut.cpu().numpy()
 
     lib = load_online_ngram_lib()
-    state = lib.create(order=16, capacity=4_194_304)
+    state = lib.create(order=8, capacity=1_048_576)
 
     model.eval()
     base_model = model.module if hasattr(model, "module") else model
@@ -184,7 +184,7 @@ def eval_val_sliding_online_best_agree(
         compiled_logits = base_model.forward_logits
 
     timings = {"best_agree_bpb": 0.0, "best_agree_nats_per_byte": 0.0}
-    prefix_buf = np.zeros(16, dtype=np.uint16)
+    prefix_buf = np.zeros(8, dtype=np.uint16)
     prefix_len = 0
     t0 = time.perf_counter()
     with torch.inference_mode():
