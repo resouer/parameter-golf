@@ -97,6 +97,21 @@ def _parse_job_metadata(output):
     return metadata
 
 
+def _normalize_status_text(value):
+    if not value:
+        return None
+    v = str(value).strip().lower()
+    if v in ("completed", "complete", "succeeded", "success"):
+        return "completed"
+    if v in ("failed", "error"):
+        return "failed"
+    if v in ("stopped", "cancelled", "canceled"):
+        return "stopped"
+    if v in ("running", "pending", "starting", "queueing", "queued"):
+        return "running"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Job command template
 # ---------------------------------------------------------------------------
@@ -313,17 +328,20 @@ def _get_job_status(job_name, job_id=None):
     else:
         result = _run(f"{LEP_CLI} job get -n {job_name}")
     output = result.stdout + result.stderr
+    try:
+        payload = json.loads(result.stdout)
+        status_blob = payload.get("status", {}) if isinstance(payload, dict) else {}
+        state = _normalize_status_text(status_blob.get("state"))
+        if state:
+            return state
+    except Exception:
+        pass
     for line in output.split("\n"):
         ll = line.lower().strip()
         if "status" in ll or "state" in ll:
-            if "completed" in ll or "succeeded" in ll:
-                return "completed"
-            if "failed" in ll or "error" in ll:
-                return "failed"
-            if "stopped" in ll:
-                return "stopped"
-            if "running" in ll or "pending" in ll or "starting" in ll:
-                return "running"
+            state = _normalize_status_text(ll)
+            if state:
+                return state
     # Fallback: check job lists
     for state in ["running", "completed", "failed", "stopped"]:
         r = _run(f"{LEP_CLI} job list -s {state}")
@@ -645,10 +663,29 @@ def main():
 
         time.sleep(30)
     else:
-        _log(f"Timeout after {args.timeout}s, stopping job")
-        _stop_job_safe(job_id)
-        log_thread.join(timeout=5)
-        _output(False, error=f"job timeout after {args.timeout}s")
+        _log(f"Timeout after {args.timeout}s, attempting final status + log capture before stopping")
+        status = "unknown"
+        for _ in range(6):
+            final_status = _get_job_status(job_name, job_id)
+            try:
+                _robust_log_capture(job_id, log_file)
+            except Exception:
+                pass
+            log_thread.join(timeout=5)
+            if os.path.exists(log_file):
+                with open(log_file) as f:
+                    timeout_log_content = f.read()
+                timeout_results = _extract_results(timeout_log_content)
+                if timeout_results.get("val_bpb") is not None:
+                    status = "completed" if final_status == "unknown" else final_status
+                    break
+            status = final_status
+            if status in ("completed", "failed", "stopped"):
+                break
+            time.sleep(10)
+        if status not in ("completed", "failed", "stopped"):
+            _stop_job_safe(job_id)
+            _output(False, error=f"job timeout after {args.timeout}s")
 
     # 5. Parse results from log
     if not os.path.exists(log_file):
@@ -720,10 +757,29 @@ def _run_seed(seed, commit, node_group, timeout):
     # Give streaming thread time to flush final results
     stream_thread.join(timeout=60)
     # Final log capture attempt (stream may have missed tail)
-    try:
-        _robust_log_capture(job_id, log_file)
-    except Exception:
-        pass
+    if status == "timeout":
+        for _ in range(6):
+            try:
+                _robust_log_capture(job_id, log_file)
+            except Exception:
+                pass
+            final_status = _get_job_status(job_name, job_id)
+            if os.path.exists(log_file):
+                with open(log_file) as f:
+                    log_content = f.read()
+                r = _extract_results(log_content)
+                if r.get("val_bpb") is not None:
+                    status = "completed" if final_status == "unknown" else final_status
+                    break
+            if final_status in ("completed", "failed", "stopped"):
+                status = final_status
+                break
+            time.sleep(10)
+    else:
+        try:
+            _robust_log_capture(job_id, log_file)
+        except Exception:
+            pass
 
     # Parse results
     val_bpb = None
@@ -734,6 +790,9 @@ def _run_seed(seed, commit, node_group, timeout):
         r = _extract_results(log_content)
         val_bpb = r.get("val_bpb")
         bytes_total = r.get("bytes_total", 0)
+        if status == "timeout" and val_bpb is not None:
+            final_status = _get_job_status(job_name, job_id)
+            status = "completed" if final_status == "unknown" else final_status
 
     _log(f"[seed-{seed}] DONE: val_bpb={val_bpb}, bytes={bytes_total}, status={status}")
     return {
