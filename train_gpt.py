@@ -91,7 +91,7 @@ class Hyperparameters:
     ttt_optimizer = os.environ.get("TTT_OPTIMIZER", "adam")
     ttt_eval_batches = os.environ.get("TTT_EVAL_BATCHES", "")
     ttt_output_dir = os.environ.get("TTT_OUTPUT_DIR", "")
-    ttt_local_bucket_docs = int(os.environ.get("TTT_LOCAL_BUCKET_DOCS", 512))
+    ttt_local_bucket_docs = int(os.environ.get("TTT_LOCAL_BUCKET_DOCS", 4096))
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
     etlb_lr = float(os.environ.get("ETLB_LR", 0.05))
     etlb_steps = int(os.environ.get("ETLB_STEPS", 5))
