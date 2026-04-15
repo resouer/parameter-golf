@@ -1991,13 +1991,14 @@ def serialize(h, base_model, code):
     torch.save(scale_only, scale_buf)
     passthrough_buf = io.BytesIO()
     torch.save(passthrough_only, passthrough_buf)
-    meta_blob = json.dumps(quant_meta, separators=(",", ":")).encode("utf-8")
+    meta_buf = io.BytesIO()
+    torch.save(quant_meta, meta_buf)
     quant_blob = _pack_split_streams(
         [
             ("q", "brotli", True, _compress(q_buf.getvalue(), "brotli", shuffle=True)),
             ("s", "lzma", True, _compress(scale_buf.getvalue(), "lzma", shuffle=True)),
             ("p", "lzma", True, _compress(passthrough_buf.getvalue(), "lzma", shuffle=True)),
-            ("m", "lzma", False, _compress(meta_blob, "lzma", shuffle=False)),
+            ("m", "lzma", False, _compress(meta_buf.getvalue(), "lzma", shuffle=False)),
         ]
     )
     quant_file_bytes = len(quant_blob)
@@ -2054,12 +2055,15 @@ def deserialize(h, device):
             ),
             map_location="cpu",
         )
-        quant_meta = json.loads(
-            _decompress(
-                split_streams["m"]["blob"],
-                split_streams["m"]["codec"],
-                shuffle=split_streams["m"]["shuffle"],
-            ).decode("utf-8")
+        quant_meta = torch.load(
+            io.BytesIO(
+                _decompress(
+                    split_streams["m"]["blob"],
+                    split_streams["m"]["codec"],
+                    shuffle=split_streams["m"]["shuffle"],
+                )
+            ),
+            map_location="cpu",
         )
         quant_result = {}
         quant_result.update(q_only)
