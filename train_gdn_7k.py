@@ -68,6 +68,7 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     compile_enabled = bool(int(os.environ.get("COMPILE_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+    w40_single_gpu_pilot = bool(int(os.environ.get("W40_SINGLE_GPU_PILOT", "1")))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -265,18 +266,41 @@ def eval_val_sliding(model: nn.Module, val_tokens: Tensor, base_bytes_lut: Tenso
 
 def main():
     args = Hyperparameters()
+    pilot_done = Path(f"/tmp/w40_done_{args.run_id}")
+    if args.w40_single_gpu_pilot and args.distributed and args.local_rank != 0:
+        print(f"w40_pilot: rank {args.local_rank} waiting while rank0 runs single-GPU feasibility", flush=True)
+        while not pilot_done.exists():
+            time.sleep(5)
+        return
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda")
-    if args.distributed:
+    if args.distributed and not args.w40_single_gpu_pilot:
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
         dist.init_process_group(backend="nccl")
+    else:
+        torch.cuda.set_device(0)
+        device = torch.device("cuda", 0)
+    if args.w40_single_gpu_pilot:
+        args.distributed = False
+        args.rank = 0
+        args.world_size = 1
+        args.local_rank = 0
+        args.train_batch_tokens = max(args.train_batch_tokens // 8, args.train_seq_len)
+        args.val_batch_size = max(args.val_batch_size // 8, args.eval_seq_len)
     rank = args.rank
     world_size = args.world_size
     if rank == 0:
+        if args.w40_single_gpu_pilot:
+            print(
+                f"w40_pilot: single-GPU feasibility mode train_batch_tokens={args.train_batch_tokens} "
+                f"val_batch_size={args.val_batch_size}",
+                flush=True,
+            )
         print(f"Arch: {args.arch_mode}", flush=True)
     cfg = get_config(args.arch_mode)
     model = HybridGDN(cfg, vocab_size=args.vocab_size, tie_embeddings=True, logit_softcap=args.logit_softcap).to(device).bfloat16()
@@ -332,6 +356,7 @@ def main():
     if rank == 0:
         print(f"pre-quantization post-ema val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f}", flush=True)
         print("FLA feasibility pilot finished before quantization integration", flush=True)
+        pilot_done.touch()
     if args.distributed:
         dist.destroy_process_group()
 
