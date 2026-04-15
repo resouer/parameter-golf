@@ -104,7 +104,7 @@ class Hyperparameters:
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 14.0))
     mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 12.0))
     attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
-    w41_single_gpu_pilot = bool(int(os.environ.get("W41_SINGLE_GPU_PILOT", "1")))
+    w41_single_gpu_pilot = bool(int(os.environ.get("W41_SINGLE_GPU_PILOT", "0")))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
