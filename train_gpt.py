@@ -9,11 +9,22 @@ lane on Heimdall.
 
 import importlib
 import fcntl
+import os
 import shutil
 import sys
 import traceback
 from pathlib import Path
 import subprocess
+
+# These explicit defaults serve two purposes:
+# 1. They make the remote evaluate.py vocabulary detector pick the SP8192 path.
+# 2. They keep the wrapper/runtime aligned with the intended W43 score probe.
+VOCAB_SIZE = int(os.environ.get("VOCAB_SIZE", 8192))
+DATA_PATH = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
+TOKENIZER_PATH = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
+os.environ.setdefault("VOCAB_SIZE", str(VOCAB_SIZE))
+os.environ.setdefault("DATA_PATH", DATA_PATH)
+os.environ.setdefault("TOKENIZER_PATH", TOKENIZER_PATH)
 
 
 _W40_VENDOR_DIR = Path(__file__).resolve().parent / ".w40_vendor"
