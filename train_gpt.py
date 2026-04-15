@@ -104,6 +104,7 @@ class Hyperparameters:
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 14.0))
     mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 12.0))
     attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
+    w41_single_gpu_pilot = bool(int(os.environ.get("W41_SINGLE_GPU_PILOT", "1")))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -2916,6 +2917,21 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    pilot_key = (
+        os.environ.get("W41_PILOT_KEY")
+        or os.environ.get("TORCHELASTIC_RUN_ID")
+        or os.environ.get("MASTER_PORT")
+        or "default"
+    )
+    pilot_done = Path(f"/tmp/w41_done_{pilot_key}")
+    if bool(int(os.environ.get("W41_SINGLE_GPU_PILOT", "1"))) and distributed and local_rank != 0:
+        print(
+            f"w41_pilot: rank {local_rank} waiting on {pilot_done} while rank0 runs single-GPU feasibility",
+            flush=True,
+        )
+        while not pilot_done.exists():
+            time.sleep(5)
+        return
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if world_size <= 0:
@@ -2925,10 +2941,13 @@ def main():
             f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral"
         )
     device = torch.device("cuda", local_rank)
-    torch.cuda.set_device(device)
-    if distributed:
+    if distributed and not bool(int(os.environ.get("W41_SINGLE_GPU_PILOT", "1"))):
+        torch.cuda.set_device(device)
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
+    else:
+        torch.cuda.set_device(0)
+        device = torch.device("cuda", 0)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
@@ -2946,6 +2965,15 @@ def main():
     torch._dynamo.config.optimize_ddp = False
     torch._dynamo.config.cache_size_limit = 16
     h = Hyperparameters()
+    if h.w41_single_gpu_pilot:
+        h.distributed = False
+        h.rank = 0
+        h.world_size = 1
+        h.local_rank = 0
+        h.is_main_process = True
+        h.grad_accum_steps = 1
+        h.train_batch_tokens = max(h.train_batch_tokens // 8, h.train_seq_len)
+        h.val_batch_tokens = max(h.val_batch_tokens // 8, h.eval_seq_len)
     set_logging_hparams(h)
     if h.is_main_process:
         os.makedirs(h.artifact_dir if h.artifact_dir else "logs", exist_ok=True)
@@ -2967,8 +2995,16 @@ def main():
             ).stdout,
             console=False,
         )
+        if h.w41_single_gpu_pilot:
+            log(
+                f"w41_pilot: single-GPU feasibility mode train_batch_tokens={h.train_batch_tokens} "
+                f"val_batch_tokens={h.val_batch_tokens} sentinel={pilot_done}",
+                console=True,
+            )
         log("=" * 100, console=False)
     train_and_eval(h, device)
+    if h.is_main_process and h.w41_single_gpu_pilot:
+        pilot_done.touch()
     if distributed:
         dist.destroy_process_group()
 
