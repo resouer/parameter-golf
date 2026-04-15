@@ -91,6 +91,7 @@ class Hyperparameters:
     ttt_optimizer = os.environ.get("TTT_OPTIMIZER", "adam")
     ttt_eval_batches = os.environ.get("TTT_EVAL_BATCHES", "")
     ttt_output_dir = os.environ.get("TTT_OUTPUT_DIR", "")
+    ttt_local_bucket_docs = int(os.environ.get("TTT_LOCAL_BUCKET_DOCS", 512))
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
     etlb_lr = float(os.environ.get("ETLB_LR", 0.05))
     etlb_steps = int(os.environ.get("ETLB_STEPS", 5))
@@ -2145,11 +2146,15 @@ def _find_docs(all_tokens):
 
 def _build_ttt_global_batches(doc_entries, h, ascending=False):
     batch_size = h.ttt_batch_size
-    scheduled = sorted(doc_entries, key=lambda x: x[1][1], reverse=not ascending)
-    global_batches = [
-        scheduled[i : i + batch_size]
-        for i in range(0, len(scheduled), batch_size)
-    ]
+    local_window = max(batch_size, h.ttt_local_bucket_docs)
+    global_batches = []
+    for start in range(0, len(doc_entries), local_window):
+        window = doc_entries[start : start + local_window]
+        scheduled = sorted(window, key=lambda x: x[1][1], reverse=not ascending)
+        global_batches.extend(
+            scheduled[i : i + batch_size]
+            for i in range(0, len(scheduled), batch_size)
+        )
     return list(enumerate(global_batches))
 
 
