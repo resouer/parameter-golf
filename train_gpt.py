@@ -2742,12 +2742,20 @@ def train_and_eval(h, device):
         compiled_forward_logits,
     )
     if not _skip_training:
-        serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
+        bytes_total, _quant_file_bytes = serialize(
+            h, base_model, Path(__file__).read_text(encoding="utf-8")
+        )
     else:
         log("eval_only: skipping serialize (already have quantized model)")
         if not os.path.exists(h.quantized_model_path):
             log("eval_only: no quantized model found, running serialize anyway")
-            serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
+            bytes_total, _quant_file_bytes = serialize(
+                h, base_model, Path(__file__).read_text(encoding="utf-8")
+            )
+        else:
+            bytes_total = os.path.getsize(h.quantized_model_path) + _bundle_submission_code(
+                Path(__file__).resolve()
+            )[1]
     if h.distributed:
         dist.barrier()
     eval_model = deserialize(h, device)
@@ -2794,7 +2802,7 @@ def train_and_eval(h, device):
             has_leading_space_lut=val_data.has_leading_space_lut,
             is_boundary_token_lut=val_data.is_boundary_token_lut,
             stride=h.eval_stride,
-            batch_seqs=int(os.environ.get("BATCH_SEQS", "32")),
+            batch_seqs=int(os.environ.get("BATCH_SEQS", "64")),
             seq_len=h.eval_seq_len,
         )
         torch.cuda.synchronize()
