@@ -44,6 +44,7 @@ def _ensure_fla_installed() -> None:
                 "install",
                 "--no-cache-dir",
                 "--ignore-installed",
+                "triton==3.2.0",
                 "safetensors==0.7.0",
                 "tokenizers==0.22.2",
                 "transformers==5.5.4",
