@@ -2917,6 +2917,7 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    pilot_mode = bool(int(os.environ.get("W41_SINGLE_GPU_PILOT", "0")))
     pilot_key = (
         os.environ.get("W41_PILOT_KEY")
         or os.environ.get("TORCHELASTIC_RUN_ID")
@@ -2924,7 +2925,7 @@ def main():
         or "default"
     )
     pilot_done = Path(f"/tmp/w41_done_{pilot_key}")
-    if bool(int(os.environ.get("W41_SINGLE_GPU_PILOT", "1"))) and distributed and local_rank != 0:
+    if pilot_mode and distributed and local_rank != 0:
         print(
             f"w41_pilot: rank {local_rank} waiting on {pilot_done} while rank0 runs single-GPU feasibility",
             flush=True,
@@ -2941,7 +2942,7 @@ def main():
             f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral"
         )
     device = torch.device("cuda", local_rank)
-    if distributed and not bool(int(os.environ.get("W41_SINGLE_GPU_PILOT", "1"))):
+    if distributed and not pilot_mode:
         torch.cuda.set_device(device)
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
@@ -2966,7 +2967,6 @@ def main():
     torch._dynamo.config.cache_size_limit = 16
     h = Hyperparameters()
     if h.w41_single_gpu_pilot:
-        h.distributed = False
         h.rank = 0
         h.world_size = 1
         h.local_rank = 0
