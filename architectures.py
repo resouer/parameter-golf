@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import math
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import torch
@@ -29,6 +31,21 @@ from torch import nn, Tensor
 # This is mainly for environments where Triton cache/build is flaky; H100 should
 # normally use Triton.
 _USE_NAIVE = os.environ.get("FLA_USE_NAIVE", "0") == "1"
+def _ensure_fla_installed() -> None:
+    try:
+        import fla  # noqa: F401
+        return
+    except ImportError:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", "flash-linear-attention==0.4.2"],
+            stdout=sys.stderr,
+            stderr=sys.stderr,
+        )
+
+
+_ensure_fla_installed()
+
+
 if _USE_NAIVE:
     try:
         # 1. Patch GatedDeltaNet's chunk op
