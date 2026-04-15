@@ -48,7 +48,7 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 2000))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 0))
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
@@ -354,9 +354,10 @@ def main():
         if rank == 0 and (step <= 5 or step % args.train_log_every == 0):
             tok_s = step * args.train_batch_tokens / max(time.perf_counter() - t0, 1e-9)
             print(f"{step}/{args.iterations} train_loss: {loss.item():.4f} train_time: {(time.perf_counter()-t0)/60:.1f}m tok/s: {tok_s:.0f}", flush=True)
-        if rank == 0 and args.val_loss_every > 0 and step % args.val_loss_every == 0:
+        if args.val_loss_every > 0 and step % args.val_loss_every == 0:
             val_loss, val_bpb = eval_val_sliding(model, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, rank, world_size, device, seq_len=args.eval_seq_len, stride=args.eval_stride, batch_seqs=64)
-            print(f"{step}/{args.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}", flush=True)
+            if rank == 0:
+                print(f"{step}/{args.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}", flush=True)
     if rank == 0:
         print(f"stopping_early: wallclock_cap train_time: {1e3*(time.perf_counter()-t0):.0f}ms step: {step}/{args.iterations}", flush=True)
     base = model.module if hasattr(model, "module") else model
