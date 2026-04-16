@@ -4,7 +4,8 @@
 
 FLA / GatedDeltaNet candidate using `K_KVShare_Wider` on a fuller
 upstream-style recipe. Nearest prior family reference: PR `#1370`.
-The packaged script avoids runtime dependency downloads from `train_gpt.py`.
+The packaged script avoids runtime dependency downloads from `train_gpt.py` and
+embeds its helper modules into a single submission script.
 
 ## Results
 
@@ -22,6 +23,7 @@ The packaged script avoids runtime dependency downloads from `train_gpt.py`.
 - fuller upstream-style recipe
 - EMA + SWA + late QAT + int6 artifact path
 - final scored line in all logs is `final_int6_roundtrip_exact`
+- packaged as a single self-contained `train_gpt.py`
 
 Not used:
 - no TTT
