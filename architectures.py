@@ -300,15 +300,27 @@ class HybridGDN(nn.Module):
         layout = cfg["layer_layout"]
         if layout == "gdn_only":
             for _ in range(cfg["num_gdn_layers"]):
-                mixer = GatedDeltaNet(
-                    hidden_size=dim,
-                    expand_v=cfg.get("gdn_expand_v", 1),
-                    head_dim=cfg.get("gdn_head_dim", 64),
-                    num_heads=cfg["num_heads"],
-                    use_short_conv=cfg.get("gdn_use_short_conv", True),
-                    allow_neg_eigval=cfg.get("gdn_allow_neg_eigval", False),
-                    mode="chunk",
-                )
+                if cfg.get("use_deltaproduct", False):
+                    mixer = GatedDeltaProduct(
+                        hidden_size=dim,
+                        expand_v=cfg.get("gdn_expand_v", 1),
+                        head_dim=cfg.get("gdn_head_dim", 64),
+                        num_heads=cfg["num_heads"],
+                        use_short_conv=cfg.get("gdn_use_short_conv", True),
+                        allow_neg_eigval=cfg.get("dp_allow_neg_eigval", False),
+                        num_householder=cfg.get("dp_num_householder", 2),
+                        mode="chunk",
+                    )
+                else:
+                    mixer = GatedDeltaNet(
+                        hidden_size=dim,
+                        expand_v=cfg.get("gdn_expand_v", 1),
+                        head_dim=cfg.get("gdn_head_dim", 64),
+                        num_heads=cfg["num_heads"],
+                        use_short_conv=cfg.get("gdn_use_short_conv", True),
+                        allow_neg_eigval=cfg.get("gdn_allow_neg_eigval", False),
+                        mode="chunk",
+                    )
                 self.blocks.append(RecurrentBlock(dim, mixer, cfg["mlp_mult"]))
         else:
             raise NotImplementedError(f"Unsupported initial FLA layout: {layout}")
