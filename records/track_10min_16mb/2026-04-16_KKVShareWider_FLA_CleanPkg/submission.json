@@ -1,8 +1,8 @@
 {
   "author": "zlei",
   "github_id": "resouer",
-  "name": "K_KVShare_Wider full-recipe FLA (cleanpkg)",
-  "blurb": "Canonicalized round-23 FLA/GatedDeltaNet candidate on K_KVShare_Wider. Uses the fuller upstream-style recipe and removes runtime dependency downloads from train_gpt.py. Exact 3-seed mean: 1.04089763 BPB / 3.16476760 nats.",
+  "name": "K_KVShare_Wider full-recipe FLA",
+  "blurb": "Canonical round-23 FLA/GatedDeltaNet candidate on K_KVShare_Wider with the fuller upstream-style recipe and no runtime dependency downloads in train_gpt.py.",
   "date": "2026-04-16",
   "track": "10min_16mb",
   "val_loss": 3.1647676,
@@ -34,11 +34,11 @@
       "steps": 1583
     }
   },
-  "based_on": "PR #1370 family (FLA / GatedDeltaNet)",
+  "based_on": "PR #1370 family",
   "artifact_bytes_mean": 15760667.666666666,
   "artifact_bytes_max": 15870797,
   "bytes_total": 15971815,
   "code_bytes": 91504,
   "hardware": "8xH100 80GB SXM",
-  "technique_summary": "K_KVShare_Wider + fuller upstream-style FLA recipe + EMA + SWA + late QAT + int6 artifact path; canonical no-runtime-download packaging"
+  "technique_summary": "K_KVShare_Wider + fuller upstream-style FLA recipe + EMA + SWA + late QAT + int6 artifact path"
 }
