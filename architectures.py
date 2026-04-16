@@ -385,6 +385,17 @@ class HybridGDN(nn.Module):
                 self._block_types.append("gdn")
             self.blocks.append(AttentionBlock(dim, self._shared_swa, cfg["mlp_mult"]))
             self._block_types.append("swa_shared")
+        elif layout == "swa_only":
+            for _ in range(cfg["num_swa_layers"]):
+                swa = SWAWrapper(
+                    dim=dim,
+                    num_heads=cfg["num_heads"],
+                    num_kv_heads=cfg.get("swa_num_kv_heads", 4),
+                    window=cfg.get("swa_window", 512),
+                    rope_base=rope_base,
+                )
+                self.blocks.append(AttentionBlock(dim, swa, cfg["mlp_mult"]))
+                self._block_types.append("swa")
         else:
             raise NotImplementedError(f"Unsupported initial FLA layout: {layout}")
         kv_stride = cfg.get("kv_sharing_stride", 0)

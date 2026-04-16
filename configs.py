@@ -191,12 +191,38 @@ def model_k_kv_share_wider() -> dict:
     )
 
 
+def model_h_pure_swa() -> dict:
+    """Model H: Pure sliding-window attention control."""
+    return dict(
+        arch_name="H_PureSWA",
+        num_gdn_layers=0,
+        num_mamba_layers=0,
+        num_swa_layers=10,
+        swa_shared=False,
+        model_dim=512,
+        num_heads=8,
+        mlp_mult=3.0,
+        gdn_expand_v=1,
+        gdn_head_dim=64,
+        gdn_allow_neg_eigval=False,
+        gdn_use_short_conv=True,
+        swa_window=512,
+        swa_num_kv_heads=4,
+        meta_tokens=0,
+        layer_layout="swa_only",
+        bigram_vocab_size=3072,
+        bigram_dim=112,
+        trigram=True,
+    )
+
+
 ALL_CONFIGS = {
     "A": model_a_pure_gdn,
     "B": model_b_deltaproduct,
     "B2": model_b2_deltaproduct_neg,
     "C": model_c_gdn_neg,
     "D": model_d_gdn_1swa,
+    "H": model_h_pure_swa,
     "I": model_i_kv_share,
     "J": model_j_kv_share_deeper,
     "K": model_k_kv_share_wider,
