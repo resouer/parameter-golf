@@ -684,6 +684,7 @@ def main():
 
     # Logging
     os.makedirs("logs", exist_ok=True)
+    os.makedirs(args.ckpt_dir, exist_ok=True)
     logfile = f"logs/{args.run_id}.txt" if master_process else None
 
     def log0(msg: str, console: bool = True):
