@@ -2,9 +2,9 @@
 
 **val_bpb: 1.0409** (3-seed mean, std 0.0011) | **3.1648 nats** | **8xH100 SXM, 600s** | **No TTT**
 
-Canonical round-23 FLA / GatedDeltaNet candidate on one script revision (`2b806d5`).
+FLA / GatedDeltaNet candidate on one script revision (`2b806d5`).
 Nearest prior family reference: PR `#1370`. This variant uses `K_KVShare_Wider`
-on the fuller upstream-style recipe and removes runtime dependency downloads from
+on the fuller upstream-style recipe and avoids runtime dependency downloads from
 `train_gpt.py`.
 
 ## Results

@@ -1,8 +1,8 @@
 {
-  "author": "zlei",
+  "author": "resouer",
   "github_id": "resouer",
   "name": "K_KVShare_Wider full-recipe FLA",
-  "blurb": "Canonical round-23 FLA/GatedDeltaNet candidate on K_KVShare_Wider with the fuller upstream-style recipe and no runtime dependency downloads in train_gpt.py.",
+  "blurb": "FLA/GatedDeltaNet candidate on K_KVShare_Wider with the fuller upstream-style recipe and no runtime dependency downloads in train_gpt.py.",
   "date": "2026-04-16",
   "track": "10min_16mb",
   "val_loss": 3.1647676,
