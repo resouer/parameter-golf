@@ -335,7 +335,16 @@ def main():
     step = 0
     while True:
         elapsed = time.perf_counter() - t0
-        if elapsed >= args.max_wallclock_seconds:
+        if args.distributed:
+            stop_flag = torch.tensor(
+                1 if elapsed >= args.max_wallclock_seconds else 0,
+                device=device,
+                dtype=torch.int32,
+            )
+            dist.all_reduce(stop_flag, op=dist.ReduceOp.MAX)
+            if int(stop_flag.item()) != 0:
+                break
+        elif elapsed >= args.max_wallclock_seconds:
             break
         x, y = loader.next_batch(args.train_batch_tokens, args.train_seq_len)
         opt_muon.zero_grad(set_to_none=True)
