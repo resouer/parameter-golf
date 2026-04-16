@@ -977,7 +977,7 @@ def main():
             loss_count = 0
 
         # Validation + checkpoint
-        if step % args.val_loss_every == 0 or step == args.iterations:
+        if (args.val_loss_every > 0 and step % args.val_loss_every == 0) or step == args.iterations:
             val_loss, val_bpb = eval_val_sliding(
                 model, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
                 rank, world_size, device,
