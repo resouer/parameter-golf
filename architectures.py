@@ -396,6 +396,65 @@ class HybridGDN(nn.Module):
                 )
                 self.blocks.append(AttentionBlock(dim, swa, cfg["mlp_mult"]))
                 self._block_types.append("swa")
+        elif layout == "mamba_only":
+            for _ in range(cfg["num_mamba_layers"]):
+                mamba_expand = cfg.get("mamba_expand", 2)
+                mamba_head_dim = cfg.get("gdn_head_dim", 64)
+                mamba_num_heads = (dim * mamba_expand) // mamba_head_dim
+                mixer = Mamba2(
+                    num_heads=mamba_num_heads,
+                    head_dim=mamba_head_dim,
+                    hidden_size=dim,
+                    state_size=cfg.get("mamba_state_size", 64),
+                    expand=mamba_expand,
+                )
+                self.blocks.append(RecurrentBlock(dim, mixer, cfg["mlp_mult"]))
+                self._block_types.append("mamba")
+        elif layout == "gdn3_mamba2_swa_gdn3_mamba2":
+            def make_gdn():
+                return GatedDeltaNet(
+                    hidden_size=dim,
+                    expand_v=cfg.get("gdn_expand_v", 1),
+                    head_dim=cfg.get("gdn_head_dim", 64),
+                    num_heads=cfg["num_heads"],
+                    use_short_conv=cfg.get("gdn_use_short_conv", True),
+                    allow_neg_eigval=cfg.get("gdn_allow_neg_eigval", False),
+                    mode="chunk",
+                )
+
+            def make_mamba():
+                mamba_expand = cfg.get("mamba_expand", 2)
+                mamba_head_dim = cfg.get("gdn_head_dim", 64)
+                mamba_num_heads = (dim * mamba_expand) // mamba_head_dim
+                return Mamba2(
+                    num_heads=mamba_num_heads,
+                    head_dim=mamba_head_dim,
+                    hidden_size=dim,
+                    state_size=cfg.get("mamba_state_size", 64),
+                    expand=mamba_expand,
+                )
+
+            for _ in range(3):
+                self.blocks.append(RecurrentBlock(dim, make_gdn(), cfg["mlp_mult"]))
+                self._block_types.append("gdn")
+            for _ in range(2):
+                self.blocks.append(RecurrentBlock(dim, make_mamba(), cfg["mlp_mult"]))
+                self._block_types.append("mamba")
+            swa = SWAWrapper(
+                dim=dim,
+                num_heads=cfg["num_heads"],
+                num_kv_heads=cfg.get("swa_num_kv_heads", 4),
+                window=cfg.get("swa_window", 512),
+                rope_base=rope_base,
+            )
+            self.blocks.append(AttentionBlock(dim, swa, cfg["mlp_mult"]))
+            self._block_types.append("swa")
+            for _ in range(3):
+                self.blocks.append(RecurrentBlock(dim, make_gdn(), cfg["mlp_mult"]))
+                self._block_types.append("gdn")
+            for _ in range(2):
+                self.blocks.append(RecurrentBlock(dim, make_mamba(), cfg["mlp_mult"]))
+                self._block_types.append("mamba")
         else:
             raise NotImplementedError(f"Unsupported initial FLA layout: {layout}")
         kv_stride = cfg.get("kv_sharing_stride", 0)
