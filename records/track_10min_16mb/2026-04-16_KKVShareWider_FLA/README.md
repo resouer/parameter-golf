@@ -5,7 +5,8 @@
 FLA / GatedDeltaNet candidate using `K_KVShare_Wider` on a fuller
 upstream-style recipe. Nearest prior family reference: PR `#1370`.
 The packaged script avoids runtime dependency downloads from `train_gpt.py` and
-embeds its helper modules into a single submission script.
+uses a packed single-file `train_gpt.py` in the same general style as other
+packed record scripts already present in the repository.
 
 ## Results
 

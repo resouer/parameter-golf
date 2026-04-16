@@ -37,8 +37,8 @@
   "based_on": "PR #1370 family",
   "artifact_bytes_mean": 15760667.666666666,
   "artifact_bytes_max": 15870797,
-  "bytes_total": 15931543,
-  "code_bytes": 29076,
+  "bytes_total": 15928163,
+  "code_bytes": 25696,
   "hardware": "8xH100 80GB SXM",
   "technique_summary": "K_KVShare_Wider + fuller upstream-style FLA recipe + EMA + SWA + late QAT + int6 artifact path; single-file packaged train_gpt.py"
 }
