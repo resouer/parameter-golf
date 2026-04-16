@@ -216,6 +216,22 @@ def model_h_pure_swa() -> dict:
     )
 
 
+def model_l_kv_share_wider_neg() -> dict:
+    """Model L: KV-share wider + negative eigenvalues."""
+    cfg = model_k_kv_share_wider()
+    cfg["arch_name"] = "L_KVShare_Wider_NegEig"
+    cfg["gdn_allow_neg_eigval"] = True
+    return cfg
+
+
+def model_m_gdn_1swa_wider() -> dict:
+    """Model M: wider shared-SWA hybrid."""
+    cfg = model_d_gdn_1swa()
+    cfg["arch_name"] = "M_GDN_1SWA_Wider"
+    cfg["model_dim"] = 544
+    return cfg
+
+
 ALL_CONFIGS = {
     "A": model_a_pure_gdn,
     "B": model_b_deltaproduct,
@@ -226,6 +242,8 @@ ALL_CONFIGS = {
     "I": model_i_kv_share,
     "J": model_j_kv_share_deeper,
     "K": model_k_kv_share_wider,
+    "L": model_l_kv_share_wider_neg,
+    "M": model_m_gdn_1swa_wider,
 }
 
 

@@ -22,12 +22,12 @@ import subprocess
 VOCAB_SIZE = int(os.environ.get("VOCAB_SIZE", 8192))
 DATA_PATH = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
 TOKENIZER_PATH = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
-ARCH_MODE = os.environ.get("ARCH_MODE", "H")
+ARCH_MODE = os.environ.get("ARCH_MODE", "L")
 os.environ.setdefault("VOCAB_SIZE", str(VOCAB_SIZE))
 os.environ.setdefault("DATA_PATH", DATA_PATH)
 os.environ.setdefault("TOKENIZER_PATH", TOKENIZER_PATH)
 os.environ.setdefault("ARCH_MODE", ARCH_MODE)
-if ARCH_MODE == "D":
+if ARCH_MODE in ("D", "M"):
     os.environ.setdefault("XSA_EVAL", "1")
 
 
