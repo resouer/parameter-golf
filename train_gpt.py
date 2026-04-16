@@ -22,7 +22,7 @@ import subprocess
 VOCAB_SIZE = int(os.environ.get("VOCAB_SIZE", 8192))
 DATA_PATH = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
 TOKENIZER_PATH = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
-ARCH_MODE = os.environ.get("ARCH_MODE", "G")
+ARCH_MODE = os.environ.get("ARCH_MODE", "F")
 os.environ.setdefault("VOCAB_SIZE", str(VOCAB_SIZE))
 os.environ.setdefault("DATA_PATH", DATA_PATH)
 os.environ.setdefault("TOKENIZER_PATH", TOKENIZER_PATH)
@@ -40,6 +40,13 @@ _W40_VENDOR_PKGS = [
     "tokenizers==0.22.2",
     "safetensors==0.7.0",
 ]
+if ARCH_MODE in ("F", "G"):
+    _W40_VENDOR_PKGS.extend(
+        [
+            "mamba-ssm==2.3.1",
+            "causal-conv1d==1.6.1",
+        ]
+    )
 
 
 def _ensure_w40_vendor_on_path() -> None:
@@ -51,7 +58,12 @@ def _ensure_w40_vendor_on_path() -> None:
 def _ensure_fla_vendor_installed() -> None:
     _ensure_w40_vendor_on_path()
     try:
-        from fla.layers.gated_deltanet import GatedDeltaNet  # noqa: F401
+        if ARCH_MODE in ("F", "G"):
+            from fla.layers.mamba2 import Mamba2  # noqa: F401
+            from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined  # noqa: F401
+            from causal_conv1d import causal_conv1d_fn  # noqa: F401
+        else:
+            from fla.layers.gated_deltanet import GatedDeltaNet  # noqa: F401
         print("w40_wrapper: local vendor layered import already works", flush=True)
         return
     except Exception:
@@ -63,7 +75,12 @@ def _ensure_fla_vendor_installed() -> None:
         fcntl.flock(lockf, fcntl.LOCK_EX)
         _ensure_w40_vendor_on_path()
         try:
-            from fla.layers.gated_deltanet import GatedDeltaNet  # noqa: F401
+            if ARCH_MODE in ("F", "G"):
+                from fla.layers.mamba2 import Mamba2  # noqa: F401
+                from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined  # noqa: F401
+                from causal_conv1d import causal_conv1d_fn  # noqa: F401
+            else:
+                from fla.layers.gated_deltanet import GatedDeltaNet  # noqa: F401
             print("w40_wrapper: local vendor layered import became available after lock wait", flush=True)
             return
         except Exception:
@@ -88,7 +105,12 @@ def _ensure_fla_vendor_installed() -> None:
         )
         importlib.invalidate_caches()
         _ensure_w40_vendor_on_path()
-        from fla.layers.gated_deltanet import GatedDeltaNet  # noqa: F401
+        if ARCH_MODE in ("F", "G"):
+            from fla.layers.mamba2 import Mamba2  # noqa: F401
+            from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined  # noqa: F401
+            from causal_conv1d import causal_conv1d_fn  # noqa: F401
+        else:
+            from fla.layers.gated_deltanet import GatedDeltaNet  # noqa: F401
         print("w40_wrapper: vendored FLA layered import succeeded", flush=True)
 
 
