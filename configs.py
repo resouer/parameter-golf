@@ -88,11 +88,37 @@ def model_c_gdn_neg() -> dict:
     )
 
 
+def model_d_gdn_1swa() -> dict:
+    """Model D: GDN + 1 shared SWA (Zamba-style)."""
+    return dict(
+        arch_name="D_GDN_1SWA",
+        num_gdn_layers=10,
+        num_mamba_layers=0,
+        num_swa_layers=1,
+        swa_shared=True,
+        model_dim=512,
+        num_heads=8,
+        mlp_mult=3.0,
+        gdn_expand_v=1,
+        gdn_head_dim=64,
+        gdn_allow_neg_eigval=False,
+        gdn_use_short_conv=True,
+        swa_window=512,
+        swa_num_kv_heads=4,
+        meta_tokens=0,
+        layer_layout="gdn5_swa_gdn5_swa_shared",
+        bigram_vocab_size=3072,
+        bigram_dim=112,
+        trigram=True,
+    )
+
+
 ALL_CONFIGS = {
     "A": model_a_pure_gdn,
     "B": model_b_deltaproduct,
     "B2": model_b2_deltaproduct_neg,
     "C": model_c_gdn_neg,
+    "D": model_d_gdn_1swa,
 }
 
 

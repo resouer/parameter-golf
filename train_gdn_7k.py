@@ -382,7 +382,7 @@ def main():
         base.load_state_dict({name: t.to(dtype=base.state_dict()[name].dtype) for name, t in ema_state.items()}, strict=True)
         if rank == 0:
             print("final_eval:ema_loaded", flush=True)
-        val_loss, val_bpb = eval_val_sliding(base, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, rank, world_size, device, seq_len=args.eval_seq_len, stride=args.eval_stride, batch_seqs=64)
+        val_loss, val_bpb = eval_val_sliding(base, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, rank, world_size, device, seq_len=args.eval_seq_len, stride=args.eval_stride, batch_seqs=64, xsa_eval=args.xsa_eval)
         if rank == 0:
             print("final_eval:done", flush=True)
             print(f"pre-quantization post-ema val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f}", flush=True)

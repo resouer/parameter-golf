@@ -220,6 +220,16 @@ class SWAWrapper(nn.Module):
         self.o = CastedLinear(dim, dim, bias=False)
         self.rotary = Rotary(self.head_dim, rope_base)
         self.q_gain = nn.Parameter(torch.full((num_heads,), 5.0))
+        self.use_xsa = False
+
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        B, T, H, D = y.shape
+        Hkv = v.size(-2)
+        group = H // Hkv
+        y_g = y.reshape(B, T, Hkv, group, D)
+        vn = F.normalize(v, dim=-1).unsqueeze(-2)
+        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
+        return (y_g - proj).reshape(B, T, H, D)
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, C = x.shape
@@ -247,7 +257,10 @@ class SWAWrapper(nn.Module):
             is_causal=True,
             enable_gqa=False,
         )
-        out = out.transpose(1, 2).reshape(B, T, C)
+        out = out.transpose(1, 2)
+        if self.use_xsa:
+            out = self._xsa_efficient(out, v)
+        out = out.reshape(B, T, C)
         return self.o(out)
 
 
@@ -283,6 +296,25 @@ class RecurrentBlock(nn.Module):
         return x
 
 
+class AttentionBlock(nn.Module):
+    """Wraps an attention-style token mixer with its own residual path and MLP."""
+    def __init__(self, dim: int, mixer: nn.Module, mlp_mult: float):
+        super().__init__()
+        self.attn_norm = RMSNorm(dim)
+        self.mlp_norm = RMSNorm(dim)
+        self.attn = mixer
+        self.attn_scale = nn.Parameter(torch.tensor(1.0))
+        self.mlp_scale = nn.Parameter(torch.tensor(1.0))
+        self.mlp = MLP(dim, int(dim * mlp_mult))
+
+    def forward(self, x: Tensor, x0: Tensor | None = None) -> Tensor:
+        x_in = self.attn_norm(x)
+        attn_out = self.attn(x_in)
+        x = x + self.attn_scale.to(dtype=x.dtype) * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
+        return x
+
+
 class HybridGDN(nn.Module):
     """Minimal GDN-first architecture scaffold from PR #1370."""
     def __init__(self, cfg: dict, vocab_size: int, rope_base: float = 10000.0, tie_embeddings: bool = True, logit_softcap: float = 30.0):
@@ -297,6 +329,8 @@ class HybridGDN(nn.Module):
         self.bigram = BigramHash(cfg.get("bigram_vocab_size", vocab_size), cfg.get("bigram_dim", 0), trigram=cfg.get("trigram", False)) if cfg.get("bigram_dim", 0) > 0 else None
         self.embed_proj = CastedLinear(dim + cfg.get("bigram_dim", 0), dim, bias=False) if self.bigram is not None else None
         self.blocks = nn.ModuleList()
+        self._shared_swa = None
+        self._block_types = []
         layout = cfg["layer_layout"]
         if layout == "gdn_only":
             for _ in range(cfg["num_gdn_layers"]):
@@ -322,14 +356,44 @@ class HybridGDN(nn.Module):
                         mode="chunk",
                     )
                 self.blocks.append(RecurrentBlock(dim, mixer, cfg["mlp_mult"]))
+                self._block_types.append("gdn")
+        elif layout == "gdn5_swa_gdn5_swa_shared":
+            def make_gdn():
+                return GatedDeltaNet(
+                    hidden_size=dim,
+                    expand_v=cfg.get("gdn_expand_v", 1),
+                    head_dim=cfg.get("gdn_head_dim", 64),
+                    num_heads=cfg["num_heads"],
+                    use_short_conv=cfg.get("gdn_use_short_conv", True),
+                    allow_neg_eigval=cfg.get("gdn_allow_neg_eigval", False),
+                    mode="chunk",
+                )
+            for _ in range(5):
+                self.blocks.append(RecurrentBlock(dim, make_gdn(), cfg["mlp_mult"]))
+                self._block_types.append("gdn")
+            self._shared_swa = SWAWrapper(
+                dim=dim,
+                num_heads=cfg["num_heads"],
+                num_kv_heads=cfg.get("swa_num_kv_heads", 4),
+                window=cfg.get("swa_window", 512),
+                rope_base=rope_base,
+            )
+            self.blocks.append(AttentionBlock(dim, self._shared_swa, cfg["mlp_mult"]))
+            self._block_types.append("swa")
+            for _ in range(5):
+                self.blocks.append(RecurrentBlock(dim, make_gdn(), cfg["mlp_mult"]))
+                self._block_types.append("gdn")
+            self.blocks.append(AttentionBlock(dim, self._shared_swa, cfg["mlp_mult"]))
+            self._block_types.append("swa_shared")
         else:
             raise NotImplementedError(f"Unsupported initial FLA layout: {layout}")
         self.final_norm = RMSNorm(dim)
         self.lm_head = None if tie_embeddings else CastedLinear(dim, vocab_size, bias=False)
 
     def set_xsa(self, enabled: bool):
-        # Compatibility hook used by the fetched eval path.
-        return
+        for block_type, block in zip(self._block_types, self.blocks):
+            if block_type in ("swa", "swa_shared"):
+                block.attn.use_xsa = enabled
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
