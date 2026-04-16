@@ -29,6 +29,7 @@ os.environ.setdefault("TOKENIZER_PATH", TOKENIZER_PATH)
 os.environ.setdefault("ARCH_MODE", ARCH_MODE)
 os.environ.setdefault("MAX_WALLCLOCK_SECONDS", "600")
 os.environ.setdefault("VAL_LOSS_EVERY", "0")
+os.environ.setdefault("EVAL_COMPILE_ENABLED", "0")
 if ARCH_MODE in ("D", "G", "M"):
     os.environ.setdefault("XSA_EVAL", "1")
 

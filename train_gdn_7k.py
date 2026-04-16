@@ -93,6 +93,7 @@ class Hyperparameters:
     # Eval
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     xsa_eval = bool(int(os.environ.get("XSA_EVAL", "0")))  # during training
+    eval_compile_enabled = bool(int(os.environ.get("EVAL_COMPILE_ENABLED", "1")))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Checkpoint
@@ -297,6 +298,7 @@ def eval_val_sliding(
     stride: int = 64,
     batch_seqs: int = 128,
     xsa_eval: bool = False,
+    compile_enabled: bool = True,
 ) -> tuple[float, float]:
     """Score-first sliding window evaluation."""
     total_tokens = val_tokens.numel() - 1
@@ -317,10 +319,12 @@ def eval_val_sliding(
         base_model.set_xsa(True)
 
     forward_fn = base_model.forward_logits
-    try:
-        compiled_logits = torch.compile(forward_fn, dynamic=False)
-    except Exception:
-        compiled_logits = forward_fn
+    compiled_logits = forward_fn
+    if compile_enabled:
+        try:
+            compiled_logits = torch.compile(forward_fn, dynamic=False)
+        except Exception:
+            compiled_logits = forward_fn
 
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
@@ -708,6 +712,7 @@ def main():
     log0(f"World size: {world_size}, Grad accum: {grad_accum_steps}")
     log0(f"EMA decay: {args.ema_decay}, SWA: {args.swa_enabled} (every {args.swa_every})")
     log0(f"Late QAT threshold: {args.late_qat_threshold}")
+    log0(f"Eval compile enabled: {args.eval_compile_enabled}")
 
     # Tokenizer
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
@@ -984,6 +989,7 @@ def main():
                 rank, world_size, device,
                 seq_len=args.eval_seq_len, stride=args.eval_stride,
                 xsa_eval=args.xsa_eval,
+                compile_enabled=args.eval_compile_enabled,
             )
             log0(f"step {step:5d} | val_loss {val_loss:.4f} | val_bpb {val_bpb:.4f}")
 
@@ -1058,6 +1064,7 @@ def main():
         rank, world_size, device,
         seq_len=args.eval_seq_len, stride=args.eval_stride,
         xsa_eval=False,
+        compile_enabled=args.eval_compile_enabled,
     )
     log0(f"EMA BPB (no XSA): {val_bpb_ema:.6f}")
 
@@ -1127,6 +1134,7 @@ def main():
         rank, world_size, device,
         seq_len=args.eval_seq_len, stride=args.eval_stride,
         xsa_eval=False,
+        compile_enabled=args.eval_compile_enabled,
     )
     log0(f"Quantized BPB (no XSA): {val_bpb_q:.6f}")
     log0(f"Quantization degradation: {val_bpb_q - val_bpb_ema:+.6f}")
@@ -1139,6 +1147,7 @@ def main():
             rank, world_size, device,
             seq_len=args.eval_seq_len, stride=args.eval_stride,
             xsa_eval=True,
+            compile_enabled=args.eval_compile_enabled,
         )
         log0(f"Quantized BPB (XSA-all): {val_bpb_qx:.6f}")
 
