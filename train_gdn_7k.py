@@ -66,6 +66,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    xsa_eval = bool(int(os.environ.get("XSA_EVAL", "0")))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     compile_enabled = bool(int(os.environ.get("COMPILE_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
