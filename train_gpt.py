@@ -7,14 +7,10 @@ this wrapper preserves the normal repo entrypoint while we validate the FLA
 lane on Heimdall.
 """
 
-import importlib
-import fcntl
 import os
-import shutil
 import sys
 import traceback
 from pathlib import Path
-import subprocess
 
 # These explicit defaults serve two purposes:
 # 1. They make the remote evaluate.py vocabulary detector pick the SP8192 path.
@@ -58,7 +54,7 @@ def _ensure_w40_vendor_on_path() -> None:
         sys.path.insert(0, p)
 
 
-def _ensure_fla_vendor_installed() -> None:
+def _ensure_fla_vendor_available() -> None:
     _ensure_w40_vendor_on_path()
     try:
         if ARCH_MODE in ("F", "G"):
@@ -70,55 +66,16 @@ def _ensure_fla_vendor_installed() -> None:
         print("w40_wrapper: local vendor layered import already works", flush=True)
         return
     except Exception:
-        pass
-
-    lock_path = _W40_VENDOR_DIR.parent / ".w40_vendor.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as lockf:
-        fcntl.flock(lockf, fcntl.LOCK_EX)
-        _ensure_w40_vendor_on_path()
-        try:
-            if ARCH_MODE in ("F", "G"):
-                from fla.layers.mamba2 import Mamba2  # noqa: F401
-                from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined  # noqa: F401
-                from causal_conv1d import causal_conv1d_fn  # noqa: F401
-            else:
-                from fla.layers.gated_deltanet import GatedDeltaNet  # noqa: F401
-            print("w40_wrapper: local vendor layered import became available after lock wait", flush=True)
-            return
-        except Exception:
-            pass
-        print(f"w40_wrapper: installing vendored FLA deps into {_W40_VENDOR_DIR}", flush=True)
-        shutil.rmtree(_W40_VENDOR_DIR, ignore_errors=True)
-        _W40_VENDOR_DIR.mkdir(parents=True, exist_ok=True)
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--no-cache-dir",
-                "--no-deps",
-                "--target",
-                str(_W40_VENDOR_DIR),
-                *_W40_VENDOR_PKGS,
-            ],
-            stdout=sys.stderr,
-            stderr=sys.stderr,
+        vendor_pkgs = ", ".join(_W40_VENDOR_PKGS)
+        raise RuntimeError(
+            "w40_wrapper: required FLA deps are missing from the local environment. "
+            f"Expected vendored packages under {_W40_VENDOR_DIR}. "
+            f"Install them before evaluation (e.g. via launcher/requirements), packages: {vendor_pkgs}"
         )
-        importlib.invalidate_caches()
-        _ensure_w40_vendor_on_path()
-        if ARCH_MODE in ("F", "G"):
-            from fla.layers.mamba2 import Mamba2  # noqa: F401
-            from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined  # noqa: F401
-            from causal_conv1d import causal_conv1d_fn  # noqa: F401
-        else:
-            from fla.layers.gated_deltanet import GatedDeltaNet  # noqa: F401
-        print("w40_wrapper: vendored FLA layered import succeeded", flush=True)
 
 
 def main():
-    _ensure_fla_vendor_installed()
+    _ensure_fla_vendor_available()
     print("w40_wrapper: importing train_gdn_7k", flush=True)
     try:
         from train_gdn_7k import main as train_main

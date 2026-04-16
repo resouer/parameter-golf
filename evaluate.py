@@ -218,6 +218,19 @@ fi
 GIT_TERMINAL_PROMPT=0 git clone --quiet --filter=blob:none --no-tags "$CLONE_URL" /workspace/pgolf
 """
 
+    fla_setup = """
+if grep -q "_W40_VENDOR_PKGS" train_gpt.py 2>/dev/null; then
+  mkdir -p .w40_vendor
+  PIP_NO_CACHE_DIR=1 python3 -m pip install -q --no-cache-dir --no-deps --target ./.w40_vendor \\
+    triton==3.2.0 \\
+    flash-linear-attention==0.4.2 \\
+    fla-core==0.4.2 \\
+    transformers==5.5.4 \\
+    tokenizers==0.22.2 \\
+    safetensors==0.7.0
+fi
+"""
+
     return f"""set -e
 PIP_NO_CACHE_DIR=1 pip install -q --no-cache-dir sentencepiece huggingface-hub tiktoken zstandard brotli 2>/dev/null || true
 
@@ -230,6 +243,7 @@ rm -rf .git /root/.cache/pip ~/.cache/pip /tmp/pip-cache
 export PYTHONUNBUFFERED=1
 
 {data_setup}
+{fla_setup}
 
 torchrun --nproc_per_node=8 train_gpt.py
 RC=$?
@@ -376,6 +390,8 @@ def _log_path(job_id):
 def _has_final_results_content(content):
     """Return True only when the final metric for the active eval mode is present."""
     if "results_json" in content:
+        return True
+    if "final_int6_roundtrip_exact" in content:
         return True
     # SLOT runs after roundtrip/sliding and must not be cut off early.
     if "slot_enabled: True" in content:
@@ -533,6 +549,13 @@ def _extract_results(logs):
                 continue
             except (json.JSONDecodeError, IndexError):
                 pass
+        if "final_int6_roundtrip_exact" in line and re.search(r"val_bpb[=:]", line):
+            m = re.search(r"val_bpb[=:](\d+\.\d+)", line)
+            if m:
+                results["val_bpb"] = float(m.group(1))
+            m = re.search(r"val_loss[=:](\d+\.\d+)", line)
+            if m:
+                results["val_loss"] = float(m.group(1))
         # Match any eval result line: has val_bpb AND eval_time (or ttt done marker).
         # This covers all eval methods (roundtrip, sliding, TTT, future) without keyword updates.
         # Training checkpoints (e.g., "4000/20000 val_bpb: 1.13") lack eval_time so are excluded.
@@ -548,8 +571,16 @@ def _extract_results(logs):
             m = re.search(r"(\d+)\s*bytes", line)
             if m:
                 results["bytes_total"] = int(m.group(1))
+        if "Artifact:" in line:
+            m = re.search(r"Artifact:\s*([\d,]+)\s*bytes", line)
+            if m:
+                results["bytes_total"] = int(m.group(1).replace(",", ""))
         if "peak memory allocated" in line:
             m = re.search(r"(\d+)\s*MiB", line)
+            if m:
+                results["peak_memory_mib"] = int(m.group(1))
+        if "Peak memory:" in line:
+            m = re.search(r"Peak memory:\s*(\d+)\s*MiB", line)
             if m:
                 results["peak_memory_mib"] = int(m.group(1))
     return results
@@ -563,6 +594,17 @@ def _log(msg):
     print(f"[evaluate] {msg}", file=sys.stderr)
 
 
+def _result_file_path() -> str:
+    explicit = (
+        os.environ.get("AUTORESEARCH_RESULT_FILE")
+        or os.environ.get("PGOLF_RESULT_FILE")
+        or ""
+    ).strip()
+    if explicit:
+        return os.path.expanduser(explicit)
+    return os.path.join(WORKSPACE, f"last_result.{os.getpid()}.json")
+
+
 def _output(pass_val, score=None, details=None, error=None):
     result = {"pass": pass_val}
     if score is not None:
@@ -572,7 +614,7 @@ def _output(pass_val, score=None, details=None, error=None):
     if error:
         result["error"] = error
     # Persist result to file BEFORE stdout — survives parent process kill.
-    result_file = os.path.join(WORKSPACE, "last_result.json")
+    result_file = _result_file_path()
     try:
         with open(result_file, "w") as f:
             json.dump(result, f)
@@ -608,7 +650,7 @@ def main():
                 results = _extract_results(log_content)
                 if results.get("val_bpb"):
                     _log(f"Saved partial results: val_bpb={results['val_bpb']}")
-                    result_file = os.path.join(WORKSPACE, "last_result.json")
+                    result_file = _result_file_path()
                     with open(result_file, "w") as f:
                         json.dump({"pass": False, "error": f"killed by signal {signum}",
                                    "score": -results["val_bpb"], "details": results}, f)
