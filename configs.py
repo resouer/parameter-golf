@@ -113,12 +113,93 @@ def model_d_gdn_1swa() -> dict:
     )
 
 
+def model_i_kv_share() -> dict:
+    """Model I: GDN + KV share — same as A but with kv_sharing_stride=2."""
+    return dict(
+        arch_name="I_KVShare",
+        num_gdn_layers=10,
+        num_mamba_layers=0,
+        num_swa_layers=0,
+        swa_shared=False,
+        model_dim=512,
+        num_heads=8,
+        mlp_mult=3.0,
+        gdn_expand_v=1,
+        gdn_head_dim=64,
+        gdn_allow_neg_eigval=False,
+        gdn_use_short_conv=True,
+        swa_window=512,
+        swa_num_kv_heads=4,
+        meta_tokens=0,
+        layer_layout="gdn_only",
+        bigram_vocab_size=3072,
+        bigram_dim=112,
+        trigram=True,
+        kv_sharing_stride=2,
+    )
+
+
+def model_j_kv_share_deeper() -> dict:
+    """Model J: GDN + KV share + deeper — 12L dim=480 near iso-param to A."""
+    return dict(
+        arch_name="J_KVShare_Deeper",
+        num_gdn_layers=12,
+        num_mamba_layers=0,
+        num_swa_layers=0,
+        swa_shared=False,
+        model_dim=480,
+        num_heads=8,
+        mlp_mult=3.0,
+        gdn_expand_v=1,
+        gdn_head_dim=64,
+        gdn_allow_neg_eigval=False,
+        gdn_use_short_conv=True,
+        swa_window=512,
+        swa_num_kv_heads=4,
+        meta_tokens=0,
+        layer_layout="gdn_only",
+        bigram_vocab_size=3072,
+        bigram_dim=112,
+        trigram=True,
+        kv_sharing_stride=2,
+    )
+
+
+def model_k_kv_share_wider() -> dict:
+    """Model K: GDN + KV share + wider — 10L dim=544 near iso-param to A."""
+    return dict(
+        arch_name="K_KVShare_Wider",
+        num_gdn_layers=10,
+        num_mamba_layers=0,
+        num_swa_layers=0,
+        swa_shared=False,
+        model_dim=544,
+        num_heads=8,
+        mlp_mult=3.0,
+        gdn_expand_v=1,
+        gdn_head_dim=64,
+        gdn_allow_neg_eigval=False,
+        gdn_use_short_conv=True,
+        swa_window=512,
+        swa_num_kv_heads=4,
+        meta_tokens=0,
+        layer_layout="gdn_only",
+        bigram_vocab_size=3072,
+        bigram_dim=112,
+        trigram=True,
+        kv_sharing_stride=2,
+    )
+
+
 ALL_CONFIGS = {
     "A": model_a_pure_gdn,
     "B": model_b_deltaproduct,
     "B2": model_b2_deltaproduct_neg,
     "C": model_c_gdn_neg,
     "D": model_d_gdn_1swa,
+    "I": model_i_kv_share,
+    "J": model_j_kv_share_deeper,
+    "K": model_k_kv_share_wider,
 }
 
 

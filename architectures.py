@@ -387,8 +387,25 @@ class HybridGDN(nn.Module):
             self._block_types.append("swa_shared")
         else:
             raise NotImplementedError(f"Unsupported initial FLA layout: {layout}")
+        kv_stride = cfg.get("kv_sharing_stride", 0)
+        if kv_stride > 0:
+            self._apply_kv_sharing(kv_stride)
         self.final_norm = RMSNorm(dim)
         self.lm_head = None if tie_embeddings else CastedLinear(dim, vocab_size, bias=False)
+
+    def _apply_kv_sharing(self, stride: int) -> None:
+        gdn_indices = [i for i, t in enumerate(self._block_types) if t == "gdn"]
+        for group_start in range(0, len(gdn_indices), stride):
+            anchor_idx = gdn_indices[group_start]
+            anchor = self.blocks[anchor_idx].recurrent
+            for j in range(1, stride):
+                if group_start + j >= len(gdn_indices):
+                    break
+                follower_idx = gdn_indices[group_start + j]
+                follower = self.blocks[follower_idx].recurrent
+                for attr in ("k_proj", "v_proj", "k_conv1d", "v_conv1d"):
+                    if hasattr(anchor, attr) and hasattr(follower, attr):
+                        setattr(follower, attr, getattr(anchor, attr))
 
     def set_xsa(self, enabled: bool):
         for block_type, block in zip(self._block_types, self.blocks):
