@@ -1,4 +1,4 @@
-import base64, collections, copy, fcntl, glob, io, json, lzma, math, os
+import base64, collections, copy, fcntl, glob, io, json, lzma, math, os, shutil
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import nn
@@ -1930,10 +1930,16 @@ def _rebank_state_dict(flat_sd, num_layers, model_dim, kv_dim, hidden_dim):
 
 def _compressed_code_size(code):
     code_raw = code.encode("utf-8")
-    minified = subprocess.run(
-        ["pyminify", "--no-rename-locals", "--no-hoist-literals", "--remove-literal-statements", "-"],
-        input=code_raw, capture_output=True, check=True,
-    ).stdout
+    minified = code_raw
+    pyminify = shutil.which("pyminify")
+    if pyminify:
+        try:
+            minified = subprocess.run(
+                [pyminify, "--no-rename-locals", "--no-hoist-literals", "--remove-literal-statements", "-"],
+                input=code_raw, capture_output=True, check=True,
+            ).stdout
+        except Exception:
+            minified = code_raw
     compressed = lzma.compress(minified)
     encoded = base64.b85encode(compressed)
     wrapper = b'import lzma as L,base64 as B\nexec(L.decompress(B.b85decode("' + encoded + b'")))\n'
