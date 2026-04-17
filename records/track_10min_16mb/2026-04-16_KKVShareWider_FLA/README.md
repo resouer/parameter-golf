@@ -4,9 +4,7 @@
 
 FLA / GatedDeltaNet candidate using `K_KVShare_Wider` on a fuller
 upstream-style recipe. Nearest prior family reference: PR `#1370`.
-The packaged script avoids runtime dependency downloads from `train_gpt.py` and
-uses a packed single-file `train_gpt.py` in the same general style as other
-packed record scripts already present in the repository.
+The packaged script avoids runtime dependency downloads from `train_gpt.py`.
 
 ## Results
 
@@ -24,7 +22,6 @@ packed record scripts already present in the repository.
 - fuller upstream-style recipe
 - EMA + SWA + late QAT + int6 artifact path
 - final scored line in all logs is `final_int6_roundtrip_exact`
-- packaged as a single self-contained `train_gpt.py`
 
 Not used:
 - no TTT
@@ -46,11 +43,7 @@ Not used:
 Install dependencies before evaluation:
 
 ```bash
-# If you are not already on the competition/runtime image, install torch first.
-# Example:
-# pip install torch==2.9.1+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
-
-pip install --no-deps -r requirements.txt
+pip install -r requirements.txt
 ```
 
 Prepare the SP8192 cached dataset/tokenizer as usual, then run one seed with:

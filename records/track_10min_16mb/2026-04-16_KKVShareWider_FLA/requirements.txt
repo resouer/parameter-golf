@@ -1,6 +1,5 @@
-# Install these on top of the competition torch runtime.
-# If self-setting up from scratch, install torch separately first.
 numpy
+torch
 sentencepiece
 zstandard
 flash-linear-attention==0.4.2
