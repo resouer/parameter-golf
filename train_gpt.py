@@ -107,7 +107,7 @@ class Hyperparameters:
     gate_width = int(os.environ.get("GATE_WIDTH", 12))
     # SmearGate (modded-nanogpt, @classiclarryd, 2025-09-18): forward-1 token smear.
     # OFF by default (smear_gate_enabled=0). Init: W=0, lambda=0 → transparent.
-    smear_gate_enabled = bool(int(os.environ.get("SMEAR_GATE", "1")))
+    smear_gate_enabled = bool(int(os.environ.get("SMEAR_GATE", "0")))
     smear_gate_width = int(os.environ.get("SMEAR_GATE_WIDTH", 12))
     # Gate Linears reuse scalar_lr via CONTROL_TENSOR_NAME_PATTERNS (same as
     # train_experiment.py) — no separate gate_lr group.
