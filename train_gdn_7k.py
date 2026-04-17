@@ -770,7 +770,8 @@ def main():
     # DDP
     base_model = model  # keep reference before wrapping
     if distributed:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        log0("DDP config: find_unused_parameters=False")
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     # Optimizer setup
     matrix_params = []
