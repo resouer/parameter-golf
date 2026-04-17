@@ -190,19 +190,28 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
 
 
 def build_sentencepiece_luts(sp, vocab_size, device):
-    base_bytes = torch.zeros(vocab_size, dtype=torch.float32, device=device)
-    has_space = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-    is_boundary = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-    for i in range(vocab_size):
+    sp_vocab_size = int(sp.vocab_size())
+    table_size = max(sp_vocab_size, vocab_size)
+    base_bytes_np = np.zeros((table_size,), dtype=np.int16)
+    has_space_np = np.zeros((table_size,), dtype=np.bool_)
+    is_boundary_np = np.ones((table_size,), dtype=np.bool_)
+    for i in range(sp_vocab_size):
+        if sp.is_control(i) or sp.is_unknown(i) or sp.is_unused(i):
+            continue
+        is_boundary_np[i] = False
+        if sp.is_byte(i):
+            base_bytes_np[i] = 1
+            continue
         piece = sp.id_to_piece(i)
-        raw = piece.encode("utf-8")
-        base_bytes[i] = len(raw)
         if piece.startswith("\u2581"):
-            has_space[i] = True
-            base_bytes[i] = len(piece[1:].encode("utf-8")) + 1
-        if sp.is_control(i) or sp.is_unknown(i):
-            is_boundary[i] = True
-    return base_bytes, has_space, is_boundary
+            has_space_np[i] = True
+            piece = piece[1:]
+        base_bytes_np[i] = len(piece.encode("utf-8"))
+    return (
+        torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
+        torch.tensor(has_space_np, dtype=torch.bool, device=device),
+        torch.tensor(is_boundary_np, dtype=torch.bool, device=device),
+    )
 
 
 def generate_coprime_shard_order(shard_files: list, seed: int = 42) -> list:
