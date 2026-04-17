@@ -46,7 +46,11 @@ Not used:
 Install dependencies before evaluation:
 
 ```bash
-pip install -r requirements.txt
+# If you are not already on the competition/runtime image, install torch first.
+# Example:
+# pip install torch==2.9.1+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
+
+pip install --no-deps -r requirements.txt
 ```
 
 Prepare the SP8192 cached dataset/tokenizer as usual, then run one seed with:
