@@ -2726,10 +2726,8 @@ def train_and_eval(h, device):
         base_model.load_state_dict(torch.load(h.eval_only_path, map_location=device))
         if h.num_loops > 0:
             base_model.looping_active = True
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-        compiled_forward_logits = torch.compile(
-            base_model.forward_logits, dynamic=False, fullgraph=True
-        )
+        compiled_model = base_model
+        compiled_forward_logits = base_model.forward_logits
     else:
         log(
             f"train_shards: {len(list(Path(h.datasets_dir).resolve().glob('fineweb_train_*.bin')))}"
@@ -2761,10 +2759,8 @@ def train_and_eval(h, device):
     eval_model = deserialize(h, device)
     if h.num_loops > 0:
         eval_model.looping_active = True
-    compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
-    compiled_forward_logits = torch.compile(
-        eval_model.forward_logits, dynamic=False, fullgraph=True
-    )
+    compiled_model = eval_model
+    compiled_forward_logits = eval_model.forward_logits
     timed_eval(
         "diagnostic quantized",
         eval_val,
@@ -2808,13 +2804,8 @@ def train_and_eval(h, device):
         def _fwd_ttt_inner(input_ids, target_ids, lora):
             return ttt_model.forward_ttt(input_ids, target_ids, lora=lora)
 
-        _fwd_ttt_compiled_inner = None
-
         def _fwd_ttt(input_ids, target_ids, lora):
-            nonlocal _fwd_ttt_compiled_inner
-            if _fwd_ttt_compiled_inner is None:
-                _fwd_ttt_compiled_inner = torch.compile(_fwd_ttt_inner, dynamic=True)
-            return _fwd_ttt_compiled_inner(input_ids, target_ids, lora=lora)
+            return _fwd_ttt_inner(input_ids, target_ids, lora=lora)
 
         _ttt_debug_bypass = bool(os.environ.get("TTT_DEBUG_BYPASS"))
         if _ttt_debug_bypass:
@@ -2830,37 +2821,7 @@ def train_and_eval(h, device):
             log("ttt_lora:DEBUG BYPASS active - using forward_logits directly (no compile warmup)")
         else:
             fwd_ttt_compiled = _fwd_ttt
-            log(f"ttt_lora:warming up compile (random tokens, no val data)")
-            global BOS_ID
-            if BOS_ID is None:
-                BOS_ID = 1
-            t_warmup = time.perf_counter()
-            warmup_bszes = [h.ttt_batch_size]
-            for bsz in warmup_bszes:
-                wl = BatchedTTTLoRA(
-                    bsz, ttt_model, h.ttt_lora_rank,
-                    k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
-                ).to(device)
-                wo = torch.optim.AdamW(
-                    wl.parameters(),
-                    lr=h.ttt_lora_lr,
-                    betas=(h.ttt_beta1, h.ttt_beta2),
-                    eps=1e-10,
-                    weight_decay=h.ttt_weight_decay,
-                    fused=True,
-                )
-                for ctx_len in (h.ttt_chunk_size, h.ttt_eval_seq_len):
-                    xw = torch.randint(0, h.vocab_size, (bsz, ctx_len), device=device, dtype=torch.int64)
-                    yw = torch.randint(0, h.vocab_size, (bsz, ctx_len), device=device, dtype=torch.int64)
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        ptl = fwd_ttt_compiled(xw, yw, lora=wl)
-                    ptl[:, : min(h.ttt_chunk_size, ctx_len)].mean(dim=-1).sum().backward()
-                    wo.step()
-                    wo.zero_grad(set_to_none=True)
-                del wl, wo
-            torch.cuda.empty_cache()
-            compile_elapsed = time.perf_counter() - t_warmup
-            log(f"ttt_lora:compile warmup done ({compile_elapsed:.1f}s)")
+            log("ttt_lora:stable-eval mode (no compile warmup)")
         log("\nbeginning TTT eval timer")
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
