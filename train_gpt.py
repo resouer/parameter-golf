@@ -17,7 +17,7 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.72))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.75))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -25,7 +25,7 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 20000))
     sliding_window_enabled = bool(int(os.environ.get("SLIDING_WINDOW_ENABLED", "0")))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
@@ -47,7 +47,7 @@ class Hyperparameters:
     # canonical weights (attn c_q/c_k/c_v/proj, mlp fc/proj) using 4 globally
     # shared orthogonal matrices. State dict W <- W @ R, Hessians H <- R^T H R.
     # See install_spinquant_rotations / _spinquant_rotate_sd_and_H.
-    spinquant_enabled = bool(int(os.environ.get("SPINQUANT_ENABLED", "0")))
+    spinquant_enabled = bool(int(os.environ.get("SPINQUANT_ENABLED", "1")))
     spinquant_seed    = int(os.environ.get("SPINQUANT_SEED", "20260416"))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.0))
@@ -62,7 +62,7 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.022))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.026))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.97))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -85,8 +85,8 @@ class Hyperparameters:
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 96))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
     lora_plus_ratio = float(os.environ.get("LORA_PLUS_RATIO", 1.0))
-    ttt_lora_layer_lr_alpha = float(os.environ.get("TTT_LORA_LAYER_LR_ALPHA", 0.0))
-    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 32))
+    ttt_lora_layer_lr_alpha = float(os.environ.get("TTT_LORA_LAYER_LR_ALPHA", 0.5))
+    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 48))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 2048))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
     ttt_grad_steps = int(os.environ.get("TTT_GRAD_STEPS", 1))
@@ -104,7 +104,7 @@ class Hyperparameters:
     # Phased TTT: split prefix docs into N phases. Between phases, run SGD on
     # the base model using all scored-prefix tokens. Score-first-then-update
     # legality is preserved — only already-scored tokens feed the SGD.
-    phased_ttt_enabled     = bool(int(os.environ.get("PHASED_TTT_ENABLED", "0")))
+    phased_ttt_enabled     = bool(int(os.environ.get("PHASED_TTT_ENABLED", "1")))
     phased_ttt_prefix_docs = int(os.environ.get("PHASED_TTT_PREFIX_DOCS", 2000))
     phased_ttt_num_phases  = int(os.environ.get("PHASED_TTT_NUM_PHASES", 3))
     global_ttt_lr          = float(os.environ.get("GLOBAL_TTT_LR", 0.001))
@@ -121,9 +121,9 @@ class Hyperparameters:
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 13.0))
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
-    embed_bits = int(os.environ.get("EMBED_BITS", 8))
+    embed_bits = int(os.environ.get("EMBED_BITS", 7))
     matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))
-    embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 15.0))
+    embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 20.0))
     mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 12.0))
     attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
