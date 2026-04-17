@@ -37,8 +37,8 @@
   "based_on": "PR #1370 family",
   "artifact_bytes_mean": 15760667.666666666,
   "artifact_bytes_max": 15870797,
-  "bytes_total": 15993821,
-  "code_bytes": 91504,
+  "bytes_total": 15991282,
+  "code_bytes": 91312,
   "hardware": "8xH100 80GB SXM",
   "technique_summary": "K_KVShare_Wider + fuller upstream-style FLA recipe + EMA + SWA + late QAT + int6 artifact path"
 }

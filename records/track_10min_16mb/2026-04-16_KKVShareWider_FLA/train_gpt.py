@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Round-23 FLA feasibility wrapper.
+"""FLA / GatedDeltaNet entrypoint wrapper.
 
-The actual GDN training logic lives in `train_gdn_7k.py`, imported from the
-fetched #1370 scaffold. `evaluate.py` still calls `torchrun train_gpt.py`, so
-this wrapper preserves the normal repo entrypoint while we validate the FLA
-lane on Heimdall.
+The actual training logic lives in `train_gdn_7k.py`. `evaluate.py` expects
+`torchrun train_gpt.py`, so this wrapper preserves the standard repo entrypoint
+while keeping the scored path in the records folder self-contained.
 """
 
 import os
@@ -12,9 +11,7 @@ import sys
 import traceback
 from pathlib import Path
 
-# These explicit defaults serve two purposes:
-# 1. They make the remote evaluate.py vocabulary detector pick the SP8192 path.
-# 2. They keep the wrapper/runtime aligned with the intended W43 score probe.
+# These defaults keep the wrapper aligned with the intended SP8192 scored path.
 VOCAB_SIZE = int(os.environ.get("VOCAB_SIZE", 8192))
 DATA_PATH = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
 TOKENIZER_PATH = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
@@ -30,8 +27,8 @@ if ARCH_MODE in ("D", "G", "M"):
     os.environ.setdefault("XSA_EVAL", "1")
 
 
-_W40_VENDOR_DIR = Path(__file__).resolve().parent / ".w40_vendor"
-_W40_VENDOR_PKGS = [
+_VENDOR_DIR = Path(__file__).resolve().parent / ".fla_vendor"
+_VENDOR_PKGS = [
     "triton==3.2.0",
     "flash-linear-attention==0.4.2",
     "fla-core==0.4.2",
@@ -40,7 +37,7 @@ _W40_VENDOR_PKGS = [
     "safetensors==0.7.0",
 ]
 if ARCH_MODE in ("F", "G"):
-    _W40_VENDOR_PKGS.extend(
+    _VENDOR_PKGS.extend(
         [
             "mamba-ssm==2.3.1",
             "causal-conv1d==1.6.1",
@@ -48,14 +45,14 @@ if ARCH_MODE in ("F", "G"):
     )
 
 
-def _ensure_w40_vendor_on_path() -> None:
-    p = str(_W40_VENDOR_DIR)
+def _ensure_vendor_on_path() -> None:
+    p = str(_VENDOR_DIR)
     if p not in sys.path:
         sys.path.insert(0, p)
 
 
 def _ensure_fla_vendor_available() -> None:
-    _ensure_w40_vendor_on_path()
+    _ensure_vendor_on_path()
     try:
         if ARCH_MODE in ("F", "G"):
             from fla.layers.mamba2 import Mamba2  # noqa: F401
@@ -63,26 +60,26 @@ def _ensure_fla_vendor_available() -> None:
             from causal_conv1d import causal_conv1d_fn  # noqa: F401
         else:
             from fla.layers.gated_deltanet import GatedDeltaNet  # noqa: F401
-        print("w40_wrapper: local vendor layered import already works", flush=True)
+        print("wrapper: local vendored FLA imports already work", flush=True)
         return
     except Exception:
-        vendor_pkgs = ", ".join(_W40_VENDOR_PKGS)
+        vendor_pkgs = ", ".join(_VENDOR_PKGS)
         raise RuntimeError(
-            "w40_wrapper: required FLA deps are missing from the local environment. "
-            f"Expected vendored packages under {_W40_VENDOR_DIR}. "
+            "wrapper: required FLA deps are missing from the local environment. "
+            f"Expected vendored packages under {_VENDOR_DIR}. "
             f"Install them before evaluation (e.g. via launcher/requirements), packages: {vendor_pkgs}"
         )
 
 
 def main():
     _ensure_fla_vendor_available()
-    print("w40_wrapper: importing train_gdn_7k", flush=True)
+    print("wrapper: importing train_gdn_7k", flush=True)
     try:
         from train_gdn_7k import main as train_main
     except Exception:
         traceback.print_exc()
         raise
-    print("w40_wrapper: import ok, entering train_main", flush=True)
+    print("wrapper: import ok, entering train_main", flush=True)
     train_main()
 
 

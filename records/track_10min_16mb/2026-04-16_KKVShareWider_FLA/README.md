@@ -35,7 +35,7 @@ Not used:
 - no eval-time adaptation
 - `train_gpt.py` does not download dependencies during evaluation
 - dependencies are installed beforehand via `requirements.txt`
-- max artifact bytes across canonical seeds: `15,870,797`
+- max artifact bytes across reported seeds: `15,870,797`
 - full packaged-folder audit remains under `16,000,000` bytes
 
 ## Reproducibility
