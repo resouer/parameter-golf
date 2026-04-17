@@ -102,7 +102,7 @@ class Hyperparameters:
     attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
     # ---- Ported features (gates only; flags-OFF path is bit-identical to train_gpt_base.py) ----
     gate_attn_out = bool(int(os.environ.get("GATE_ATTN_OUT", "1")))
-    gate_mlp_out = bool(int(os.environ.get("GATE_MLP_OUT", "0")))
+    gate_mlp_out = bool(int(os.environ.get("GATE_MLP_OUT", "1")))
     gate_attn_src = os.environ.get("GATE_ATTN_SRC", "proj")  # 'proj' or 'q'
     gate_width = int(os.environ.get("GATE_WIDTH", 12))
     # SmearGate (modded-nanogpt, @classiclarryd, 2025-09-18): forward-1 token smear.
