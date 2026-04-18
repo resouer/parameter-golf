@@ -90,9 +90,9 @@ class Hyperparameters:
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 16))
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 4.0))
-    phased_ttt_enabled = bool(int(os.environ.get("PHASED_TTT_ENABLED", "0")))
+    phased_ttt_enabled = bool(int(os.environ.get("PHASED_TTT_ENABLED", "1")))
     phased_ttt_prefix_docs = int(os.environ.get("PHASED_TTT_PREFIX_DOCS", 2000))
-    phased_ttt_num_phases = int(os.environ.get("PHASED_TTT_NUM_PHASES", 1))
+    phased_ttt_num_phases = int(os.environ.get("PHASED_TTT_NUM_PHASES", 3))
     global_ttt_lr = float(os.environ.get("GLOBAL_TTT_LR", 0.001))
     global_ttt_momentum = float(os.environ.get("GLOBAL_TTT_MOMENTUM", 0.9))
     global_ttt_epochs = int(os.environ.get("GLOBAL_TTT_EPOCHS", 1))
@@ -103,10 +103,10 @@ class Hyperparameters:
     global_ttt_grad_clip = float(os.environ.get("GLOBAL_TTT_GRAD_CLIP", 1.0))
     global_ttt_respect_doc_boundaries = bool(int(os.environ.get("GLOBAL_TTT_RESPECT_DOC_BOUNDARIES", "1")))
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
-    embed_bits = int(os.environ.get("EMBED_BITS", 8))
+    embed_bits = int(os.environ.get("EMBED_BITS", 7))
     matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))
-    embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 2e1))
-    mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 10.0))
+    embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 15.0))
+    mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 12.0))
     attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -117,6 +117,7 @@ class Hyperparameters:
     datasets_dir = os.path.join(data_dir, "datasets", f"fineweb10B_sp{vocab_size}")
     train_files = os.path.join(datasets_dir, "fineweb_train_*.bin")
     val_files = os.path.join(datasets_dir, "fineweb_val_*.bin")
+    train_shard_limit = int(os.environ.get("TRAIN_SHARD_LIMIT", 80))
     tokenizer_path = os.path.join(
         data_dir, "tokenizers", f"fineweb_{vocab_size}_bpe.model"
     )
@@ -230,6 +231,15 @@ def load_data_shard(file):
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
+def _resolve_train_files(h):
+    files = [Path(p) for p in sorted(glob.glob(h.train_files))]
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
+    if h.train_shard_limit > 0:
+        files = files[: h.train_shard_limit]
+    return files
+
+
 _SHARD_HEADER_BYTES = 256 * np.dtype("<i4").itemsize
 _SHARD_NTOKENS_CACHE = {}
 _MMAP_CACHE = {}
@@ -298,10 +308,7 @@ class DocumentPackingLoader:
         self.device = device
         self.cu_bucket_size = cu_bucket_size
         self.max_seq_len = h.train_seq_len
-        all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
-        if not all_files:
-            raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
-        self.files = all_files
+        self.files = _resolve_train_files(h)
         self.file_iter = iter(self.files)
         self._init_shard(load_data_shard(next(self.file_iter)))
         self._next_shard = self._submit_next_shard()
@@ -383,9 +390,7 @@ class ShuffledSequenceLoader:
         self.world_size = h.world_size
         self.seq_len = h.train_seq_len
         self.device = device
-        all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
-        if not all_files:
-            raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
+        all_files = _resolve_train_files(h)
         self.files = all_files[h.rank :: h.world_size]
         self.rng = np.random.Generator(np.random.PCG64(h.rank))
         self.num_tokens = [_read_num_tokens(f) for f in self.files]
@@ -2789,9 +2794,7 @@ def train_and_eval(h, device):
     if h.artifact_dir and h.is_main_process:
         os.makedirs(h.artifact_dir, exist_ok=True)
     val_data = ValidationData(h, device)
-    log(
-        f"train_shards: {len(list(Path(h.datasets_dir).resolve().glob('fineweb_train_*.bin')))}"
-    )
+    log(f"train_shards: {len(_resolve_train_files(h))}")
     log(f"val_tokens: {val_data.val_tokens.numel()-1}")
     base_model, compiled_model, compiled_forward_logits = train_model(
         h, device, val_data
