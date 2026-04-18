@@ -130,6 +130,14 @@ class Hyperparameters:
     total_iterations = int(os.environ.get("TOTAL_ITERATIONS", "0"))  # 0 = same as iterations
 
 
+def resolve_train_shard_files(pattern: str) -> list[Path]:
+    files = [Path(p) for p in sorted(glob.glob(pattern))]
+    limit = int(os.environ.get("TRAIN_SHARD_LIMIT", "0"))
+    if limit > 0:
+        files = files[:limit]
+    return files
+
+
 # ─── Data Loading ─────────────────────────────────────────────────────────────
 
 def load_data_shard(file: Path) -> Tensor:
@@ -148,7 +156,7 @@ class TokenStream:
             with open(shard_order_file) as f:
                 self.files = [Path(line.strip()) for line in f if line.strip()]
         else:
-            self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+            self.files = resolve_train_shard_files(pattern)
         assert self.files, f"No files matching {pattern}"
         self.idx = 0
         self.buf = load_data_shard(self.files[self.idx])
@@ -988,7 +996,7 @@ def main():
     shard_order_file = os.environ.get("SHARD_ORDER_FILE", "")
     if not shard_order_file:
         # Generate coprime ordering on-the-fly
-        shard_files = sorted(glob.glob(args.train_files))
+        shard_files = resolve_train_shard_files(args.train_files)
         if shard_files:
             ordered = generate_coprime_shard_order(shard_files, seed=args.seed)
             shard_order_path = f"/tmp/shard_order_{args.run_id}.txt"
