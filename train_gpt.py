@@ -1694,9 +1694,59 @@ def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
     return Q[:, invperm], s
 
 
+def _compute_adaptive_gptq_clip_sigmas(state_dict, hessians, h):
+    records = []
+    for name, tensor in state_dict.items():
+        t = tensor.detach().cpu().contiguous()
+        if (not t.is_floating_point()) or t.numel() <= 65536 or "tok_emb" in name:
+            continue
+        if name not in hessians:
+            continue
+        H = hessians[name].float()
+        diag_mean = H.diag().mean().clamp_min(1e-12)
+        row_var = t.float().var(dim=1).mean().clamp_min(1e-12)
+        sens = (diag_mean * row_var).item()
+        records.append((name, math.log(sens), int(t.numel())))
+
+    if not records:
+        return {}
+
+    target_log = math.log(h.matrix_clip_sigmas) + 0.012
+    lo, hi = -6.0, 6.0
+    best = None
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        vals = []
+        total_w = 0
+        total = 0.0
+        for _, log_sens, weight in records:
+            clip = min(24.0, max(6.0, math.exp(-0.15 * log_sens + mid)))
+            vals.append((clip, weight))
+            total += math.log(clip) * weight
+            total_w += weight
+        mean_log = total / max(total_w, 1)
+        best = (mid, mean_log, vals)
+        if mean_log < target_log:
+            lo = mid
+        else:
+            hi = mid
+
+    assert best is not None
+    _, _, vals = best
+    out = {}
+    for (name, _, _), (clip, _) in zip(records, vals):
+        out[name] = clip
+    return out
+
+
 def gptq_mixed_quantize(state_dict, hessians, h):
     result = {}
     meta = {}
+    adaptive_clip = _compute_adaptive_gptq_clip_sigmas(state_dict, hessians, h)
+    if adaptive_clip:
+        log("GPTQ adaptive clip_sigmas (Hessian-sensitivity):")
+        for name in sorted(adaptive_clip):
+            log(f"    {name}: {adaptive_clip[name]:.2f}")
     for (name, tensor) in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         if not t.is_floating_point() or t.numel() <= 65536:
@@ -1705,6 +1755,8 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             continue
         if "tok_emb" in name:
             cs = h.embed_clip_sigmas
+        elif name in adaptive_clip:
+            cs = adaptive_clip[name]
         elif ".mlp." in name:
             cs = h.mlp_clip_sigmas
         elif ".attn." in name:
