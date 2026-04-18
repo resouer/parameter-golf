@@ -733,6 +733,7 @@ def gptq_quantize(W: Tensor, H: Tensor, bits: int, clip_sigmas: float) -> tuple[
     """Full GPTQ with Hessian-guided error redistribution + SDClip."""
     qmax = (1 << (bits - 1)) - 1
     W = W.float().clone()
+    H = H.float().clone()
     n_out, n_in = W.shape
 
     # Pre-compute per-row scales via SDClip
@@ -744,7 +745,6 @@ def gptq_quantize(W: Tensor, H: Tensor, bits: int, clip_sigmas: float) -> tuple[
 
     # Damping for numerical stability
     damp = 0.01 * H.diagonal().mean().clamp(min=1e-6)
-    H = H.clone()
     H.diagonal().add_(damp)
 
     # Compute H_inv
@@ -838,7 +838,7 @@ def quantize_model(model: nn.Module, hessians: dict[str, Tensor], args: Hyperpar
         # Use GPTQ if Hessian available, otherwise SDClip
         H = hessians.get(name.replace(".weight", ""))
         if H is not None and t.ndim == 2:
-            Q, S = gptq_quantize(t, H.cpu(), bits, clip_sig)
+            Q, S = gptq_quantize(t, H.cpu().float(), bits, clip_sig)
             gptq_names.append(name)
         else:
             Q, S = sdclip_quantize(t, bits, clip_sig)
