@@ -181,7 +181,7 @@ SHARDS=80
 SHARD_OVERRIDE=$(python3 << 'PYEOF'
 import re, sys
 f = open('train_gpt.py').read()
-m = re.search(r'TRAIN_SHARDS_OVERRIDE.*?,\s*(\d+)', f)
+m = re.search(r'TRAIN_SHARDS_OVERRIDE.*?,\\s*(\\d+)', f)
 if m:
     print(m.group(1)); sys.exit()
 print('')
@@ -245,6 +245,9 @@ GIT_TERMINAL_PROMPT=0 git clone --quiet --filter=blob:none --no-tags "$CLONE_URL
 
     return f"""set -e
 PIP_NO_CACHE_DIR=1 pip install -q --no-cache-dir sentencepiece huggingface-hub tiktoken zstandard brotli 2>/dev/null || true
+if ! command -v git >/dev/null 2>&1; then
+  apt-get update && apt-get install -y git
+fi
 
 {clone_setup}
 cd /workspace/pgolf
