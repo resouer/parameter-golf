@@ -466,6 +466,27 @@ def _get_job_status(job_name, job_id=None):
     return "unknown"
 
 
+def _get_job_status_info(job_name, job_id=None):
+    info = {"state": "unknown", "reason": "", "message": ""}
+    if job_id:
+        result = _run(f"{LEP_CLI} job get -i {job_id}")
+    else:
+        result = _run(f"{LEP_CLI} job get -n {job_name}")
+    output = result.stdout + result.stderr
+    for candidate in (result.stdout, output):
+        payload = _extract_json_object(candidate)
+        if isinstance(payload, dict):
+            status_blob = payload.get("status", {})
+            state = _normalize_status_text(status_blob.get("state"))
+            if state:
+                info["state"] = state
+            info["reason"] = str(status_blob.get("reason", "") or "")
+            info["message"] = str(status_blob.get("message", "") or "")
+            return info
+    info["state"] = _get_job_status(job_name, job_id)
+    return info
+
+
 # ---------------------------------------------------------------------------
 # Log streaming (critical: dev clusters have no log persistence)
 # ---------------------------------------------------------------------------
@@ -723,6 +744,7 @@ def main():
     parser.add_argument("--node-group", default=os.environ.get("AUTORESEARCH_NODE_GROUP", "heimdall-dev"))
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     args = parser.parse_args()
+    queue_failfast_seconds = int(os.environ.get("PGOLF_QUEUE_FAILFAST_SECONDS", "300"))
 
     # Signal handler: on SIGTERM/SIGINT, attempt final log capture before dying.
     # This catches the case where the calling Bash shell kills us (e.g., 10-min timeout).
@@ -789,9 +811,24 @@ def main():
     start = time.time()
     status = "unknown"
     while time.time() - start < args.timeout:
-        status = _get_job_status(job_name, job_id)
+        status_info = _get_job_status_info(job_name, job_id)
+        status = status_info["state"]
         elapsed = int(time.time() - start)
-        _log(f"[{elapsed}s] {job_name}: {status}")
+        suffix = ""
+        if status_info.get("reason"):
+            suffix = f" reason={status_info['reason']}"
+        elif status_info.get("message"):
+            suffix = f" message={status_info['message'][:160]}"
+        _log(f"[{elapsed}s] {job_name}: {status}{suffix}")
+
+        if (
+            status == "queueing"
+            and queue_failfast_seconds > 0
+            and elapsed >= queue_failfast_seconds
+            and status_info.get("reason") == "InsufficientQuota"
+        ):
+            _stop_job_safe(job_id)
+            _output(False, error=f"queueing>{queue_failfast_seconds}s due to InsufficientQuota")
 
         if status in ("completed", "failed", "stopped"):
             log_thread.join(timeout=15)
