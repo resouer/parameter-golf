@@ -181,7 +181,7 @@ SHARDS=80
 SHARD_OVERRIDE=$(python3 << 'PYEOF'
 import re, sys
 f = open('train_gpt.py').read()
-m = re.search(r'TRAIN_SHARDS_OVERRIDE.*?,\s*(\d+)', f)
+m = re.search(r'TRAIN_SHARDS_OVERRIDE.*?,\\s*(\\d+)', f)
 if m:
     print(m.group(1)); sys.exit()
 print('')
@@ -245,6 +245,9 @@ GIT_TERMINAL_PROMPT=0 git clone --quiet --filter=blob:none --no-tags "$CLONE_URL
 
     return f"""set -e
 PIP_NO_CACHE_DIR=1 pip install -q --no-cache-dir sentencepiece huggingface-hub tiktoken zstandard brotli 2>/dev/null || true
+if ! command -v git >/dev/null 2>&1; then
+  apt-get update && apt-get install -y git
+fi
 
 {clone_setup}
 cd /workspace/pgolf
@@ -268,9 +271,43 @@ fi
 # Install repo-root extra requirements without dependency resolution drift.
 # This keeps experiment branches that vendor non-standard runtime packages
 # (for example FLA / Triton families) runnable on the remote image while
-# preserving the preinstalled torch stack.
+# preserving the preinstalled torch stack. Core runtime packages stay owned
+# by the base image / explicit FA3 probe settings.
 if [ -f requirements.txt ]; then
-  python3 -m pip install --no-deps -r requirements.txt
+  FILTERED_REQ=$(python3 << 'PYEOF'
+from pathlib import Path
+import re
+
+blocked = {
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "triton",
+    "flash_attn_3",
+    "flash-attn",
+    "flash-attn-3",
+}
+src = Path("requirements.txt")
+dst = Path("/tmp/pgolf.requirements.filtered.txt")
+kept = []
+for raw in src.read_text().splitlines():
+    stripped = raw.strip()
+    if not stripped or stripped.startswith("#"):
+        kept.append(raw)
+        continue
+    name = re.split(r"[<>=!~\\[\\s]", stripped, maxsplit=1)[0].lower()
+    if name in blocked:
+        print(f"requirements_filter: skip {{name}}", flush=True)
+        continue
+    kept.append(raw)
+dst.write_text("\\n".join(kept) + ("\\n" if kept else ""))
+print(dst)
+PYEOF
+)
+  FILTERED_REQ=$(printf "%s\n" "$FILTERED_REQ" | tail -n 1)
+  if [ -s "$FILTERED_REQ" ]; then
+    python3 -m pip install --no-deps -r "$FILTERED_REQ"
+  fi
 fi
 
 torchrun --nproc_per_node=8 train_gpt.py
