@@ -27,8 +27,10 @@ partially, and it uncovered two stronger infrastructure facts:
 - A real AWS-vs-Heimdall split was then launched:
   - `W108` → `aws-iad-leptondev-001`
   - `W109` → `heimdall-dev-ayxxjemt`
-- AWS side is still blocked by `InsufficientQuota`, so only the Heimdall half
-  is producing evidence so far.
+- AWS side never produced a usable control run:
+  - `W108 r4` spent the full 3600s in `Queueing`
+  - final reason remained `InsufficientQuota`
+  - so round38 ended without a clean AWS positive-control measurement
 - Separate alt-image probe on Heimdall (`runpod/pytorch:1.0.3-cu1290-torch280-ubuntu2204`)
   is active as an image-level isolation lane after the FA3 hypothesis weakened.
 

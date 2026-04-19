@@ -28,6 +28,7 @@ _extract_results = _ns["_extract_results"]
 _log_has_results = _ns["_log_has_results"]
 _has_final_results_content = _ns["_has_final_results_content"]
 _make_job_command = _ns["_make_job_command"]
+_normalize_status_text = _ns["_normalize_status_text"]
 
 
 class TestExtractResults(unittest.TestCase):
@@ -221,6 +222,12 @@ class TestJobCommand(unittest.TestCase):
         self.assertIn('python_exec=$PYBIN', cmd)
         self.assertIn('import torch', cmd)
         self.assertIn('"$PYBIN" -m torch.distributed.run --nproc_per_node=8 train_gpt.py', cmd)
+
+
+class TestStatusHelpers(unittest.TestCase):
+    def test_normalize_status_text_queueing_aliases(self):
+        self.assertEqual(_normalize_status_text("Queueing"), "queueing")
+        self.assertEqual(_normalize_status_text("pending"), "queueing")
 
 
 def _log_has_results_str(content):
