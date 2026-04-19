@@ -153,9 +153,9 @@ fi
         data_setup = """
 # Auto-detect vocab size from train_gpt.py (default sp1024, supports sp4096+)
 if [ -f remote_helper.py ]; then
-    VOCAB=$(python3 remote_helper.py detect-vocab)
+    VOCAB=$("$PYBIN" remote_helper.py detect-vocab)
 else
-    VOCAB=$(python3 << 'PYEOF'
+    VOCAB=$("$PYBIN" << 'PYEOF'
 import re, sys
 f = open('train_gpt.py').read()
 m = re.search(r'VOCAB_SIZE.*?,\\s*(\\d+)', f)
@@ -178,7 +178,7 @@ fi
 SHARDS=80
 [ "$VOCAB" -gt 1024 ] && SHARDS=143
 [ "$VOCAB" -gt 4096 ] && SHARDS=128
-SHARD_OVERRIDE=$(python3 << 'PYEOF'
+SHARD_OVERRIDE=$("$PYBIN" << 'PYEOF'
 import re, sys
 f = open('train_gpt.py').read()
 m = re.search(r'TRAIN_SHARDS_OVERRIDE.*?,\\s*(\\d+)', f)
@@ -195,8 +195,8 @@ if [ "$VOCAB" = "998" ]; then
     SCYLLA_DIR="./data/datasets/fineweb10B_scylla"
     if [ ! -f "$SCYLLA_DIR/.download_complete" ]; then
         echo "data_setup: downloading Scylla data from HuggingFace..."
-        PIP_NO_CACHE_DIR=1 pip install -q --no-cache-dir huggingface_hub 2>/dev/null || true
-        python3 -c "from huggingface_hub import snapshot_download; snapshot_download('anthonym21/fineweb10B-scylla', local_dir='$SCYLLA_DIR', repo_type='dataset')"
+        PIP_NO_CACHE_DIR=1 "$PYBIN" -m pip install -q --no-cache-dir huggingface_hub 2>/dev/null || true
+        "$PYBIN" -c "from huggingface_hub import snapshot_download; snapshot_download('anthonym21/fineweb10B-scylla', local_dir='$SCYLLA_DIR', repo_type='dataset')"
         touch "$SCYLLA_DIR/.download_complete"
         echo "data_setup: Scylla download complete"
     fi
@@ -244,7 +244,23 @@ GIT_TERMINAL_PROMPT=0 git clone --quiet --filter=blob:none --no-tags "$CLONE_URL
 """
 
     return f"""set -e
-PIP_NO_CACHE_DIR=1 pip install -q --no-cache-dir sentencepiece huggingface-hub tiktoken zstandard brotli 2>/dev/null || true
+PYBIN=$(command -v python3 || true)
+if [ -z "$PYBIN" ] || ! "$PYBIN" - <<'PYEOF' >/dev/null 2>&1
+import torch
+PYEOF
+then
+  ALT_PY=$(command -v python || true)
+  if [ -n "$ALT_PY" ] && "$ALT_PY" - <<'PYEOF' >/dev/null 2>&1
+import torch
+PYEOF
+  then
+    PYBIN="$ALT_PY"
+  fi
+fi
+[ -z "$PYBIN" ] && PYBIN=$(command -v python3 || command -v python)
+echo "python_exec=$PYBIN"
+
+PIP_NO_CACHE_DIR=1 "$PYBIN" -m pip install -q --no-cache-dir sentencepiece huggingface-hub tiktoken zstandard brotli 2>/dev/null || true
 if ! command -v git >/dev/null 2>&1; then
   apt-get update && apt-get install -y git
 fi
@@ -263,7 +279,7 @@ export PYTHONUNBUFFERED=1
 # Drift isolation uses this to distinguish runtime image regressions from
 # model/code regressions.
 if [ "${{PGOLF_ENSURE_FA3:-0}}" = "1" ]; then
-  python3 -m pip install --no-deps --find-links \
+  "$PYBIN" -m pip install --no-deps --find-links \
     "${{PGOLF_FA3_WHEEL_INDEX:-https://windreamer.github.io/flash-attention3-wheels/cu128_torch291/}}" \
     flash_attn_3
 fi
@@ -274,7 +290,7 @@ fi
 # preserving the preinstalled torch stack. Core runtime packages stay owned
 # by the base image / explicit FA3 probe settings.
 if [ -f requirements.txt ]; then
-  FILTERED_REQ=$(python3 << 'PYEOF'
+  FILTERED_REQ=$("$PYBIN" << 'PYEOF'
 from pathlib import Path
 import re
 
@@ -306,11 +322,11 @@ PYEOF
 )
   FILTERED_REQ=$(printf "%s\n" "$FILTERED_REQ" | tail -n 1)
   if [ -s "$FILTERED_REQ" ]; then
-    python3 -m pip install --no-deps -r "$FILTERED_REQ"
+    "$PYBIN" -m pip install --no-deps -r "$FILTERED_REQ"
   fi
 fi
 
-python3 -m torch.distributed.run --nproc_per_node=8 train_gpt.py
+"$PYBIN" -m torch.distributed.run --nproc_per_node=8 train_gpt.py
 RC=$?
 
 # Post-training: emit structured results_json from log file if available.
@@ -320,7 +336,7 @@ if [ -d logs ]; then
   LOGFILE=$(ls -t logs/*.txt 2>/dev/null | head -1)
   if [ -n "$LOGFILE" ]; then
     if [ -f remote_helper.py ]; then
-        python3 remote_helper.py collect-results 2>/dev/null || true
+        "$PYBIN" remote_helper.py collect-results 2>/dev/null || true
     fi
   fi
 fi
