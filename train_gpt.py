@@ -1,6 +1,7 @@
 import os
 # Source-visible defaults for merged #1493 faithful replay.
 VOCAB_SIZE = int(os.environ.get("VOCAB_SIZE", 8192))
+TRAIN_SHARDS_OVERRIDE = int(os.environ.get("TRAIN_SHARDS_OVERRIDE", 80))
 os.environ.setdefault("QK_GAIN_INIT", "5.25")
 os.environ.setdefault("TTT_ENABLED", "1")
 import lzma as L,base64 as B
