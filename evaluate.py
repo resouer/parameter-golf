@@ -337,6 +337,12 @@ def _create_job(commit_sha, node_group=None, branch=None):
     seed = os.environ.get("PGOLF_SEED")
     if seed:
         lep_cmd.extend(["-e", f"SEED={seed}"])
+    ensure_fa3 = os.environ.get("PGOLF_ENSURE_FA3")
+    if ensure_fa3:
+        lep_cmd.extend(["-e", f"PGOLF_ENSURE_FA3={ensure_fa3}"])
+    fa3_index = os.environ.get("PGOLF_FA3_WHEEL_INDEX")
+    if fa3_index:
+        lep_cmd.extend(["-e", f"PGOLF_FA3_WHEEL_INDEX={fa3_index}"])
 
     _log(f"Creating job {job_name}...")
     result = subprocess.run(lep_cmd, capture_output=True, text=True)
