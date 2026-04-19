@@ -256,6 +256,13 @@ export PYTHONUNBUFFERED=1
 
 {data_setup}
 
+# Optional: force-install the known-good H100 FA3 wheel before launch.
+if [ "${PGOLF_ENSURE_FA3:-0}" = "1" ]; then
+  python3 -m pip install --no-deps --find-links \
+    "${PGOLF_FA3_WHEEL_INDEX:-https://windreamer.github.io/flash-attention3-wheels/cu128_torch291/}" \
+    flash_attn_3
+fi
+
 # Install repo-root extra requirements without dependency resolution drift.
 # This keeps experiment branches that vendor non-standard runtime packages
 # (for example FLA / Triton families) runnable on the remote image while
