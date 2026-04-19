@@ -33,6 +33,20 @@ partially, and it uncovered two stronger infrastructure facts:
   - so round38 ended without a clean AWS positive-control measurement
 - Separate alt-image probe on Heimdall (`runpod/pytorch:1.0.3-cu1290-torch280-ubuntu2204`)
   is active as an image-level isolation lane after the FA3 hypothesis weakened.
+- A lighter-weight 1xH100 scheduler diagnostic was then launched on both groups:
+  - AWS 1x completed immediately and produced usable FA3/matmul logs
+  - Heimdall 1x initially stalled at `Starting`, but a live-mirrored rerun did complete
+    and produced usable FA3/matmul logs too
+- A follow-up 8x distributed diagnostic on Heimdall current-image started cleanly,
+  printed rank0 setup (`WORLD_SIZE=8`), then stalled before emitting the first
+  `MATMUL_SEC` / `ALLREDUCE_SEC_MEAN` lines and had to be manually stopped.
+- Additional scale probes on Heimdall narrowed the failure band further:
+  - a fresh `2x` distributed diagnostic failed quickly without ever producing
+    benchmark output; the live mirror only captured an immediate
+    `Connection stopped.`
+  - a fresh `4x` distributed diagnostic reached rank0 setup (`WORLD_SIZE=4`)
+    but also stalled before emitting `MATMUL_SEC` / `ALLREDUCE_SEC_MEAN`
+    lines; the live mirror ended right after rank0 bootstrap output
 
 ## Confirmed Runtime Findings
 
@@ -59,6 +73,23 @@ partially, and it uncovered two stronger infrastructure facts:
 - We also observed current-image training controls logging:
   - `Requirement already satisfied: flash_attn_3 ...`
 - So "missing FA3" is no longer a strong primary-cause hypothesis.
+- The AWS 1x diagnostic further confirms the current image itself is healthy on
+  a clean scheduler path:
+  - `python_exec = /usr/bin/python3`
+  - `torch = 2.9.1+cu128`
+  - `FA3_IMPORT ok`
+  - `FA3_CALL_OK elapsed_sec = 0.796484`
+  - `MATMUL_SEC = 0.082915`
+- Heimdall 1x on the same image/diagnostic is not catastrophically broken:
+  - `FA3_CALL_OK elapsed_sec = 0.783914`
+  - `MATMUL_SEC = 0.11914`
+- Heimdall 1x on the same image/diagnostic is not catastrophically broken:
+  - `python_exec = /usr/bin/python3`
+  - `torch = 2.9.1+cu128`
+  - `FA3_IMPORT ok`
+- So the simplest "FA3/import path broken on Heimdall" story is false. The
+  remaining gap is more likely tied to multi-GPU runtime state, scheduler
+  health, or other 8x-only effects.
 
 ## Alt-Image Probe Status
 
@@ -105,9 +136,25 @@ partially, and it uncovered two stronger infrastructure facts:
 - Current strongest evidence points to a mixed infra problem:
   - degraded Heimdall node health
   - plus launcher/runtime ownership bugs around environment composition
+- The 1x diagnostics strengthen the scheduler interpretation:
+  - AWS can run the current image and FA3 microbenchmark immediately
+  - Heimdall can run the same 1x microbenchmark too, but startup/log behavior is
+    less stable and matmul is somewhat slower
+- The 8x distributed diagnostic sharpens that further:
+  - Heimdall can start an 8x `torch.distributed` job
+  - but it can hang before even finishing the first simple local matmul /
+    allreduce benchmark block
+  - so the remaining fault domain looks increasingly 8x-specific
+- The 2x/4x reruns suggest the break is not only at the full 8x scale:
+  - `1x` microbenchmarks work on both AWS and Heimdall
+  - `2x` already fails quickly on Heimdall
+  - `4x` and `8x` can reach distributed init but stall before the first useful
+    benchmark result
+  - so the fault domain now looks like Heimdall multi-GPU / NCCL / scheduler
+    substrate rather than model code
 - The alt-image path is now a valid probe surface, but it has not restored the
   expected speed band; simply switching to `cu129/torch280` is not sufficient.
 - The next meaningful probe is not "new model idea", but:
   - continue refusing or deprioritizing launches when node-group health is degraded
   - recover a clean AWS calibration lane once quota returns
-  - or pivot to explicit node-health / scheduler evidence instead of more model runs
+  - or pivot to explicit 8x distributed / NCCL evidence instead of more model runs
