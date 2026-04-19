@@ -388,6 +388,9 @@ def _create_job(commit_sha, node_group=None, branch=None):
         lep_cmd.extend(["-ng", ng])
     if node_id:
         lep_cmd.extend(["-ni", node_id])
+    log_collection = (os.environ.get("PGOLF_LOG_COLLECTION", "") or "").strip().lower()
+    if log_collection in ("1", "true", "false", "0"):
+        lep_cmd.extend(["-lg", "true" if log_collection in ("1", "true") else "false"])
     if LOCAL_VOLUME:
         lep_cmd.extend(["--mount", f"/:/mnt/pgolf-data:node-local:{LOCAL_VOLUME}"])
     if GIT_TOKEN:
