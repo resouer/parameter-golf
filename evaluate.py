@@ -352,6 +352,7 @@ exit $RC
 def _create_job(commit_sha, node_group=None, branch=None):
     """Create a Lepton job. Returns (job_name, job_id)."""
     ng = node_group or os.environ.get("PGOLF_NODE_GROUP", "")
+    node_id = (os.environ.get("PGOLF_NODE_ID", "") or "").strip()
     short_sha = commit_sha[:7]
     prefix = os.environ.get("PGOLF_JOB_PREFIX", "pgolf")
 
@@ -385,6 +386,8 @@ def _create_job(commit_sha, node_group=None, branch=None):
     ]
     if ng:
         lep_cmd.extend(["-ng", ng])
+    if node_id:
+        lep_cmd.extend(["-ni", node_id])
     if LOCAL_VOLUME:
         lep_cmd.extend(["--mount", f"/:/mnt/pgolf-data:node-local:{LOCAL_VOLUME}"])
     if GIT_TOKEN:
