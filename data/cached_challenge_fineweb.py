@@ -86,7 +86,7 @@ def load_manifest(*, skip_manifest_download: bool) -> dict:
             raise FileNotFoundError(
                 f"manifest.json is required for manifest-driven shard counts but is not present locally at {path}"
             )
-        get(f"{REMOTE_ROOT_PREFIX}/manifest.json")
+        get(f"{ACTIVE_REMOTE_ROOT_PREFIX}/manifest.json")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -150,7 +150,9 @@ def main() -> None:
     manifest = load_manifest(skip_manifest_download=args.skip_manifest)
     dataset_entry = next((x for x in manifest.get("datasets", []) if x.get("name") == dataset_dir), None)
     if dataset_entry is None:
-        raise ValueError(f"dataset {dataset_dir} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
+        raise ValueError(
+            f"dataset {dataset_dir} not found in {ACTIVE_REMOTE_ROOT_PREFIX}/manifest.json"
+        )
     max_train_shards = int((dataset_entry.get("stats") or {}).get("files_train"))
     val_shards = int((dataset_entry.get("stats") or {}).get("files_val"))
     if train_shards > max_train_shards:
@@ -160,7 +162,9 @@ def main() -> None:
     tokenizer_name = dataset_entry.get("tokenizer_name")
     tokenizer_entry = next((x for x in manifest.get("tokenizers", []) if x.get("name") == tokenizer_name), None)
     if tokenizer_entry is None:
-        raise ValueError(f"tokenizer {tokenizer_name} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
+        raise ValueError(
+            f"tokenizer {tokenizer_name} not found in {ACTIVE_REMOTE_ROOT_PREFIX}/manifest.json"
+        )
 
     if args.with_docs:
         get(f"{ACTIVE_REMOTE_ROOT_PREFIX}/docs_selected.jsonl")
