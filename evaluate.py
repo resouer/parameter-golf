@@ -310,7 +310,7 @@ PYEOF
   fi
 fi
 
-torchrun --nproc_per_node=8 train_gpt.py
+python3 -m torch.distributed.run --nproc_per_node=8 train_gpt.py
 RC=$?
 
 # Post-training: emit structured results_json from log file if available.
