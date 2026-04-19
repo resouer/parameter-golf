@@ -1,3 +1,12 @@
+import os
+VOCAB_SIZE = int(os.environ.get("VOCAB_SIZE", 8192))
+DATA_DIR = os.environ.get("DATA_DIR", "./data/")
+DATASETS_DIR = os.environ.get("DATASETS_DIR", os.path.join(DATA_DIR, "datasets/fineweb10B_sp8192"))
+TOKENIZER_PATH = os.environ.get("TOKENIZER_PATH", os.path.join(DATA_DIR, "tokenizers/fineweb_8192_bpe.model"))
+os.environ.setdefault("VOCAB_SIZE", str(VOCAB_SIZE))
+os.environ.setdefault("DATA_DIR", DATA_DIR)
+os.environ.setdefault("DATASETS_DIR", DATASETS_DIR)
+os.environ.setdefault("TOKENIZER_PATH", TOKENIZER_PATH)
 import base64, collections, copy, fcntl, glob, io, json, lzma, math, os
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
