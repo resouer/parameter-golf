@@ -60,7 +60,13 @@ LEP_CLI = os.environ.get("PGOLF_LEP_CLI", "lep")
 # ---------------------------------------------------------------------------
 
 def _run(cmd, check=False, timeout=30):
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode("utf-8", "replace")
+        stderr = e.stderr if isinstance(e.stderr, str) else (e.stderr or b"").decode("utf-8", "replace")
+        stderr = (stderr + f"\nTIMEOUT after {timeout}s").strip()
+        r = subprocess.CompletedProcess(cmd, 124, stdout=stdout, stderr=stderr)
     if check and r.returncode != 0:
         raise RuntimeError(f"Command failed: {cmd}\n{r.stderr}")
     return r
@@ -91,6 +97,65 @@ def _parse_job_metadata(output):
     return metadata
 
 
+def _strip_ansi(text):
+    return re.sub(r"\x1b\[[0-9;]*m", "", text or "")
+
+
+def _node_group_health(node_group):
+    """Best-effort summary from `lep node list --detail --node-group ...`."""
+    r = subprocess.run(
+        [*shlex.split(LEP_CLI), "node", "list", "--detail", "--node-group", node_group],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    text = _strip_ansi((r.stdout or "") + (r.stderr or ""))
+    summary = {
+        "raw": text,
+        "available": None,
+        "total": None,
+        "has_unhealthy": ("Unhealthy" in text or "NotReady" in text),
+        "has_diskpressure": ("DiskPressure" in text),
+        "has_initializing": ("Initializing" in text),
+    }
+    m = re.search(rf"{re.escape(node_group)}.*?(\d+)\s*/\s*(\d+)", text, re.S)
+    if m:
+        summary["available"] = int(m.group(1))
+        summary["total"] = int(m.group(2))
+    return summary
+
+
+def _normalize_status_text(value):
+    if not value:
+        return None
+    v = str(value).strip().lower()
+    if v in ("completed", "complete", "succeeded", "success"):
+        return "completed"
+    if v in ("failed", "error"):
+        return "failed"
+    if v in ("stopped", "cancelled", "canceled"):
+        return "stopped"
+    if v in ("running",):
+        return "running"
+    if v in ("pending", "starting", "queueing", "queued"):
+        return "queueing"
+    return None
+
+
+def _extract_json_object(text):
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    blob = text[start : end + 1]
+    try:
+        return json.loads(blob)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Job command template
 # ---------------------------------------------------------------------------
@@ -116,21 +181,21 @@ fi
         data_setup = """
 # Auto-detect vocab size from train_gpt.py (default sp1024, supports sp4096+)
 if [ -f remote_helper.py ]; then
-    VOCAB=$(python3 remote_helper.py detect-vocab)
+    VOCAB=$("$PYBIN" remote_helper.py detect-vocab)
 else
-    VOCAB=$(python3 << 'PYEOF'
+    VOCAB=$("$PYBIN" << 'PYEOF'
 import re, sys
 f = open('train_gpt.py').read()
-m = re.search(r'VOCAB_SIZE.*?,\s*(\d+)', f)
+m = re.search(r'VOCAB_SIZE.*?,\\s*(\\d+)', f)
 if m: print(m.group(1)); sys.exit()
 try:
     import lzma, base64
-    m2 = re.search(r"b85decode\([b]?['\"](.+?)['\"]\)", f, re.DOTALL)
+    m2 = re.search(r"b85decode\\([b]?['\\\"](.+?)['\\\"]\\)", f, re.DOTALL)
     if m2:
         blob = m2.group(1)
         try: code = lzma.decompress(base64.b85decode(blob)).decode()
         except: code = lzma.decompress(base64.b85decode(blob), format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2}]).decode()
-        m3 = re.search(r'VOCAB_SIZE.*?,\s*(\d+)', code)
+        m3 = re.search(r'VOCAB_SIZE.*?,\\s*(\\d+)', code)
         if m3: print(m3.group(1)); sys.exit()
 except Exception: pass
 print('1024')
@@ -148,8 +213,8 @@ if [ "$VOCAB" = "998" ]; then
     SCYLLA_DIR="./data/datasets/fineweb10B_scylla"
     if [ ! -f "$SCYLLA_DIR/.download_complete" ]; then
         echo "data_setup: downloading Scylla data from HuggingFace..."
-        pip install -q huggingface_hub 2>/dev/null || true
-        python3 -c "from huggingface_hub import snapshot_download; snapshot_download('anthonym21/fineweb10B-scylla', local_dir='$SCYLLA_DIR', repo_type='dataset')"
+        PIP_NO_CACHE_DIR=1 "$PYBIN" -m pip install -q --no-cache-dir huggingface_hub 2>/dev/null || true
+        "$PYBIN" -c "from huggingface_hub import snapshot_download; snapshot_download('anthonym21/fineweb10B-scylla', local_dir='$SCYLLA_DIR', repo_type='dataset')"
         touch "$SCYLLA_DIR/.download_complete"
         echo "data_setup: Scylla download complete"
     fi
@@ -159,39 +224,127 @@ if [ "$VOCAB" = "998" ]; then
     export TOKENIZER_META_PATH="${TOKENIZER_META_PATH:-./candidate.meta.npz}"
 else
     # Non-default vocab: use kevclark's HF repo + delete stale manifest (SP8192 not in default manifest)
-    [ "$VOCAB" -gt 1024 ] && export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
-    [ "$VOCAB" -gt 1024 ] && rm -f data/manifest.json
-    if [ ! -f "data/datasets/.download_complete_sp${VOCAB}" ]; then
-        python data/cached_challenge_fineweb.py --variant sp${VOCAB} --train-shards $SHARDS
-        touch "data/datasets/.download_complete_sp${VOCAB}"
+    if [ "$VOCAB" = "8192" ] && [ -f "tokenizer_specs_export_caseops_v1_reserved_only.json" ]; then
+        CASEOPS_VARIANT=sp8192_lossless_caps_caseops_v1_reserved
+        export MATCHED_FINEWEB_REPO_ID=${MATCHED_FINEWEB_REPO_ID:-romeerp/parameter-golf-caseops-v1}
+        export MATCHED_FINEWEB_REMOTE_ROOT_PREFIX=${MATCHED_FINEWEB_REMOTE_ROOT_PREFIX:-datasets}
+        rm -f data/manifest.json data/datasets/manifest.json
+        if [ ! -f "data/datasets/.download_complete_${CASEOPS_VARIANT}" ]; then
+            python data/cached_challenge_fineweb.py --variant ${CASEOPS_VARIANT} --train-shards 80
+            touch "data/datasets/.download_complete_${CASEOPS_VARIANT}"
+        fi
+        export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved}
+        export DATASETS_DIR=${DATASETS_DIR:-./data/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved}
+        export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model}
+    else
+        [ "$VOCAB" -gt 1024 ] && export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
+        [ "$VOCAB" -gt 1024 ] && rm -f data/manifest.json data/datasets/manifest.json
+        if [ ! -f "data/datasets/.download_complete_sp${VOCAB}" ]; then
+            python data/cached_challenge_fineweb.py --variant sp${VOCAB} --train-shards $SHARDS
+            touch "data/datasets/.download_complete_sp${VOCAB}"
+        fi
+        export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp${VOCAB}}
+        export DATASETS_DIR=${DATASETS_DIR:-./data/datasets/fineweb10B_sp${VOCAB}}
+        export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_${VOCAB}_bpe.model}
     fi
-    export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp${VOCAB}}
-    export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_${VOCAB}_bpe.model}
 fi
 """
 
     clone_setup = f"""
+rm -rf /workspace/pgolf /root/.cache/pip ~/.cache/pip /tmp/pip-cache
+mkdir -p /workspace
 if [ -n "$PGOLF_GIT_TOKEN" ]; then
     CLONE_URL="https://x-access-token:${{PGOLF_GIT_TOKEN}}@github.com/{owner}/{repo}.git"
 else
     CLONE_URL="{REPO_URL}"
 fi
-GIT_TERMINAL_PROMPT=0 git clone --quiet "$CLONE_URL" /workspace/pgolf
+GIT_TERMINAL_PROMPT=0 git clone --quiet --filter=blob:none --no-tags "$CLONE_URL" /workspace/pgolf
 """
 
     return f"""set -e
-pip install -q sentencepiece huggingface-hub tiktoken zstandard brotli 2>/dev/null || true
+PYBIN=$(command -v python3 || true)
+if [ -z "$PYBIN" ] || ! "$PYBIN" - <<'PYEOF' >/dev/null 2>&1
+import torch
+PYEOF
+then
+  ALT_PY=$(command -v python || true)
+  if [ -n "$ALT_PY" ] && "$ALT_PY" - <<'PYEOF' >/dev/null 2>&1
+import torch
+PYEOF
+  then
+    PYBIN="$ALT_PY"
+  fi
+fi
+[ -z "$PYBIN" ] && PYBIN=$(command -v python3 || command -v python)
+echo "python_exec=$PYBIN"
+
+PIP_NO_CACHE_DIR=1 "$PYBIN" -m pip install -q --no-cache-dir sentencepiece huggingface-hub tiktoken zstandard brotli 2>/dev/null || true
+if ! command -v git >/dev/null 2>&1; then
+  apt-get update && apt-get install -y git
+fi
 
 {clone_setup}
 cd /workspace/pgolf
 git fetch origin {f'{branch}' if branch else '--all'}
 git checkout {commit_sha}
+rm -rf .git /root/.cache/pip ~/.cache/pip /tmp/pip-cache
 
 export PYTHONUNBUFFERED=1
 
 {data_setup}
 
-torchrun --nproc_per_node=8 train_gpt.py
+# Optional: force-install the known-good H100 FA3 wheel before launch.
+# Drift isolation uses this to distinguish runtime image regressions from
+# model/code regressions.
+if [ "${{PGOLF_ENSURE_FA3:-0}}" = "1" ]; then
+  "$PYBIN" -m pip install --no-deps --find-links \
+    "${{PGOLF_FA3_WHEEL_INDEX:-https://windreamer.github.io/flash-attention3-wheels/cu128_torch291/}}" \
+    flash_attn_3
+fi
+
+# Install repo-root extra requirements without dependency resolution drift.
+# This keeps experiment branches that vendor non-standard runtime packages
+# (for example FLA / Triton families) runnable on the remote image while
+# preserving the preinstalled torch stack. Core runtime packages stay owned
+# by the base image / explicit FA3 probe settings.
+if [ -f requirements.txt ]; then
+  FILTERED_REQ=$("$PYBIN" << 'PYEOF'
+from pathlib import Path
+import re
+
+blocked = {
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "triton",
+    "flash_attn_3",
+    "flash-attn",
+    "flash-attn-3",
+}
+src = Path("requirements.txt")
+dst = Path("/tmp/pgolf.requirements.filtered.txt")
+kept = []
+for raw in src.read_text().splitlines():
+    stripped = raw.strip()
+    if not stripped or stripped.startswith("#"):
+        kept.append(raw)
+        continue
+    name = re.split(r"[<>=!~\\[\\s]", stripped, maxsplit=1)[0].lower()
+    if name in blocked:
+        print(f"requirements_filter: skip {{name}}", flush=True)
+        continue
+    kept.append(raw)
+dst.write_text("\\n".join(kept) + ("\\n" if kept else ""))
+print(dst)
+PYEOF
+)
+  FILTERED_REQ=$(printf "%s\n" "$FILTERED_REQ" | tail -n 1)
+  if [ -s "$FILTERED_REQ" ]; then
+    "$PYBIN" -m pip install --no-deps -r "$FILTERED_REQ"
+  fi
+fi
+
+"$PYBIN" -m torch.distributed.run --nproc_per_node=8 train_gpt.py
 RC=$?
 
 # Post-training: emit structured results_json from log file if available.
@@ -201,7 +354,7 @@ if [ -d logs ]; then
   LOGFILE=$(ls -t logs/*.txt 2>/dev/null | head -1)
   if [ -n "$LOGFILE" ]; then
     if [ -f remote_helper.py ]; then
-        python3 remote_helper.py collect-results 2>/dev/null || true
+        "$PYBIN" remote_helper.py collect-results 2>/dev/null || true
     fi
   fi
 fi
@@ -257,6 +410,12 @@ def _create_job(commit_sha, node_group=None, branch=None):
     seed = os.environ.get("PGOLF_SEED")
     if seed:
         lep_cmd.extend(["-e", f"SEED={seed}"])
+    ensure_fa3 = os.environ.get("PGOLF_ENSURE_FA3")
+    if ensure_fa3:
+        lep_cmd.extend(["-e", f"PGOLF_ENSURE_FA3={ensure_fa3}"])
+    fa3_index = os.environ.get("PGOLF_FA3_WHEEL_INDEX")
+    if fa3_index:
+        lep_cmd.extend(["-e", f"PGOLF_FA3_WHEEL_INDEX={fa3_index}"])
 
     _log(f"Creating job {job_name}...")
     result = subprocess.run(lep_cmd, capture_output=True, text=True)
@@ -304,19 +463,21 @@ def _get_job_status(job_name, job_id=None):
     else:
         result = _run(f"{LEP_CLI} job get -n {job_name}")
     output = result.stdout + result.stderr
+    for candidate in (result.stdout, output):
+        payload = _extract_json_object(candidate)
+        if isinstance(payload, dict):
+            status_blob = payload.get("status", {})
+            state = _normalize_status_text(status_blob.get("state"))
+            if state:
+                return state
     for line in output.split("\n"):
         ll = line.lower().strip()
         if "status" in ll or "state" in ll:
-            if "completed" in ll or "succeeded" in ll:
-                return "completed"
-            if "failed" in ll or "error" in ll:
-                return "failed"
-            if "stopped" in ll:
-                return "stopped"
-            if "running" in ll or "pending" in ll or "starting" in ll:
-                return "running"
+            state = _normalize_status_text(ll)
+            if state:
+                return state
     # Fallback: check job lists
-    for state in ["running", "completed", "failed", "stopped"]:
+    for state in ["queueing", "running", "completed", "failed", "stopped"]:
         r = _run(f"{LEP_CLI} job list -s {state}")
         if job_name in r.stdout or (job_id and job_id in r.stdout):
             return state
@@ -331,15 +492,34 @@ def _log_path(job_id):
     return os.path.join(WORKSPACE, f"run_{job_id}.log")
 
 
+def _has_final_results_content(content):
+    """Return True only when the final metric for the active eval mode is present."""
+    if "results_json" in content:
+        return True
+    if "final_int6_roundtrip_exact" in content:
+        return True
+    # SLOT runs after roundtrip/sliding and must not be cut off early.
+    if "slot_enabled: True" in content:
+        return "final_causal_slot" in content
+    # LoRA TTT runs after quantized roundtrip/sliding and is the real final metric.
+    if "ttt_enabled: True" in content:
+        return "quantized_ttt_lora" in content or "ttt_sliding:done" in content
+    # Sliding-only runs should wait for the sliding metric, not roundtrip.
+    if "sliding_window_enabled: True" in content:
+        return (
+            "quantized_sliding_window" in content
+            or "final_int6_sliding_window" in content
+        )
+    # Plain roundtrip-only evals can stop on the first final eval line.
+    return "eval_time" in content and "val_bpb" in content
+
+
 def _log_has_results(log_file):
     if not os.path.exists(log_file):
         return False
     with open(log_file) as f:
         content = f.read()
-    # If SLOT is enabled, wait for final_causal_slot or results_json (not just any eval result)
-    if "slot_enabled: True" in content:
-        return "final_causal_slot" in content or "results_json" in content
-    return "results_json" in content or ("eval_time" in content and "val_bpb" in content)
+    return _has_final_results_content(content)
 
 
 def _stream_job_logs(job_id, log_file):
@@ -447,7 +627,7 @@ def _robust_log_capture(job_id, log_file, retries=10):
                      and not l.startswith("Selected replica")
                      and l.strip() != "Connection stopped."]
             text = "\n".join(lines).strip()
-            if "results_json" in text or ("eval_time" in text and "val_bpb" in text):
+            if _has_final_results_content(text):
                 with open(log_file, "a") as f:
                     f.write(text + "\n")
                 return
@@ -474,6 +654,13 @@ def _extract_results(logs):
                 continue
             except (json.JSONDecodeError, IndexError):
                 pass
+        if "final_int6_roundtrip_exact" in line and re.search(r"val_bpb[=:]", line):
+            m = re.search(r"val_bpb[=:](\d+\.\d+)", line)
+            if m:
+                results["val_bpb"] = float(m.group(1))
+            m = re.search(r"val_loss[=:](\d+\.\d+)", line)
+            if m:
+                results["val_loss"] = float(m.group(1))
         # Match any eval result line: has val_bpb AND eval_time (or ttt done marker).
         # This covers all eval methods (roundtrip, sliding, TTT, future) without keyword updates.
         # Training checkpoints (e.g., "4000/20000 val_bpb: 1.13") lack eval_time so are excluded.
@@ -489,8 +676,16 @@ def _extract_results(logs):
             m = re.search(r"(\d+)\s*bytes", line)
             if m:
                 results["bytes_total"] = int(m.group(1))
+        if "Artifact:" in line:
+            m = re.search(r"Artifact:\s*([\d,]+)\s*bytes", line)
+            if m:
+                results["bytes_total"] = int(m.group(1).replace(",", ""))
         if "peak memory allocated" in line:
             m = re.search(r"(\d+)\s*MiB", line)
+            if m:
+                results["peak_memory_mib"] = int(m.group(1))
+        if "Peak memory:" in line:
+            m = re.search(r"Peak memory:\s*(\d+)\s*MiB", line)
             if m:
                 results["peak_memory_mib"] = int(m.group(1))
     return results
@@ -504,6 +699,17 @@ def _log(msg):
     print(f"[evaluate] {msg}", file=sys.stderr)
 
 
+def _result_file_path() -> str:
+    explicit = (
+        os.environ.get("AUTORESEARCH_RESULT_FILE")
+        or os.environ.get("PGOLF_RESULT_FILE")
+        or ""
+    ).strip()
+    if explicit:
+        return os.path.expanduser(explicit)
+    return os.path.join(WORKSPACE, f"last_result.{os.getpid()}.json")
+
+
 def _output(pass_val, score=None, details=None, error=None):
     result = {"pass": pass_val}
     if score is not None:
@@ -513,7 +719,7 @@ def _output(pass_val, score=None, details=None, error=None):
     if error:
         result["error"] = error
     # Persist result to file BEFORE stdout — survives parent process kill.
-    result_file = os.path.join(WORKSPACE, "last_result.json")
+    result_file = _result_file_path()
     try:
         with open(result_file, "w") as f:
             json.dump(result, f)
@@ -536,6 +742,30 @@ def main():
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     args = parser.parse_args()
 
+    # Best-effort node-group health summary before any push/launch.
+    if args.node_group:
+        try:
+            health = _node_group_health(args.node_group)
+            _log(
+                "node-group health: "
+                f"{args.node_group} available={health['available']}/{health['total']} "
+                f"unhealthy={health['has_unhealthy']} "
+                f"diskpressure={health['has_diskpressure']} "
+                f"initializing={health['has_initializing']}"
+            )
+            if os.environ.get("PGOLF_STRICT_NODEGROUP_HEALTH", "0") == "1":
+                blockers = []
+                if health["available"] == 0:
+                    blockers.append("no fully available GPU nodes")
+                if health["has_unhealthy"]:
+                    blockers.append("unhealthy/not-ready nodes present")
+                if health["has_diskpressure"]:
+                    blockers.append("diskpressure nodes present")
+                if blockers:
+                    _output(False, error="node-group unhealthy: " + ", ".join(blockers))
+        except Exception as e:
+            _log(f"node-group health check warning: {e}")
+
     # Signal handler: on SIGTERM/SIGINT, attempt final log capture before dying.
     # This catches the case where the calling Bash shell kills us (e.g., 10-min timeout).
     _main_state = {"job_id": None, "log_file": None}
@@ -549,7 +779,7 @@ def main():
                 results = _extract_results(log_content)
                 if results.get("val_bpb"):
                     _log(f"Saved partial results: val_bpb={results['val_bpb']}")
-                    result_file = os.path.join(WORKSPACE, "last_result.json")
+                    result_file = _result_file_path()
                     with open(result_file, "w") as f:
                         json.dump({"pass": False, "error": f"killed by signal {signum}",
                                    "score": -results["val_bpb"], "details": results}, f)
@@ -619,10 +849,29 @@ def main():
 
         time.sleep(30)
     else:
-        _log(f"Timeout after {args.timeout}s, stopping job")
-        _stop_job_safe(job_id)
-        log_thread.join(timeout=5)
-        _output(False, error=f"job timeout after {args.timeout}s")
+        _log(f"Timeout after {args.timeout}s, attempting final status + log capture before stopping")
+        status = "unknown"
+        for _ in range(6):
+            final_status = _get_job_status(job_name, job_id)
+            try:
+                _robust_log_capture(job_id, log_file)
+            except Exception:
+                pass
+            log_thread.join(timeout=5)
+            if os.path.exists(log_file):
+                with open(log_file) as f:
+                    timeout_log_content = f.read()
+                timeout_results = _extract_results(timeout_log_content)
+                if timeout_results.get("val_bpb") is not None:
+                    status = "completed" if final_status == "unknown" else final_status
+                    break
+            status = final_status
+            if status in ("completed", "failed", "stopped"):
+                break
+            time.sleep(10)
+        if status not in ("completed", "failed", "stopped"):
+            _stop_job_safe(job_id)
+            _output(False, error=f"job timeout after {args.timeout}s")
 
     # 5. Parse results from log
     if not os.path.exists(log_file):
@@ -694,10 +943,29 @@ def _run_seed(seed, commit, node_group, timeout):
     # Give streaming thread time to flush final results
     stream_thread.join(timeout=60)
     # Final log capture attempt (stream may have missed tail)
-    try:
-        _robust_log_capture(job_id, log_file)
-    except Exception:
-        pass
+    if status == "timeout":
+        for _ in range(6):
+            try:
+                _robust_log_capture(job_id, log_file)
+            except Exception:
+                pass
+            final_status = _get_job_status(job_name, job_id)
+            if os.path.exists(log_file):
+                with open(log_file) as f:
+                    log_content = f.read()
+                r = _extract_results(log_content)
+                if r.get("val_bpb") is not None:
+                    status = "completed" if final_status == "unknown" else final_status
+                    break
+            if final_status in ("completed", "failed", "stopped"):
+                status = final_status
+                break
+            time.sleep(10)
+    else:
+        try:
+            _robust_log_capture(job_id, log_file)
+        except Exception:
+            pass
 
     # Parse results
     val_bpb = None
@@ -708,6 +976,9 @@ def _run_seed(seed, commit, node_group, timeout):
         r = _extract_results(log_content)
         val_bpb = r.get("val_bpb")
         bytes_total = r.get("bytes_total", 0)
+        if status == "timeout" and val_bpb is not None:
+            final_status = _get_job_status(job_name, job_id)
+            status = "completed" if final_status == "unknown" else final_status
 
     _log(f"[seed-{seed}] DONE: val_bpb={val_bpb}, bytes={bytes_total}, status={status}")
     return {

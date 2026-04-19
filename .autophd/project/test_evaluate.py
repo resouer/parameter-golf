@@ -26,6 +26,8 @@ exec(compile(
 
 _extract_results = _ns["_extract_results"]
 _log_has_results = _ns["_log_has_results"]
+_has_final_results_content = _ns["_has_final_results_content"]
+_make_job_command = _ns["_make_job_command"]
 
 
 class TestExtractResults(unittest.TestCase):
@@ -167,6 +169,59 @@ class TestLogHasResults(unittest.TestCase):
             "1000/20000 train_loss: 3.20 train_time: 1.7m"
         ))
 
+    def test_ttt_quantized_only_is_not_final(self):
+        content = """ttt_enabled: True
+pre-quantization post-ema val_loss:2.78 val_bpb:1.077 eval_time:9709ms
+quantized val_loss:2.81 val_bpb:1.088 eval_time:68979ms
+ttt_lora:warming up compile"""
+        self.assertFalse(_log_has_results_str(content))
+
+    def test_ttt_final_marker_is_final(self):
+        content = """ttt_enabled: True
+quantized val_loss:2.81 val_bpb:1.088 eval_time:68979ms
+quantized_ttt_lora val_loss:2.79 val_bpb:1.077 eval_time:429509ms"""
+        self.assertTrue(_log_has_results_str(content))
+
+    def test_slot_roundtrip_is_not_final(self):
+        content = """slot_enabled: True
+final_int6_roundtrip_exact val_loss:1.88 val_bpb:1.114 eval_time:22797ms"""
+        self.assertFalse(_log_has_results_str(content))
+
+    def test_slot_final_marker_is_final(self):
+        content = """slot_enabled: True
+final_causal_slot val_loss:1.70 val_bpb:1.0069 time:474604ms"""
+        self.assertTrue(_log_has_results_str(content))
+
+    def test_sliding_roundtrip_only_is_not_final(self):
+        content = """sliding_window_enabled: True
+final_int6_roundtrip_exact val_loss:2.84 val_bpb:1.10 eval_time:27711ms"""
+        self.assertFalse(_log_has_results_str(content))
+
+    def test_sliding_marker_is_final(self):
+        content = """sliding_window_enabled: True
+final_int6_sliding_window val_loss:2.80 val_bpb:1.083 eval_time:124497ms"""
+        self.assertTrue(_log_has_results_str(content))
+
+
+class TestFinalMarkerDetection(unittest.TestCase):
+    def test_results_json_short_circuits(self):
+        self.assertTrue(_has_final_results_content('results_json: {"val_bpb": 1.08}'))
+
+
+class TestJobCommand(unittest.TestCase):
+    def test_requirements_filter_skips_runtime_owned_packages(self):
+        cmd = _make_job_command("deadbeef", branch="exp/test")
+        self.assertIn("requirements_filter: skip", cmd)
+        self.assertIn("'torch'", cmd)
+        self.assertIn("'flash_attn_3'", cmd)
+        self.assertIn('"$PYBIN" -m pip install --no-deps -r "$FILTERED_REQ"', cmd)
+
+    def test_job_command_selects_python_with_torch(self):
+        cmd = _make_job_command("deadbeef", branch="exp/test")
+        self.assertIn('python_exec=$PYBIN', cmd)
+        self.assertIn('import torch', cmd)
+        self.assertIn('"$PYBIN" -m torch.distributed.run --nproc_per_node=8 train_gpt.py', cmd)
+
 
 def _log_has_results_str(content):
     """Helper: test _log_has_results with a string instead of a file."""
@@ -290,7 +345,7 @@ class TestRemoteScript(unittest.TestCase):
 
     def test_script_has_torchrun(self):
         script = self._get_script()
-        self.assertIn("torchrun --nproc_per_node=8 train_gpt.py", script)
+        self.assertIn('"$PYBIN" -m torch.distributed.run --nproc_per_node=8 train_gpt.py', script)
 
     def test_script_has_results_json_collector(self):
         script = self._get_script()
