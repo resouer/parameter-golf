@@ -178,6 +178,16 @@ fi
 SHARDS=80
 [ "$VOCAB" -gt 1024 ] && SHARDS=143
 [ "$VOCAB" -gt 4096 ] && SHARDS=128
+SHARD_OVERRIDE=$(python3 << 'PYEOF'
+import re, sys
+f = open('train_gpt.py').read()
+m = re.search(r'TRAIN_SHARDS_OVERRIDE.*?,\s*(\d+)', f)
+if m:
+    print(m.group(1)); sys.exit()
+print('')
+PYEOF
+)
+[ -n "$SHARD_OVERRIDE" ] && SHARDS="$SHARD_OVERRIDE"
 echo "data_setup: vocab=$VOCAB shards=$SHARDS"
 # Scylla (998-vocab custom tokenizer): download from HuggingFace
 if [ "$VOCAB" = "998" ]; then
