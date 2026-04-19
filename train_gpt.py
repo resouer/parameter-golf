@@ -118,12 +118,29 @@ class Hyperparameters:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     is_main_process = rank == 0
     grad_accum_steps = 8 // world_size
-    default_datasets_dir = os.path.join(data_dir, "datasets", f"fineweb10B_sp{vocab_size}")
+    caseops_spec_path = Path(__file__).with_name(
+        "tokenizer_specs_export_caseops_v1_reserved_only.json"
+    )
+    caseops_defaults_enabled = caseops_spec_path.is_file()
+    default_datasets_dir = (
+        os.path.join(data_dir, "datasets", "fineweb10B_sp8192_lossless_caps_caseops_v1_reserved")
+        if caseops_defaults_enabled
+        else os.path.join(data_dir, "datasets", f"fineweb10B_sp{vocab_size}")
+    )
     datasets_dir = os.environ.get("DATASETS_DIR", default_datasets_dir)
     train_files = os.environ.get("TRAIN_FILES", os.path.join(datasets_dir, "fineweb_train_*.bin"))
     val_files = os.environ.get("VAL_FILES", os.path.join(datasets_dir, "fineweb_val_[0-9][0-9][0-9][0-9][0-9][0-9].bin"))
+    default_tokenizer_path = (
+        os.path.join(
+            data_dir,
+            "tokenizers",
+            "fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model",
+        )
+        if caseops_defaults_enabled
+        else os.path.join(data_dir, "tokenizers", f"fineweb_{vocab_size}_bpe.model")
+    )
     tokenizer_path = os.environ.get(
-        "TOKENIZER_PATH", os.path.join(data_dir, "tokenizers", f"fineweb_{vocab_size}_bpe.model")
+        "TOKENIZER_PATH", default_tokenizer_path
     )
     artifact_dir = os.environ.get("ARTIFACT_DIR", "")
     logfile = (

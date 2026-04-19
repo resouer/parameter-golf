@@ -196,14 +196,29 @@ if [ "$VOCAB" = "998" ]; then
     export TOKENIZER_META_PATH="${TOKENIZER_META_PATH:-./candidate.meta.npz}"
 else
     # Non-default vocab: use kevclark's HF repo + delete stale manifest (SP8192 not in default manifest)
-    [ "$VOCAB" -gt 1024 ] && export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
-    [ "$VOCAB" -gt 1024 ] && rm -f data/manifest.json
-    if [ ! -f "data/datasets/.download_complete_sp${VOCAB}" ]; then
-        python data/cached_challenge_fineweb.py --variant sp${VOCAB} --train-shards $SHARDS
-        touch "data/datasets/.download_complete_sp${VOCAB}"
+    if [ "$VOCAB" = "8192" ] && [ -f "tokenizer_specs_export_caseops_v1_reserved_only.json" ]; then
+        CASEOPS_VARIANT=sp8192_lossless_caps_caseops_v1_reserved
+        export MATCHED_FINEWEB_REPO_ID=${MATCHED_FINEWEB_REPO_ID:-romeerp/parameter-golf-caseops-v1}
+        export MATCHED_FINEWEB_REMOTE_ROOT_PREFIX=${MATCHED_FINEWEB_REMOTE_ROOT_PREFIX:-datasets}
+        rm -f data/manifest.json data/datasets/manifest.json
+        if [ ! -f "data/datasets/.download_complete_${CASEOPS_VARIANT}" ]; then
+            python data/cached_challenge_fineweb.py --variant ${CASEOPS_VARIANT} --train-shards 80
+            touch "data/datasets/.download_complete_${CASEOPS_VARIANT}"
+        fi
+        export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved}
+        export DATASETS_DIR=${DATASETS_DIR:-./data/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved}
+        export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model}
+    else
+        [ "$VOCAB" -gt 1024 ] && export MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf
+        [ "$VOCAB" -gt 1024 ] && rm -f data/manifest.json data/datasets/manifest.json
+        if [ ! -f "data/datasets/.download_complete_sp${VOCAB}" ]; then
+            python data/cached_challenge_fineweb.py --variant sp${VOCAB} --train-shards $SHARDS
+            touch "data/datasets/.download_complete_sp${VOCAB}"
+        fi
+        export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp${VOCAB}}
+        export DATASETS_DIR=${DATASETS_DIR:-./data/datasets/fineweb10B_sp${VOCAB}}
+        export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_${VOCAB}_bpe.model}
     fi
-    export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp${VOCAB}}
-    export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_${VOCAB}_bpe.model}
 fi
 """
 

@@ -7,24 +7,41 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download
 
 
-REPO_ID = os.environ.get("MATCHED_FINEWEB_REPO_ID", "willdepueoai/parameter-golf")
-REMOTE_ROOT_PREFIX = os.environ.get("MATCHED_FINEWEB_REMOTE_ROOT_PREFIX", "datasets")
+DEFAULT_REPO_ID = "willdepueoai/parameter-golf"
+DEFAULT_REMOTE_ROOT_PREFIX = "datasets"
+CASEOPS_REPO_ID = "romeerp/parameter-golf-caseops-v1"
+CASEOPS_VARIANT = "sp8192_lossless_caps_caseops_v1_reserved"
+CASEOPS_DATASET_DIR = "fineweb10B_sp8192_lossless_caps_caseops_v1_reserved"
 ROOT = Path(__file__).resolve().parent
 DATASETS_DIR = ROOT / "datasets"
 TOKENIZERS_DIR = ROOT / "tokenizers"
+CASEOPS_SPEC = ROOT.parent / "tokenizer_specs_export_caseops_v1_reserved_only.json"
+
+ACTIVE_REPO_ID = os.environ.get("MATCHED_FINEWEB_REPO_ID", DEFAULT_REPO_ID)
+ACTIVE_REMOTE_ROOT_PREFIX = os.environ.get(
+    "MATCHED_FINEWEB_REMOTE_ROOT_PREFIX", DEFAULT_REMOTE_ROOT_PREFIX
+)
+
+
+def caseops_enabled_for_variant(name: str) -> bool:
+    return name == "sp8192" and CASEOPS_SPEC.is_file()
 
 def dataset_dir_for_variant(name: str) -> str:
+    if caseops_enabled_for_variant(name):
+        return CASEOPS_DATASET_DIR
     if name == "byte260":
         return "fineweb10B_byte260"
     if name.startswith("sp") and name[2:].isdigit():
+        return f"fineweb10B_{name}"
+    if name.startswith("sp"):
         return f"fineweb10B_{name}"
     raise ValueError(f"unsupported variant {name!r}; expected byte260 or sp<VOCAB_SIZE>")
 
 
 def local_path_for_remote(relative_path: str) -> Path:
     remote_path = Path(relative_path)
-    if REMOTE_ROOT_PREFIX and remote_path.parts[:1] == (REMOTE_ROOT_PREFIX,):
-        remote_path = remote_path.relative_to(REMOTE_ROOT_PREFIX)
+    if ACTIVE_REMOTE_ROOT_PREFIX and remote_path.parts[:1] == (ACTIVE_REMOTE_ROOT_PREFIX,):
+        remote_path = remote_path.relative_to(ACTIVE_REMOTE_ROOT_PREFIX)
     if remote_path.parts[:1] == ("datasets",):
         return DATASETS_DIR.joinpath(*remote_path.parts[1:])
     if remote_path.parts[:1] == ("tokenizers",):
@@ -42,7 +59,7 @@ def get(relative_path: str) -> None:
     remote_path = Path(relative_path)
     cached_path = Path(
         hf_hub_download(
-            repo_id=REPO_ID,
+            repo_id=ACTIVE_REPO_ID,
             filename=remote_path.name,
             subfolder=remote_path.parent.as_posix() if remote_path.parent != Path(".") else None,
             repo_type="dataset",
@@ -59,7 +76,7 @@ def get(relative_path: str) -> None:
 
 
 def manifest_path() -> Path:
-    return local_path_for_remote(f"{REMOTE_ROOT_PREFIX}/manifest.json")
+    return local_path_for_remote(f"{ACTIVE_REMOTE_ROOT_PREFIX}/manifest.json")
 
 
 def load_manifest(*, skip_manifest_download: bool) -> dict:
@@ -118,7 +135,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    global ACTIVE_REPO_ID, ACTIVE_REMOTE_ROOT_PREFIX
     args = build_parser().parse_args()
+    if caseops_enabled_for_variant(args.variant):
+        ACTIVE_REPO_ID = os.environ.get("MATCHED_FINEWEB_REPO_ID", CASEOPS_REPO_ID)
+        ACTIVE_REMOTE_ROOT_PREFIX = os.environ.get(
+            "MATCHED_FINEWEB_REMOTE_ROOT_PREFIX", DEFAULT_REMOTE_ROOT_PREFIX
+        )
     dataset_dir = dataset_dir_for_variant(args.variant)
     train_shards = args.train_shards_positional if args.train_shards_positional is not None else args.train_shards
     if train_shards < 0:
@@ -132,7 +155,7 @@ def main() -> None:
     val_shards = int((dataset_entry.get("stats") or {}).get("files_val"))
     if train_shards > max_train_shards:
         raise ValueError(
-            f"{args.variant} only has {max_train_shards} training shards on {REPO_ID}, requested {train_shards}"
+            f"{args.variant} only has {max_train_shards} training shards on {ACTIVE_REPO_ID}, requested {train_shards}"
         )
     tokenizer_name = dataset_entry.get("tokenizer_name")
     tokenizer_entry = next((x for x in manifest.get("tokenizers", []) if x.get("name") == tokenizer_name), None)
@@ -140,17 +163,21 @@ def main() -> None:
         raise ValueError(f"tokenizer {tokenizer_name} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
 
     if args.with_docs:
-        get(f"{REMOTE_ROOT_PREFIX}/docs_selected.jsonl")
-        get(f"{REMOTE_ROOT_PREFIX}/docs_selected.source_manifest.json")
+        get(f"{ACTIVE_REMOTE_ROOT_PREFIX}/docs_selected.jsonl")
+        get(f"{ACTIVE_REMOTE_ROOT_PREFIX}/docs_selected.source_manifest.json")
 
-    dataset_prefix = f"{REMOTE_ROOT_PREFIX}/datasets/{dataset_dir}"
+    dataset_prefix = f"{ACTIVE_REMOTE_ROOT_PREFIX}/datasets/{dataset_dir}"
     for i in range(val_shards):
         get(f"{dataset_prefix}/fineweb_val_{i:06d}.bin")
+    val_bytes_glob = dataset_entry.get("val_bytes_glob")
+    if val_bytes_glob:
+        for i in range(val_shards):
+            get(f"{dataset_prefix}/fineweb_val_bytes_{i:06d}.bin")
     for i in range(train_shards):
         get(f"{dataset_prefix}/fineweb_train_{i:06d}.bin")
 
     for artifact_path in artifact_paths_for_tokenizer(tokenizer_entry):
-        get(f"{REMOTE_ROOT_PREFIX}/{artifact_path}")
+        get(f"{ACTIVE_REMOTE_ROOT_PREFIX}/{artifact_path}")
 
 
 if __name__ == "__main__":
