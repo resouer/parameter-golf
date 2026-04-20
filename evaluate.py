@@ -505,8 +505,6 @@ def _has_final_results_content(content):
     """Return True only when the final metric for the active eval mode is present."""
     if "results_json" in content:
         return True
-    if "final_int6_roundtrip_exact" in content:
-        return True
     # SLOT runs after roundtrip/sliding and must not be cut off early.
     if "slot_enabled: True" in content:
         return "final_causal_slot" in content
@@ -520,6 +518,8 @@ def _has_final_results_content(content):
             or "final_int6_sliding_window" in content
         )
     # Plain roundtrip-only evals can stop on the first final eval line.
+    if "final_int6_roundtrip_exact" in content:
+        return True
     return "eval_time" in content and "val_bpb" in content
 
 
@@ -863,7 +863,10 @@ def main():
                 with open(log_file) as f:
                     timeout_log_content = f.read()
                 timeout_results = _extract_results(timeout_log_content)
-                if timeout_results.get("val_bpb") is not None:
+                if (
+                    timeout_results.get("val_bpb") is not None
+                    and _has_final_results_content(timeout_log_content)
+                ):
                     status = "completed" if final_status == "unknown" else final_status
                     break
             status = final_status
@@ -882,12 +885,17 @@ def main():
         log_content = f.read()
     results = _extract_results(log_content)
     val_bpb = results.get("val_bpb")
+    has_final_marker = _has_final_results_content(log_content)
 
     if status == "failed":
         _output(False, score=-val_bpb if val_bpb else None, error="job failed on Lepton")
 
     if val_bpb is None:
         _output(False, error=f"no val_bpb in log ({len(log_content)} bytes, {log_content.count(chr(10))} lines)")
+
+    if not has_final_marker:
+        _output(False, score=-val_bpb, details=results,
+                error="no final eval marker in log")
 
     # Score is always NEGATIVE val_bpb: higher = better = lower BPB (-1.116 > -1.117).
     # score_improvement keeps when score goes UP, so negating BPP aligns directions.
