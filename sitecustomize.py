@@ -33,9 +33,12 @@ _REPLACEMENT = (
 
 
 def _patched_exec(obj, globals=None, locals=None):
-    if isinstance(obj, str) and _TARGET in obj and "pre-quantization post-ema" in obj:
-        obj = obj.replace(_TARGET, _REPLACEMENT, 1)
-        print("sitecustomize:patched_quantized_sliding_window", flush=True)
+    if isinstance(obj, (str, bytes)) and "pre-quantization post-ema" in str(obj):
+        decoded = obj.decode("utf-8", "replace") if isinstance(obj, bytes) else obj
+        if _TARGET in decoded:
+            decoded = decoded.replace(_TARGET, _REPLACEMENT, 1)
+            print("sitecustomize:patched_quantized_sliding_window", flush=True)
+            obj = decoded
     return _ORIG_EXEC(obj, globals, locals)
 
 
