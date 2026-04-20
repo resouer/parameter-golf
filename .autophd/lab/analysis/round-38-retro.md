@@ -47,6 +47,13 @@ partially, and it uncovered two stronger infrastructure facts:
   - a fresh `4x` distributed diagnostic reached rank0 setup (`WORLD_SIZE=4`)
     but also stalled before emitting `MATMUL_SEC` / `ALLREDUCE_SEC_MEAN`
     lines; the live mirror ended right after rank0 bootstrap output
+- A stable runfile-based `2x` distributed diagnostic on AWS completed cleanly:
+  - `python_exec = /usr/bin/python3`
+  - `WORLD_SIZE = 2`
+  - `MATMUL_SEC = 0.080145`
+  - `ALLREDUCE_SEC_MEAN = 0.0003` for `64 MiB`
+- The matching stable runfile-based `2x` diagnostic on Heimdall did not even
+  leave `Starting` over the same observation window.
 
 ## Confirmed Runtime Findings
 
@@ -147,11 +154,26 @@ partially, and it uncovered two stronger infrastructure facts:
   - so the remaining fault domain looks increasingly 8x-specific
 - The 2x/4x reruns suggest the break is not only at the full 8x scale:
   - `1x` microbenchmarks work on both AWS and Heimdall
-  - `2x` already fails quickly on Heimdall
+  - `2x` is healthy on AWS but already unhealthy on Heimdall
   - `4x` and `8x` can reach distributed init but stall before the first useful
     benchmark result
   - so the fault domain now looks like Heimdall multi-GPU / NCCL / scheduler
     substrate rather than model code
+- Node-pinned submission-style controls narrow the fault domain even further:
+  - `node-ip-10-0-83-32` (`node-B`) stays in the bad training band:
+    - `500/20000 = 2.3m`
+    - `1000/20000 = 5.7m`
+    - `quantized_sliding_window = 1.13941579`
+  - `node-ip-10-0-80-97` (`node-A`) restores healthy training speed:
+    - `500/20000 = 0.9m`
+    - `1000/20000 = 1.7m`
+    - `1500/20000 = 2.6m`
+    - `4000/20000 val_bpb = 1.1109`
+    - `pre-quantization post-ema = 1.08767090`
+    - `quantized = 1.09884460`
+  - A final-gated rerun on `node-A` still did not produce a
+    `quantized_sliding_window` tail, so it proves training/quantized recovery
+    but does not yet prove full final-sliding recovery
 - The alt-image path is now a valid probe surface, but it has not restored the
   expected speed band; simply switching to `cu129/torch280` is not sufficient.
 - The next meaningful probe is not "new model idea", but:

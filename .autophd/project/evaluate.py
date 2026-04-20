@@ -370,6 +370,7 @@ exit $RC
 def _create_job(commit_sha, node_group=None, branch=None):
     """Create a Lepton job. Returns (job_name, job_id)."""
     ng = node_group or os.environ.get("PGOLF_NODE_GROUP", "")
+    node_id = (os.environ.get("PGOLF_NODE_ID", "") or "").strip()
     short_sha = commit_sha[:7]
     prefix = os.environ.get("PGOLF_JOB_PREFIX", "pgolf")
 
@@ -403,6 +404,11 @@ def _create_job(commit_sha, node_group=None, branch=None):
     ]
     if ng:
         lep_cmd.extend(["-ng", ng])
+    if node_id:
+        lep_cmd.extend(["-ni", node_id])
+    log_collection = (os.environ.get("PGOLF_LOG_COLLECTION", "") or "").strip().lower()
+    if log_collection in ("1", "true", "false", "0"):
+        lep_cmd.extend(["-lg", "true" if log_collection in ("1", "true") else "false"])
     if LOCAL_VOLUME:
         lep_cmd.extend(["--mount", f"/:/mnt/pgolf-data:node-local:{LOCAL_VOLUME}"])
     if GIT_TOKEN:
@@ -517,8 +523,6 @@ def _has_final_results_content(content):
     """Return True only when the final metric for the active eval mode is present."""
     if "results_json" in content:
         return True
-    if "final_int6_roundtrip_exact" in content:
-        return True
     # SLOT runs after roundtrip/sliding and must not be cut off early.
     if "slot_enabled: True" in content:
         return "final_causal_slot" in content
@@ -532,6 +536,8 @@ def _has_final_results_content(content):
             or "final_int6_sliding_window" in content
         )
     # Plain roundtrip-only evals can stop on the first final eval line.
+    if "final_int6_roundtrip_exact" in content:
+        return True
     return "eval_time" in content and "val_bpb" in content
 
 
@@ -899,7 +905,10 @@ def main():
                 with open(log_file) as f:
                     timeout_log_content = f.read()
                 timeout_results = _extract_results(timeout_log_content)
-                if timeout_results.get("val_bpb") is not None:
+                if (
+                    timeout_results.get("val_bpb") is not None
+                    and _has_final_results_content(timeout_log_content)
+                ):
                     status = "completed" if final_status == "unknown" else final_status
                     break
             status = final_status
@@ -918,12 +927,17 @@ def main():
         log_content = f.read()
     results = _extract_results(log_content)
     val_bpb = results.get("val_bpb")
+    has_final_marker = _has_final_results_content(log_content)
 
     if status == "failed":
         _output(False, score=-val_bpb if val_bpb else None, error="job failed on Lepton")
 
     if val_bpb is None:
         _output(False, error=f"no val_bpb in log ({len(log_content)} bytes, {log_content.count(chr(10))} lines)")
+
+    if not has_final_marker:
+        _output(False, score=-val_bpb, details=results,
+                error="no final eval marker in log")
 
     # Score is always NEGATIVE val_bpb: higher = better = lower BPB (-1.116 > -1.117).
     # score_improvement keeps when score goes UP, so negating BPP aligns directions.

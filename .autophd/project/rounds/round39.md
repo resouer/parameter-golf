@@ -20,8 +20,12 @@ from launcher/image issues.
 
 - AWS 1x current-image microbenchmark is healthy.
 - Heimdall 1x current-image microbenchmark works but is slower.
-- Heimdall 2x fails quickly.
-- Heimdall 4x/8x can start distributed init but stall before useful benchmark output.
+- AWS 2x distributed microbenchmark is healthy.
+- Heimdall 2x is unhealthy.
+- Heimdall 4x/8x can start distributed init but stall before useful benchmark output unless pinned to a better node.
+- Heimdall node-level training split is now visible:
+  - `node-ip-10-0-83-32` stays in the bad `~1.139` band
+  - `node-ip-10-0-80-97` restores healthy training speed but still lacks a proven final sliding tail
 - AWS 8x remains quota-blocked.
 
 ## Stop Criteria

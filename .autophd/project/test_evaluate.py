@@ -229,6 +229,12 @@ class TestStatusHelpers(unittest.TestCase):
         self.assertEqual(_normalize_status_text("Queueing"), "queueing")
         self.assertEqual(_normalize_status_text("pending"), "queueing")
 
+    def test_quantized_only_is_not_final_for_sliding(self):
+        content = """sliding_window_enabled: True
+pre-quantization post-ema val_loss:2.80 val_bpb:1.08 eval_time:8000ms
+quantized val_loss:2.83 val_bpb:1.09 eval_time:32000ms"""
+        self.assertFalse(_has_final_results_content(content))
+
 
 def _log_has_results_str(content):
     """Helper: test _log_has_results with a string instead of a file."""
