@@ -1,2 +1,1126 @@
-import lzma as L,base64 as B
-exec(L.decompress(B.b85decode(";La>KC|v+An1iBmm2Lj?#GMy3nc5FDC5OrW_PApDM>V>ui&z$DDoYt&HOr-YcRavx&eXRn?afQA6n6r<BX<v1rtKuHG!lt%8``=xU9FZm;bSYDGVGC%Q$-~7^W|1CDzM>443e~?FX!ZzOMj?myitmTW#fAmj~o95;!EoIpb)B3z)?SDn(z(jZNK2Lv%Kg3CRay6djTaM(n!-Kln4?8Saqqe`k1D+0tTiZSpwGH`AF=~;-A%RiNINklX#eRh0i^&0g_vdkRAe11!m79HNIZl3>gS*uf2?0m#$sX+#MNls2y9uN?PO%kZpic_XMV&=Sswx+ehbpKr@4iJa1^b_5q~b-ylubG)v=uk7&j7xneAQLgaALOynbb_V|VwNU{7xJf>?j(130APvN?uNX!_@gh&Gf%lSLQVhBtDC#Xe+WeCB-mxYhdUpXe?)(j-jPk=Vc5W|Fm1&vH2kp67Av^gPmX(fWE-hkgLLeQHvT#HV?Razu;F~6nMnA?03dH*@MV&&+4?hG3fySZ|wEXw}5O}DW5XXB>gRth3On0<WRV3Ha4O*y2PQYZ61NG3BovrL;PiMhrC^$NKraPaO3uV{z!Ffm0<Dj<QBGlcsY;uu5895UPqVzl!&mn2ntq@UR3;jCV4rL>nj-$94oUerULMS`su-+MXUU;qJxcLAvM7J5}i;7s{>N$unEeRfeOiCfi~>3TpN?HlqzYmfe7h^c^X++|8ZU>0R#VFv#iW~)6pyQ!1s3n?%|=;t?9nGMverb1O?N!dr|B*Yb&THp=yUL7Bg@28^)A|Hmovr%SmZ9f2fGA7whvTyh|QEDF&2<6}{{m+H51_`T`r+7p<veK)XZqIG~!VUVH<RwB*8fAccs(B?8vXk2bP!w%Ee<5t@o??l&0Hqmfx6(71Y=|FUCJFIgS)Ta(QP;ZbgR~Y9^y~4?Mib2lz6C?B100^1FuEY`=QoO&bKTwNwcYjqy!rKkwfMqO(=`Av_9=ojnmKex00t8;iKplKis5sO0v~ph&}?RX=npem0qQdCB3Er?$fBC;Cf^sx2c5;;xb4?H<nz2qr^7RvB2;ne_gO&8Tt9;t5@g(aIAI4_Sj-sZgE*&RJYyzf(*8WbpQ{D8C?{x>cKiw%;T!udJt8kydax)BLb9I!g(0~>{G@p~<!g#FE8nl{{?)3C8v12QbOmC}(Hf5nO&B01{wvsX*FkhSQs>8uKMUKVWo@VaXu#m$Z<l&`#z12;8=P$Fc-oD}dxx@gkP9LGYJ7a$qX<Fo9=y{c+gUYfpdlcriw#g<$1)<<j#%nU16EHl-bH$6P*xg@;uI}=km7e-C95usxw{YtpzVyCb2;(CrQ=^J`kxfDN}|O|Sx#OQqK@q|70E@1s2nB3UYV`>2;qXuL_eF4dQ4{QRo*TcRRc8zkG8qo07wFU1I@8Ds(_&UFl`9Y2CDOTEX$A)hz0(nfy)3`^aSP$Vq97+Cim<u>K?uP55fC-#eu)i;RYTk!%fbPDkmg?z^-O52l6*q*7K2aD6GLzxEEL0n8NRuR-LHx<I^;e=!7TkU1MO8KKn-({C<t)(gU#n%*C55p${Dnn#h+<AkfM@x|^F=r5i?>p$Sjj^J@?FHh(%!#F>SA=h)`I$)5|&V?QuWdM=7llsImL<DdZ!iIs92vtTeQb43;*GZ3o#4ktQIm|#^n&G_5-vV_POfyWofvF4*s>SdND;XsTQ$`uYsa*O{u)K>lyislXJy(?;_J|RL3qE%Q&*m10pZWg+-*mU2Oypu$7F}1wM&{V<Ouf=ri3$v~lPSI$x#<-foYTmj9gH3)Mpe5*@s7Z9_tE(RhuyJk`B|tu64w~R+F+%gx&>|7xg9ZuN+Z$<pzkk#nB#WcEg$x)93IgzZ`9=lyO|0wB(vQ!m{G0O@eP+s(cgoTQhE_><M?tITh9{oM5=&Sbc`C3?;>@;WEn8zOgg;~HrD?}i90&-@wZ!`(j`Vf$!N-G#O<P9o=UYy*?t##t!Wn;4a}b(wZ|jCw6!I=W04bcnnf5Wc45S6~34ehitj9LV(<$Rd>_cjJdIjf;;>i7yz#)|4qx+V?KHg7UEKlVw!5V3>9ya^Lq!L54XFb@LC-=)C7gnFp_@b_6fwS0sO*;$z9jff~x%qIx+saZ4@$8<I_60ZAVd}V#5NO0~_4}3UGryiVs1@KRR+W%2SW7O@{DnxsX(bnP4Xz+g+0Q!%anT$C>*UBKne*N!&g#o*KXxkW+Q2`@kdN42!F9;AG33<ZSC`1GLRjAIvsc#x@gla=54;PKhwQgbd7&*X<65}&xJ?vBzzo^5$J#$Q4X*cpB3!zbT&HjE-5&nF;I9LE00trEVM$-69y20NXK?PxXeUB8*Bg3#H$#V>Nh#3sY=DqiPAa(xbv_d!*mI_q7AU#nu%r_*Sy4s|dl0&yp<^mskZef_qIgDh*Yr))2&lq$J=ySktS6>?%tk?8b<#fN+gM@mj$yAY@Fp|kN`FR6f|r*&?1hl^0CGq|a6F^GSh57?A4Si{+@W8|#F0oUG`YfUFxjH>s+S}vlmrO!MTslFM-B}H^vCV@7$?{D>CKHLMS1?z&jouJRu|rtNAu+4-q=(2^~E+M#cl+&V$IvnO1<(my?0WFQpmW;99mUY_#k=W*fk$<o_=Y*#t&(ZmH@tc8=CjT$qoZxDZKMS@Pb9l_z};huF3`d2WMey-cB^2Xq{Wo6YY$7qkMWL4M5U8&KIF5v8eN8;t8NQ@xBu22(BMN7ocE7@}m2E^j~k{Eu;ygFw@=OZRFr)rDpUDdxH8BW$;t}jD4;Q6N>7|H{ho*W+|JA#xJZU;ja9M#)?l=B(H+Jq-@!v97O8S!3NzK-?lI<aMBdmomxg0{`|UTmdq4Yg3^5tT(_r@%t{0(l(YV1ps)|8NVNUhfT3Uh{v6txl{V&PPf12de9QFzPa58|u15A0l81c$7UZ7nefEGIKm}boyy>e*(q^Gm%5W5G{D?8Q&vG-tFpT51slE9B5Z~|$(**a`tgjp_++lQn&zf=e!~G72&%l$Bq<eyYT&A5hvW4)KB30Ft_f@$a9wC>qQjVR|X4tV6hUYQv4RyHQyvXA|)vyiPCTPO(SU#%^5?7@7dW__luo2bA=Jb$bIOCrkq4K=gQ4JDmp(#RQ2fw+3<uhgkvKziwhDM5pZPki4IoT>M=S0Qsf{Mz9vw2g-1k$Zn<CA#N{#u324Jd<YMWIc%%N^grxA`z6VdBDB3wQNcwap6S5$2ey+x7Y^y0#11pO79uPY5_!g>*3w2c>ndMHsz*<OApS%{y!Vf=RYF12usD^}<Ewr4cc~N0!E1xV6}@$;@t)Q}8Z(b|&F?sHRy4X6Wt`%~~M)hB@0OK-ww_p(>S@1U6Ywg>m}|WeiNq|IECi^e6~uPT(*0!3zVET0ZX7hPdU+!7PYO5wUMbgx=zs_OusB3AR(wG-2Lp(x>{xzfZ#1rmz7Z-fdeA54`!7F)AZ58`H!5R2yPZR#H;}mE?_-i$V7^&ZP18-1I7U$0PE)2FA8}R`rcXdJ5+y6lwC^1WRvt)>!B8hj+Dis36HN7hq2__e8R<?J_`i#6I#{Ph@69|A${H9M6<f>;fY`#QzlYetnd>S~Sa`FTvxA7F1OZl~<*fHi`Al$g~X`CEAAThOSsxo{*bl2P`QpvwlJ2(`eHhcNM7asOijRQRvewj=bn*Sc*)ZF)lQ4|G#StqKheXA630Eihd25XWycTwcL$=>r+trO21Sjr0HdcEm(A~PujTZ5hw1$9HG67C8W2%TEn0YzQ;OlJfak0m*0#O%PAwSQ?g!Up_2P-hdB3iEN$P%zB%j4)_c>;#~|Xu2unPj-?YAWnG^AKDJ9*pTios>*I<+W)lU$fM9E~eJZsIJ`!~9;_0Ic+WrJf)vxeU$JGbT`iePF;m-XBs_o(%YLXTY-9jyzP2mH~VhT}Aj-dECGLqiulVS(--?cC|Dv91t-PP=Ucerku{xSLm?!h@xWi>b*KGWvkLM@XutFn?o=qn?0KaglEDx5Y%bQwp3Sn!RwE;j#K3<Hwko<f^Rlz6EFv<)nz&9#sN7H<VO=={mBM+@=008s@q3gq{G&u?=)i`<77ahf9Rc<9yvTEG+f<G5iUSAF-}@n7uF7w<4ymPJ7L-Bk4uTAR7A|L9$8dUJ_4di@OE*4nj(VXsok=+DYkl_c1o`&(#(FmGZKztZYM#tL=75M}B2sy^c@8IU?1$p*yJTb^d4cEn0B781&o_<5BDCBqK=pR)EQpN3*MS6}Sm(LB;d@o0Wraq6pxTke0##%-h+8wUph(CR<2-_0uh})QEO9e!!`O+qHm5Ism5YH)nTsYT|yliu1b44N{9lQ|vYFTVSK+p7b!(`dN4(OndDn`sM~Q1PL3l48yj&&dL|Q@ii2x#9*IEnMM$IH1)-{1OIhk>iFm_mW~Lr@Q_r4xwU+{{IP=%P3;97*DGoGi75rb@)D{(*SGRY;wZ!S@4Ppz@99U9@zj+PL6fJlW?NkDLd#oaIYP?URFEP5kx_ZAv50hONz1k^m{?O-eM5@8-P4_gAP)T9N$iDh+6*4*qs{~?S$P66;#K;n1T{nA0+EBM0@LysY1u5C3_6C*p?J*jk&t3f({A8+sk4lSgfQSY#!e$`Pm0tbmxGfpuaNoC6^B9>@c8(7!WMTX4`n<EuKZ*8oyz^31(lB70(L-+%SMQBWxe~D->>Ruf6(p|3gfYB(O^#9;`UZlL?gbOjyh#nCI{?JY&77$TKKqN1xq@g@1nrzu;;jDg-2RU!bggiWxPtyU4ktu#yt-vnF>+rh*DM}?=x`CILHl5O+QwKfl1dx@wK-xn}kHD(Lco0^H!{4U>mPmeSlu4ZU;0&dT6P~<UYG_e^hS)liR5BArC>~YymS5c|i7MV_jmpJp2Xp<vrmlwOSMZ!t9_?fbl|d(Uv4!;zZ9XeX!WOmdaDtG>QmkdPFU`Vv2o|mR?rD?m;oOUuql&1on^Tq|Z+hFPp8+$s_#Pb*bx%WYH#XdblBOQ02H)ZvOT+!33YB5UXHY<QX!EiDLIF{mW7a?7kAitrhS3STpDm<BTMZX_30a91P9$jxBF53z#gj{igCR{JKe7lJ*{(!9l5(REVrb?=7{pY4-;8PCaA{`ZthGth?o7tW@r5!aN0G%}(cubrM?SG5IP7|9um(o4+E&#)(e^=wu=f#O8y7%}=ozhwi8HF{)4GTW2rqRTFQ5FJhMI4Hlj$g?#$)<$w10K)y}2Pg@7Ro9M4W3a)oj;9TzqNbsK|>Es~dnGA%+ng60%n29l^nr-XHtq8;;M8C`VG4u^e(n!%YGbT1yU&mCrp+?$wq`Zi4sFLUM1(@QN-dgV$PYI@_H?RR7!VZdMX{m`7Y3nO-A*7{SI(ayVN#}>vSrxyw?WXP7d4S+Me_Z3iw0lF8w(}yC5E)$7eLVl+Ben{)Iw@iAG6C{=Ea9=pZ4f-OwxGnLf>Af-HGE(SUoTqRy82Mz-vw@}Edtm$khz&KM;;Xx!!z;>fQ)2kzrNulbo=!FWI5=Sn3PpV)|so$1^z$%kP3{I`G20_SDudTgdixy>V4L=pO!aLvAwd+W8}-r)lPb^!h#`*i<gsKwDw{$rTolD0aTYb<V!>aOW+J%d+?#1)?NvR&Z7vkf*qyC;Y<rT?kiI32AcyEz=yoyG+-S#Yj#`zre<KLk9$pJBB)QV58T?f_EeD9I+xf->g|h8%d<HUeP^l)l~XZkg?Jx)oYKQ%mn_u?DlGeqD2$%k%9v@hu=v6lc;#$)?|`=XF>@`5oZP<A6W|ggBkg9_vgl%yzO%e>$<XLj^GpbYTd3aBS$YV{^3X<9VFD>;3E_TBd%aPML=!;?>5|pr=XG$=a-SaVW15t^^83ecCUJ~fMxa+hm#7K|%9GIjOiP4;$ji$w<{&!n1v~YpnwgpYEuf^1PB7b3t(8!J_oKo_B=y6@ho+}#z>M!S8A&93M8WQ-isKPrQ7u(<sLlLlZ3b8=;r;SBJ{%iy?v;jo(%yv|+W@SQ3x|p5<NM9CzIutt8&X4)OOVZ~8dvz0pk&#_YR<Bxp1+jT#x7otoS=-PyD9y|4lS`fS<R{VM9R_z@6|AtD?#F%1Io?0I`bh-ioewHFbb%ex5r<s*;J0~X)X~2-V=%2$a$ccD&`O(@50f^H`vc=>uX)<#D53`Xg%=^uKHKIr4Ba|Z#nAT{?nD|A0;QfwzQn|%w}KI#8=BFZaYW}D2L|s-v|inW~i-`_IxVbSQAxt&9|YWFPd7a1di}@<ru}kkR@z$UztSwdF>y-jaOsR%J(9!+fZqsiu4CEJK<=pjDhUPfM>Na(Y@(sDVaMO>r^XcQp)!g^QGMaP=1Tw&O@l;vousL@U~1$aa<TI?9E$)I<yx>ean*y0I+H`^-E`I`{(>nle~F%Ik}(B8EmUsY90hKuXirACTm9I4cO$rw5LHeU4vKdgyo=ul_NSw3jX8XV34^`>(cF@k5q#a;$^hjR42W1W8%##TgkYE`$Nc*)a5Z?)1uRo0Pz94&F8tr8%C6i7OwhZ1=d4qmFvmd^R(|pHI~Lt=RvPU0O$m399K~5wEVHhYHIOvn;;TQc&=6ZrH7R*+y(%Y1>F(l<ph12^|rQ#B_Oc7=d$`4(B}_}iSz^l<Sn|4cD0Z8&WY>2sYA5UCUkSKK1a9IP;grSRP_ryb{HTHqF~h`#f&96?zOD_NGn;5He{so;36HBlsC3fGDC0eA>~$QjAbJ7E$~TtvQ<gl?~%8XOokRP!iE1SyhQk`1f{w#Y2LjzTK^@WIO4=9;OZXu6DzwhcH%Y)hdX0QLbb&XOR*+6JI%kON+%t4M=Fj%AqbuS#9k(-Mxxbo+Z~`={05%YEYw7VFFKdmgrgA!=K(kQm!&(&+PI-@;^|7zGqhlw<%#ilq)@z=jqGk-p*Ci(6q*+XD^bY$thofpT7cHXvtoE1WQq>_Q1cC#k@?7VGejs8YV3wdqQ3hX5d~Uuz&uJHvg9g5PbSo&^5_V?W^wG>5A?QL0u6T8Z?&RkR^%&F71IYX#vORe{v*I8nQbDSV>*dx52lNn4-mZM0UcO7gW~j#g(O9ZvJI!!@*)q*#$-WRHLyYtpS_rY8P>GI_ynZyugT4J4EGq|5sz`$9-^L{8rpurQrXF;fM7f|$>p_PZ>!@YdK2ChwttBV1>?oXav5PZ*v-TJc^xaP`;OCr&Le?1<ke>Q{$&!(pwX+#z5EzD$UF(C<}~hmq`;#hq#7ZP+`4DbKjVwfE@Y1m)ZT~=`PU<xHvehcUVjw=t2#20Pf8AQTWz#~y$Gx53LXve62eZ_TMM~MmdHm^z-FL{DL_^xsz0KNaH6sU;X5xg!jMRgOrGTX!CI`Z-)yqJ`L*=jvRByyzP$<71>~v@^^p$=s`az#>>T%$ay-Mgz*+f(TIItRO&~Q!RCfHdQ&i*r%7_sq7@3-y_<nuV1)ds_OCt$)!6=XR339{=oRbJ6G`#3W?&yw8$S1r_R(WErLs!$hS-Uh1jyy*jaI^}@$hSlckDo(7xZ99mVhoor5UC?;#=5MTolWw-NyeG8c=Jlh&dIQ>=1qexkJS8hv(sq<?(mr0DejvBoFWxD>RO4Z258lbR4}E^2Qdt7@_BSz+GawYHskgF*D*Gk<!LwfVQ<|z>B0lW=A_HwH{x~*y(Ze{FKaoDaW>v4_E)7g*;wh~$D=39qf<B38%pmkVPy6;W%3Gx-A)R{SD~#+(yD}N=yMwZ9#!?_aoQexARzD|14>eS?T$bEmGONB_0To*v$|Ig*^xKZu_{kkweyUGi~sxQeJE!H*`df&9dhNYQW|y==N6|FR6KfyU}G19tdo0?bTWe(mtNc=w(jV!$>0?-$5=5d+2!73;&?j6q^RZW1U6OPov?}las`Ry-#Kck<x{gkNIZ2M6;QK9OrXm2B@rKoI#y=QuE>lU<-*mUQO(FKkPJwR>o;x?SKZni284n|^#!b3Amy%6VcyFtS$n>}jJ`5Vqx*|s=dyocJRTPY`u4H0R<rfF4NXRq98I?_;zPaQ`NBm|r=OjCpyxJK%#fbf1gNF=7d}Bzus~C0?LJ=x%`#eInIhjo3D}je)VG-Gs8bvaBDxk7*ny?<HNCb1j@d}X=pkpd(rqE^TR7th03w00KN@FTdPcAoq%!_Fv;w*QeQ-azCPCD(wkW+GhCqnD9aH^|R`HeC08-5pfa6-0W(sW)n)I>rTj_P%<S@s}55mV?!TUO1ocGFB^|;ySRz}G+s4^MY$v?c=uey#<qF+jG#O}BV+Q^N}{ZOU?+wLV+l>)95cvx6wVg$fe{LrzeUzVbrE0=}HO?>snOgK{61;j8I8}Hhdw*$;vQFfO)e2_Aq9(BFwoy1+J3lXdZ_AyC$o~YptzBQRKL~Upy{(-P1W#ryq{T|k60|h-sURlyP-Uk2R6uC~JY@KJsRU#qEu>QN}TxXz6-Kz?<?5v9bn?D8-G*HsNqhZs=$MxX}92V=$LDZtR?bGTHm?xR97X7M|I)V#otralkRH)K#pw2g!`~iQ?MF{P{bPq!#7gqXH6rB}X>7HBkw;FK=I+Te$T6N^5ti+-b&2RoVH3iS(scQJT*F;{~1ehB=o6#P_8+uly&^x=!Rh>M9%)`a<vaOhUe(bsPM-XQg?f>&9|G4d!lf+mr)XrKZoUSCO@4kd#EK$B}QDMlF;EMO0ZjptX8Ey`zm_AQ<nOtieyznLYFyy;2*pjDE2h-|Af~>C}AuY~On;#;Zmap4$aN}=W_X(YF*j#l`R^gHueO?5PlBETxFxyy``C1qrBXVE}J?+GhnoF9}z9+#!GZTsj*jVfz<cjW_GP7z!-JBoN{F-sUiSOt2EpbN1Jfs{;({U2{^}~iMU^Ba@hgU3b3*zgjl<<kr9D8h5CIz%}0;+Qhwysi)TZvDrd0L-sOMvADM=GTofK0g0*De1LcIBy~K}_u!sz8VHmaKCY=nb690+h0Tn7Y2h__Zq7OMA!0ppEB^*C(!83rLd>-tFY9iZe`HF99{GqaL2maB-W3#TorRUQr0+{qylBlw&-D9jK|zjpx%`LXB*QKek@Fq{O@LS`ViLc*y-HYiw|gk2Gn~;|5%gpoKk9Gv{UQ@4BqCSfm8;MK9+sI~}rIlh~NEOE?6zXtBcAwIgWZ<-@N!1otiSTS2hiBrO*>UX`<Xe&K2>C&_TT-zTAE%!kdwE1T-S;PkDj=JW_-Z8B;yAWp&r<de#D6!}BT{QpjJ49lFdXtE`lSH;Y|7vk(`Vb3Ln#%N<{0)QCYiOb_KlJ@1L+G5%MvK{|B7h0%%H<z|H4KZ6N)%jOKoKj1H3&H##a~JPnx6JI#=G;1qjW+{F>>_;BA;zgivQyIEw^67d<XU>a=9f-PmfQs@P}Js&T~iDLp*2R}+|=J(<8O}A7LOZ55Z!GumOUbk@Z|~3($iMO6nnOeo>LG}bo>GyFWn&#U-W&IOtM`x>8sR#d+n);kYpiQNg(s%--(6c%s-4OMs>u!imdnCF*WN-2Jz<}k?>@3HOnOJsPZQZa>EBMp2<?X+M8hrkGaE6DfrgAbuGBKVy>e32Q>e-A!Tz*NA6A>g%toIn|YF*f-ukor$Kp>B=A>;@T5G>P}n<qKxEw`D@V!V{Eq3H|1^R3u_Rc@$Mcdl5Ti|k6V=s>=|xk;)q*WuJSZTD(CupCwPvPr#9Ziw6V0GR;|61(ey>@|gTrrF(UKwIeBlx%Abyem_PF$XjR(DEse`bLEE-D2dUq<8K2U*5*Rn_Eu2vz4y*|l??-v<Ea$<X}FZgb>-WR!lta2}~fmqdXqy_|k*@i4{pfEq%Q*}Gk^#j?HEs|fQX*zQ!zp6|Ly)abD&W3n#Q5gipX<}QbUe@lUGE?qP4n-gf)#>hI(i8&?kUhcO7U?T_(>W|;YyH~{EAw&Q=;W)tkKg!v(A%~c1h{*p2sKRFs_cb*KKpg+kPS8Sma61~7?ZeeY*iIqR@3e6oJ0$AZ?hg1Q#zIG??{&h<S9@HX8a~9i&6~%P?SM`0Wb}|gQi~T^ySd*G2ywkH@$(RA{)guY{~SI7im)fp#sKCkJSmZ4B*DP;}bb5Xq9!(M7iXQBP}1crQu8?Gt%mEBlAw$fc2tIFBM$(=NN%R>n+<HXXd|fL++$FBU~6|NiDe;nNN0h%$rtqOKXJWIZE86)$j~`&RLYAiO}0m@8e;A;eJa1bqOP{D1v>pi5K$4R=X(Rj33q8aznt51qg>X^eaRCX<UwMWp?mx1B(jFLHAV--_@2CA(ZgXv2G(E`T5V!Ul>4A<#=$5c?KZapYGfo5T&ZKmlq0`{A^^)6fRg#Z!AMu+0Nz$fuSXXhTd|{%+>~8#yK_Q!m;C^9#8@0(cXQnv&Hs6j!W&vy)9|<9VuNBP`5|9pKpO8k6J8_xsX}AJyXJX8E$c(`~2q91B*HD$y4!{M&?pf6m?yoIFSbOQtPkw5(gn#$D#iZ%lY15sF+QZ<l+ZO<4ih(?*G#uSBy{Ve5r-lu^dN{F#`sJit;~I_!hM}F{YT3Irhb_U{h-&xmZZZ!|!e@-x|-f1h!6>4jFwJS)w&8;&KqdU6&ssyQVhybGUIesR&L`4wQ|{J5@Sf75Mc>?vUm5m-u<jkJ0&owv$`j?SG_#9qV!KlB}3T_``z<Kw!UPIda<_BR~mW&?35+`6B=VU9;9<>S&O)(;8aeY@1f$QjvI9Mc|BXc$o4mmy9Z(dIFm)MB6NuEHG+Z?D8J<(Y6yLL2kWrkxGEyTthb~6zui14gg3AI4Sn9%Bo&26HW!$#`;?KrLKv44dJk)Qlf!5MFM%i^=&(1<s3pFEP3EWvY*~gY2~ugICpMWqLH#^%XTx>F3R~9w}v212vt6rVYp@FKgEr0@vO12=e9)$7*`UmO|VaO?Z<p)U=M-&5<Nn~ht?3MIAB71nq_n(GX9B`4?@@i$L5!4hgz&F3hyS|Pr{655cug&dwz?7>zkKQ<-g3RW`e(2s3dPhms;>gr>$U`e90_f&ar~Z;cVn>wE-v=Igpu$Yr>Cd{oBUV%qWUaf3e)xHFvAqs}<TWeI`GRT?m5c1Kn7<l8^p5vAe{y!wzT5QoH&3K3apInYBSHRPiqgNQAn180$a^a6j$B{ph)L!SnllNyZRzrG^WMiy-E;xV>C*g+6XL_c-=Q^hlLv+spvLjxe84zqtQfU74+=?40iCoat&=(0A$sR{@<d4G=F|6HgI?vR?b;sc|g7qO%-&0TYX4o|Q!voCwm5rmFT{FYJR;_Kv@6riK~vS#@!-I8dgTa}&bhZHz_nEX~5O#{WyH-1_=y2?;w0b_<a$AH*N|^w=v^W5C7ob=hSS9x)X<k&=|p?J@mh=ZZi=?5=ODBuUa(E=ok~3!t`5_ErMBr_siy5e64^(X#(c2;o-ra9g!;6<aFWKc)GQ3}^_<@mtFgQ)@U>elxr<hO$-Ke26%#sJ<S{0Hq_1(iA&#H8z53SVJ9>c*f8k$8WxWnDoTYK%z&XJ!z_m34RKORvK6o;;GRHpGCOI=yyUf@`<793B;h8BB!Dud{|Ciq9oWl{TZng4vh}cHlo@wE<up^_v~!1ol@&9h^3zqd)Gnz9&`x-k`KH>%&j+!vFuRL7CY0T*?b-58%}>aut^^43YJt#(Vv++Z{8vCiHmGX_EgwSwozSR7}m7qefenEy`08{=)0}mWDc8k=-sozYwzjP>?}ZrU#(OWfUZJe!g3x2Tj+?<0NL#e5bN4HpA(eSqvx*w#&=HL7FLe}kdtaS_~dYd@byfK`48W^^iPYX>qyD+&@-Ax%Hm(IufDaNM<QJa>137$6Nmc5O4+1y3lF5yyvvJKdx6wqY<+Tbi(zG9;>)l@yHw=<V3${eDK>t)OjN`iEr!kB)ev`UG%aDJiFHXmF2U*aOy12R$_mQ@xLE4!^Q>r4uNJbt>}6SPF}K{1FRwcC?N4Q5p&Py8lKP0jA>Ux(z1kOC98Rj)FR#cXxrF@zEwOHO`12G>^(W!{uVmGH4I5gLSKw1I$V=Cvp~vVfC&|G8S!f}VKFoDosA<-w36Jj1@*AJuS-lXih5c5x>(&5~4_oxI57XBBvDn4O5{C(u;G^!W!MdQW?7BtoSuAZ!-<4$El~n2rs$vU@m+;MPFo%;hb}uklyNh3ce$lO5ZONP#dtkiG26mq^sCZf7Ewj<pn9*o&*!!1AZ$R8ezd?cS@4)&s?_p@gcREyrv5*n@%-dH6CT%(9&Cu5iR}l%Z%A8;SlXWkBws}gA&i<H14O{rP5>xQFJ(ZduFYb5e(d&(?gDtJX*LWp-40zC8593&0>$ZaKv)F`HKWiBh0rY{*(pd4{!k#E5{cC^4{lp$<ZE^F)n67=KfrtW*@C<fNww)w_v0--rgcr~Lj4ykr;p0i^Y5vSbI!Oc})RV}pZ}yfT06Yu7U?BoqaAAJ9;zjFoMqnHdBEH<DnSpuADP=>-xeHd>?%pAxa=;UpNK>GTZ`3yT6Dd9DM=d1gEAKQ~%I?rDifSI#{t3W9TCnWaZauga`4yA&sxr_;?Be*5`u7oanrTXDZnvam6`MajD%tSnt|gYEURu?XdH8oBo&s0+3Nc~?pQvCq?KSL*9s27_fdSv2*swCA6RXNLUs=e6=%wwURWrm;S9WT`EkJ|WWY)zUQ_;Qg?FB0&CzR(V!xO<Gi$;N=F_9J%u7B|jREaEeC2E27LsqGtXhEI{uwM<AqmT2V1>n;lE|$@OU>wpBWB`>DC?6DgWDAm)xMU;N6w|Dtwt+2sIyC8{QA>rJeD9SfiGdlX<d=wuPqG9n2Qu$Ra*5t%XG`MJN2H;gD2q<J9-xf4*A%=>93qbJE9Fp$=N2*ynJv=IZvIN>Fp%JHPS(4>OmC`=Oir?qzbP$}PuChoyuGqPSN_ZiG?`m)8TODMYi04i$BQaXBX8M`uz1r(P)56phLQ<)|9OKm{j7$=JjaO-A|~@p!e#MzdMN00_;BO%O+4&p6*_x+o~K&MUKhfK;s*QlZ8+KtM{Y7=z2ksJkhK4OeYG~ENH%9|o*?nX*)!fg-DeBI?O)GCJPIo3py?m(&ldfKV>KZosbUkgTJ3q0$&H$M(D{4lCc!(uiOwUy-KiFjbX!wh+Qk4y?Ab`!TA|5v@kL>jN=hBw3IyNeW;byQBuhGGfn)FAnd4~p)^82_+hb5(QQzz|_9Vk1j~=c&mHeGrm83n)0;=2+!+l7WpxXYf3&uJpWm-i&NnzJnreB4XUDJSLWw&4rE`qV3ZRB)~4okHh0ya2T$@85hajXB6)}*FnedvOkxYX;-R<}{-Vj$mLW(pIEI$d3mFjLJ>7*(d&qS}Og8f;Bp^74g$l}BUOtzrNG&3BnLVnua<fIUSd-|lmOQDl=85EB3jX2}K!QsbbArsZThyJsg|rPrf8mv1YwV?%o+Nq@hkGUlPbN3_$SD$GzG3Xf%9l?P-UW7|<Jh)87zG9>-ymi6>)U*53U4?fcs@>+&y;rlvS`Ydkp*%rI&=V~X@2Vy%>I#pBnkTfS?wh%wNWoS_n0DW^<nem7FZdz|pLycT^?g<8~P}edz$ZRr4(6Hgp<Q#$%0JmJ^S19W*Al%!4k;sA5`~H?RHXXl*X>MN@0%LqYD%H!VP9<Ab7r69SX#pL_1xrX+e*TgVXomZQJ4%S3*>s9vg~4@}43NKYWm3{>!NMv;8P^0CoKa4Ppog!xW)|xbFI5;gIk3x%$#wS_I5xCR^4)gxF@d}5Y*LI}nsDy3rlue2o^Q~KThgL)x8njeGn9K*g{yMFv@yBkYkW!4S7^j)Q*(!ndqO#Lxad4(B_uVW>w?Xi&*1}W*$;KFR6i%?pKHBvFsdSe$>s7R5pWZw9D_39ANUGfz03rYVdg&#A=>0jQslm$)J`-vIEBPJp!=`IK1&{7EHtwb{VCx^*J0h+52Mld6@i=TP}6~YE-T$nRqdl_n&nwVm@w<q&E!a0kMWB{DuX{XlV%tZvrzAQ8mO6Tu?Kk)OGA&k5Aeky7(-?+bLNm7%5bj`EP`#)-0D6|p!^-L+gCr6qd61P;^NX=2C=ry<!=7G6I^zi<7=+k4qPBd;S~XhS5tq->)0QmCkJ<~$ivH)p!h+CHGY=VE($)$cnbt6bT=Ua`ftH}W6yZfJYt2g0O3RQ`c?K+_4%eX*jMwJfFHO8c^LU}SPjn6Ab?JCKDa7MWp%{`oIV%z+;b3x-07%FCwL^S$A|C)8w&APim?b`c*=IAcsqxfDdlL<J_+~FSFb&NXXsW#s!ErAyFtnn263Ao?|$+SGicXy9IQI;X1Eoba%y}<73AragBx|?H2)@f-zp0OJwePmCrI2jpq0*Dpwb%oKj1$2hQo`#H)jB^_Jx8q=nee*{BM*t*1mexCP|pHwBE7tL+Zw1TCk~;#{U^<xVF?h3v-Dd+L$M0jaeSU0+sdT2m||UYcK={wQ(k+{)DqiY8XZ9yON<>qkd%8@Qw(XeJ*8Cy!|9Io^j%L;fzej+YQ4AHJU^@N{DokzWI{qLSlTA=g@1gJbD)z93jWaicfE)Y#VGd*;uG+klOwvqe~?Fsm8uoD*&PV8k+3{;-OCaH(^Gz32MepB4h_jm`~l8%u(}bW<vlD0bAvOXvcvjy<1F+GwoaX-^V7(eo;%9(({K9cC>&4bi@%qsMJF=2`nIOMkeQ>MLV3AIxZEF^`>`Z8|E*h&{m~D{x*?K%<2rnXf_Nh8PST3wJy(A>cPdHC<ho+=ZR1EMb0c(^lA@m!cOsT9A9d{CnbFdx>ly<L!C*e#?;x;pIJ%XH!(!YtS7^OkfnI=wCyf(P0qWjL@lp3*qe}e(vAN!s}V!hjb_-zixS}vP*w%nml&PZ0fbf@4{{r5z3Z{F{UT?Hc`T<NDBt2-qEXzi&~jkMQ7h*3pZA;poJm@@ZCbuq#M75{g#XOZmQeR9LrC-L5+&Q>G*3%M_WxDI2Bb#swkosxi-4CGXN6{kjaO+F8}+c`l%i*c%Q4F&@^i2e7Z}a{6MCSTMsR+Ub2fyt;_E<Oc2>qpeX_Cvdoxxd;Mh$F+_6xXu~2X`ooBxVujS>QDNulUhiw31REJ4%k6(b+p1~GHgnve~6?|_{wwwh~)`*Ntf4txtt&>*s=ZD*|T-?wRM|zA33IGV`qeX0`<)MKh7ICwT&f!`q3ivE|GuXT>={H7NgYp{7N#mxuY`!_6e^~Qq#eW_9mYoaUxsD$-EI<iunOA9l4{Oh@>^HqdIsX<8_(q)7kt9RlPX!0p5p;(P#D1l#X@u~o7-HF3=gbIefEouM%Pt0j%~nbD1A61J26$hOkRst(N0tEt4?ucZ=HA#Wyh%q?jx?Y*ou=J9sRg9~5m|mF9i;Z^d_KrQ5cYh8ee-~QSZ4e>V>~<@+h8{;3{#-lRm>F3NA|x1+L*MO5^_?P416ShfHDKYeKCsZo7Kd(15sRvlLk@KlXxN8i>0(oD?%w-#NyHGIgqdq#IfSDCyG#MU!+rP78@vm$gg&&(LYOOhU16q?bJVoHUBDU{%d3-bvp&Cbob{{bTgA-7(Sp&SEGw2h6?jw-e+oHnLsSM5Xq2Yf@W3XQE1{miS`%Cb}JKnznI(yW9%!|9hO~7T!w!sky!{psV^$GWjuZ^&|m^UIUGrk*WB6<Cc$|kj!{ihR^lxI<D3a&t4z~kB`YD<jLL|?IID4ktooFO5kv}9DP3F6Iqh?llz9Tfr3Ae^QEHYKTnRqMdMTs2#;7|avpf^bA%}@<?%bLxP_w!}SJQ~MiqoZ*jCKPnD-{~v3qXp5vK9^V|BS);!EcD=X<(aAM_cOYWax&3`I1FR@Vtxvs;FVcS3d*x4N({_XXgTA=Yb{JN8u!Ot--)%4GNTGa=SGySSq!sbrvt$7e<>LMON$Aw50NLYr4+<zm*dO!X^LXq)?3fKn|-@aeE%$$PHerarf7DE(Nc#8j#9Fu>(Ezm$X}n4IH(tYSOO_!cg_ICT6F@snlNIXjF@YHT=t}-UfyMCQh$qKNg;U`vL}o{lL2Ei;W0xgIyC%kxn{#1|AZOO@o`C@3g>q-A}p1+bv#;R9>RlDLHOrWJbub7jK}cuRh1JcME+Gv-UzWxdCmxq+o&*Rn46ZwXS_&a*{;SC8^QUGS2~+R(KnKvuTI~u}hqe1ch?~!jl@)t=aD;cLaE+2lTqy4Cp|}WBC%$_Qcmf{hE`W&dY#n%gUWES5%+m6TUsFPn0I*4_ytMYYLVnvRsw;+>{C>0;4xZH$Y^8j9sFQVZ&+UL3^qARZQDH%JWb`Jh-5t@KkOwv2Ci_Kj?PDCQ;lU3poDHQf+<$ijk=B=v!qQDQ~GSYI7ufpXvvDy-7eGO}#fRq*0a`A+k=y+C^pCiZB3_M4k`CqkRm+UU*GWTLCX&9Be0})vO9rWg$M&vZya5D0rDr_+MH>KRxRJV!X`-8;hk(yal&IvNUJa(iJ}qA+Y&e!0Qgk<2h!vG0Gj`a5Te7=X1)i<&R_K^zvAPoT&QK*H;sr@)5~G{TKHb&P14jnd_+FkXJ5;*3*J?0MM!|!KLh;GTx}X=j^WX2sjEcl79G5o91CcRxO!vZ){G}B+Bg|I!$OhqRr&4?B?wbij^vPNL0?al$AEVO^dsH@Y##4tHya*AoDw<*42I(I^^+P+Ym(mgT<$(eoHiSf}>i{Ttyk4elgpgX#+5`@s>IAZ@!JvDKh5)vkjgR@uXR2>~CqGR>o@LBCokzg2L)W<{gU=;%Yu2Ap&mhaT&R`dd?-QYg6~b_TF$YY8cCpZW*sV1P;EUI8$C;<CB0V^wk-53ro$5xi;j_swjNQ9+q<%H!5;*21B#8P|~t-_g^1c#$@pp@D_k$nAl9bb9wKi7MN;p9J7KzDd?YwK7JYyfSy>oR8dH!q(4F8_Hkeh-jwX@C{9JR*)T#bEzADcd@WJv1YA_GU<1A`vR=#8R0A_aBDs-&LMkUzW~VH1@GgLGVrpqx3{>~5z9T5~4?U^ClUr>1u2yFrb*`??`ll(;{SBGJi3>_0riYQ(Y9DKXDA9D*o;0E&Le{f~jD9HGdCGBpGE%{?WUGXzGqex?r-<e8R$sjq1A35}6XM|pIG{XFKbEi;Nn4O&rp1wc@Fg~^n`SNJY^7G*2|a5(k8|Da+s*p%GFafMc@@jM$Ud%1$jYt$P!q#Eskn+?XAD~isAi@|B#EWnvF=1-G=oSnjMCg9^Av+MG6kouF`LXRD8F-wfg5H<jCG&*7LsFa_WAYJ7)E6AClqVA(qmNv78#L!;jAa}ruj~H>Gpk;mLb5GPtNBMx`FyVq6FjylfDeLk^vKOW(rD8>BfyF+KUq(`U_Z|BZ2Vl&CYcSl0qVPU?!o<O@Q>_^6)wPP~1A(&7M63#_*t`u^e;NrLd#kdLJHx!QCDq&f$}Hk#@+WSw80avfHWfw?M2abXHZcONM{C1RQJ-niywDNc>yNZsT$@HyMK3q`=9eOMwJVzi<kpes;`4bMNX$`z|!s#P!<ti&kZ`h_m<nwp>-`M_k3!_CQV@Cc3=;Y-=hF+?i)ssH@X^Mea}*^^kbN_yE2`uM0;<Ybh70M`la136(c6BL`^Mc-Nc#v+VxK1z*D0VNJ{@?@A9zu1QD%7FDybT#ipgM1=C~E-X5!kjE>9n>elU!V_pb%@eRav3iRkiBV{x=u8$axC<$;TGVm#brlkdFTyRK{*ozR3mKg&z7i}cx6Os7UCg-KHl1?wXd>|W3=5k_;n}e1(S3*$RCpN26oi?FBYbzR{Jrsr(tnkPPGiGa<)*x14m&cDI5rt$?JyKTYVXZ0MsXf7MIPPPV@R@CL&@qODfX5fgk5uqlZVW50S$^^?=U6@x^Tqk?NR4VO~O=`!{0a~>X#;K!=>tFk@y3KMo98JN%$H6z*EMl)?m$afgC-+E<Z%-s#*L?a}BGXW4t0BhAdt1v0H;?xiC4Q?G|ZrpF8CFAt#8Wey|g<36V>~b2tt4HPNMBh~WP=He>WVf%?yiF=lirc=C#7yq&h#8%$<P#fEAoBH~v*c!6~zzM<&PD8}Ny?d?OF*4$2SX{MC2-qan;J8imWXaE|k)*gf1jC5NPX8eDS9J(^*){wT18d8AZmL-$$mH*Sk<l9m<UT(^MAl0kSG<`2^?I&4D>LZd9fr!QnPs~2%+pB5ta@}2(6Ar~`!L(>@9$<3_=65OU0FM$U0<N=^YG%drJ*I~2SIm-CIJ12wq)qVucCfDBY-N&rnXLnQ^kT=^hM_~J9RM4gS<z*>dyU%ha?{WMe>x#a85II+98+Y@J>useAjFaMe+;4Ia($UjRCw3w^?2qy-Z<+6=3!qDd?R}|4sO9i3yP%R4;=?g^(WO1KTJzYdc91klhdGpo86V2dpL;{EoZ4=OnTQD3P6*_J8Wu^x0wg@{~H*CK^4Bof<j!WB;{$VJ-PDP0EY?y"),format=L.FORMAT_RAW,filters=[{"id":L.FILTER_LZMA2}]))
+"""
+The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+
+Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+"""
+
+from __future__ import annotations
+
+import copy
+import glob
+import io
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+import uuid
+import zlib
+from pathlib import Path
+
+import numpy as np
+import sentencepiece as spm
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# -----------------------------
+# HYPERPARAMETERS
+# -----------------------------
+# Default Simple Baseline run:
+# - 9 transformer blocks at width 512
+# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
+# - vocab size 1024, sequence length 1024, tied embeddings
+# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+
+class Hyperparameters:
+    # Data paths are shard globs produced by the existing preprocessing pipeline.
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    train_files = os.path.join(data_path, "fineweb_train_*.bin")
+    val_files = os.path.join(data_path, "fineweb_val_*.bin")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    seed = int(os.environ.get("SEED", 1337))
+
+    # Validation cadence and batch size. Validation always uses the full fineweb_val split.
+    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+
+    # Training length.
+    iterations = int(os.environ.get("ITERATIONS", 20000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+
+    # Model shape.
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+    # Optimizer hyperparameters.
+    embed_lr = float(os.environ.get("EMBED_LR", 0.6))
+    head_lr = float(os.environ.get("HEAD_LR", 0.008))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    beta1 = float(os.environ.get("BETA1", 0.9))
+    beta2 = float(os.environ.get("BETA2", 0.95))
+    adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+# -----------------------------
+# MUON OPTIMIZER 
+# -----------------------------
+# 
+# As borrowed from modded-nanogpt
+# Background on Muon: https://kellerjordan.github.io/posts/muon/
+
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
+    # Muon uses this to normalize matrix-shaped gradients before applying them.
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X /= X.norm() + eps
+    transposed = G.size(0) > G.size(1)
+    if transposed:
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    return X.T if transposed else X
+
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+        super().__init__(
+            params,
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+        )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
+
+        for group in self.param_groups:
+            params = group["params"]
+            if not params:
+                continue
+            lr = group["lr"]
+            momentum = group["momentum"]
+            backend_steps = group["backend_steps"]
+            nesterov = group["nesterov"]
+
+            total_params = sum(int(p.numel()) for p in params)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+
+            curr = 0
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
+                    g = p.grad
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    # Scale correction from Muon reference implementations.
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                curr += p.numel()
+
+            if distributed:
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            curr = 0
+            for p in params:
+                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                p.add_(g, alpha=-lr)
+                curr += p.numel()
+
+        return loss
+
+
+# -----------------------------
+# TOKENIZER-AGNOSTIC EVALUATION SETUP 
+# -----------------------------
+#
+# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
+# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
+# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
+# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
+
+def build_sentencepiece_luts(
+    sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
+) -> tuple[Tensor, Tensor, Tensor]:
+    sp_vocab_size = int(sp.vocab_size())
+    table_size = max(sp_vocab_size, vocab_size)
+    base_bytes_np = np.zeros((table_size,), dtype=np.int16)
+    has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
+    is_boundary_token_np = np.ones((table_size,), dtype=np.bool_)
+    for token_id in range(sp_vocab_size):
+        if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
+            continue
+        is_boundary_token_np[token_id] = False
+        if sp.is_byte(token_id):
+            base_bytes_np[token_id] = 1
+            continue
+        piece = sp.id_to_piece(token_id)
+        if piece.startswith("▁"):
+            has_leading_space_np[token_id] = True
+            piece = piece[1:]
+        base_bytes_np[token_id] = len(piece.encode("utf-8"))
+    return (
+        torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
+        torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
+        torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
+    )
+
+
+def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
+    files = [Path(p) for p in sorted(glob.glob(pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {pattern}")
+    # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
+    tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
+    usable = ((tokens.numel() - 1) // seq_len) * seq_len
+    if usable <= 0:
+        raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
+    return tokens[: usable + 1]
+
+
+def eval_val(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    # Validation computes two metrics:
+    # - val_loss: token cross-entropy (natural log)
+    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    if local_batch_tokens < args.train_seq_len:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    local_batch_seqs = local_batch_tokens // args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+            raw_start = batch_seq_start * args.train_seq_len
+            raw_end = batch_seq_end * args.train_seq_len + 1
+            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            x = local[:-1].reshape(-1, args.train_seq_len)
+            y = local[1:].reshape(-1, args.train_seq_len)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                batch_loss = model(x, y).detach()
+            batch_token_count = float(y.numel())
+            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+            val_token_count += batch_token_count
+            prev_ids = x.reshape(-1)
+            tgt_ids = y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+# -----------------------------
+# POST-TRAINING QUANTIZATION
+# -----------------------------
+#
+# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
+# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
+# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
+
+CONTROL_TENSOR_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "CONTROL_TENSOR_NAME_PATTERNS",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+    ).split(",")
+    if pattern
+)
+INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
+        ",".join(CONTROL_TENSOR_NAME_PATTERNS),
+    ).split(",")
+    if pattern
+)
+INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+INT8_PER_ROW_SCALE_DTYPE = torch.float16
+INT8_CLIP_PERCENTILE = 99.99984
+INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+
+def tensor_nbytes(t: Tensor) -> int:
+    return int(t.numel()) * int(t.element_size())
+
+def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
+    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+        return t.float().contiguous()
+    if t.dtype in {torch.float32, torch.bfloat16}:
+        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+    return t
+
+def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    if t32.ndim == 2:
+        # Matrices get one scale per row, which usually tracks output-channel
+        # ranges much better than a single tensor-wide scale.
+        clip_abs = (
+            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            if t32.numel()
+            else torch.empty((t32.shape[0],), dtype=torch.float32)
+        )
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+
+    # Vectors / scalars use a simpler per-tensor scale.
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    return q, scale
+
+def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
+    # Single supported clean-script export format:
+    # - per-row int8 for 2D float tensors
+    # - per-tensor int8 for other float tensors
+    # - exact passthrough for non-floats
+    # - passthrough for small float tensors, stored as fp16 to save bytes
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict[str, object]] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        0,
+    )
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        # Small float tensors are cheap enough to keep directly. We still downcast
+        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
+        stats["num_float_tensors"] += 1
+        q, s = quantize_float_tensor(t)
+        if s.ndim > 0:
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        quantized[name] = q
+        scales[name] = s
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+    obj: dict[str, object] = {
+        "__quant_format__": "int8_clean_per_row_v1",
+        "quantized": quantized,
+        "scales": scales,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+    }
+    if qmeta:
+        obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    qmeta = obj.get("qmeta", {})
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, q in obj["quantized"].items():
+        dtype = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name]
+        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+            s = s.to(dtype=torch.float32)
+            # Broadcast the saved row scale back across trailing dimensions.
+            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+        else:
+            scale = float(s.item())
+            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+    for name, t in obj["passthrough"].items():
+        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
+        out_t = t.detach().to("cpu").contiguous()
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        out[name] = out_t
+    return out
+
+
+# -----------------------------
+# DATA LOADING 
+# -----------------------------
+
+def load_data_shard(file: Path) -> Tensor:
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    token_bytes = np.dtype("<u2").itemsize
+    header = np.fromfile(file, dtype="<i4", count=256)
+    # SHARD HEADER INTS & SHARD_MAGIC
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Unexpected shard header for {file}")
+    num_tokens = int(header[2])
+    expected_size = header_bytes + num_tokens * token_bytes
+    if file.stat().st_size != expected_size:
+        raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
+    tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
+    if tokens_np.size != num_tokens:
+        raise ValueError(f"Short read for {file}")
+    return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
+
+
+class TokenStream:
+    # Reads shards sequentially and wraps around forever. The training loop therefore
+    # has deterministic, simple streaming behavior with no sampling or workers.
+    def __init__(self, pattern: str):
+        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not self.files:
+            raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        self.file_idx = 0
+        self.tokens = load_data_shard(self.files[0])
+        self.pos = 0
+
+    def _advance_file(self) -> None:
+        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.pos = 0
+
+    def take(self, n: int) -> Tensor:
+        chunks: list[Tensor] = []
+        remaining = n
+        while remaining > 0:
+            avail = self.tokens.numel() - self.pos
+            if avail <= 0:
+                self._advance_file()
+                continue
+            k = min(remaining, avail)
+            chunks.append(self.tokens[self.pos : self.pos + k])
+            self.pos += k
+            remaining -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+
+class DistributedTokenLoader:
+    # Each call consumes a contiguous chunk from the shared token stream, then slices out
+    # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.stream = TokenStream(pattern)
+
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        per_rank_span = local_tokens + 1
+        chunk = self.stream.take(per_rank_span * self.world_size)
+        start = self.rank * per_rank_span
+        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        x = local[:-1].reshape(-1, seq_len)
+        y = local[1:].reshape(-1, seq_len)
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+# -----------------------------
+# TRANSFORMER MODULES
+# -----------------------------
+
+class RMSNorm(nn.Module):
+    def __init__(self, eps: float | None = None):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
+
+
+class CastedLinear(nn.Linear):
+    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    def forward(self, x: Tensor) -> Tensor:
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, self.weight.to(x.dtype), bias)
+
+
+def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
+    # Keep small/control parameters in fp32 even when the model body runs in bf16.
+    with torch.no_grad():
+        for name, param in module.named_parameters():
+            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+                param.data = param.data.float()
+
+
+class Rotary(nn.Module):
+    # Caches cos/sin tables per sequence length on the current device.
+    def __init__(self, dim: int, base: float = 10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._seq_len_cached = 0
+        self._cos_cached: Tensor | None = None
+        self._sin_cached: Tensor | None = None
+
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        if (
+            self._cos_cached is None
+            or self._sin_cached is None
+            or self._seq_len_cached != seq_len
+            or self._cos_cached.device != device
+        ):
+            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+            freqs = torch.outer(t, self.inv_freq.to(device))
+            self._cos_cached = freqs.cos()[None, None, :, :]
+            self._sin_cached = freqs.sin()[None, None, :, :]
+            self._seq_len_cached = seq_len
+        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+
+
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    half = x.size(-1) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_base: float,
+        qk_gain_init: float,
+    ):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj._zero_init = True
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rotary = Rotary(self.head_dim, base=rope_base)
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            is_causal=True,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+        )
+        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+
+class MLP(nn.Module):
+    # relu^2 MLP from the original modded-nanogpt setup
+    def __init__(self, dim: int, mlp_mult: int):
+        super().__init__()
+        hidden = mlp_mult * dim
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = torch.relu(self.fc(x))
+        return self.proj(x.square())
+
+
+class Block(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        rope_base: float,
+        qk_gain_init: float,
+    ):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = MLP(dim, mlp_mult)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out = self.attn(self.attn_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        return x
+
+
+class GPT(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        model_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        tie_embeddings: bool,
+        tied_embed_init_std: float,
+        logit_softcap: float,
+        rope_base: float,
+        qk_gain_init: float,
+    ):
+        super().__init__()
+        if logit_softcap <= 0.0:
+            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        self.tie_embeddings = tie_embeddings
+        self.tied_embed_init_std = tied_embed_init_std
+        self.logit_softcap = logit_softcap
+        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                )
+                for i in range(num_layers)
+            ]
+        )
+        self.final_norm = RMSNorm()
+        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        if self.lm_head is not None:
+            self.lm_head._zero_init = True
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        if self.tie_embeddings:
+            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        for module in self.modules():
+            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+                nn.init.zeros_(module.weight)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+
+        # First half stores skips; second half reuses them in reverse order.
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        targets = target_ids.reshape(-1)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+
+# -----------------------------
+# TRAINING
+# -----------------------------
+
+def main() -> None:
+    global zeropower_via_newtonschulz5
+
+    code = Path(__file__).read_text(encoding="utf-8")
+    args = Hyperparameters()
+    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+
+    # -----------------------------
+    # DISTRIBUTED + CUDA SETUP
+    # -----------------------------
+
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size <= 0:
+        raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
+    if 8 % world_size != 0:
+        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+    grad_accum_steps = 8 // world_size
+    grad_scale = 1.0 / grad_accum_steps
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    if distributed:
+        dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier()
+    master_process = rank == 0
+
+    # Fast math knobs
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+
+    enable_cudnn_sdp(False)
+    enable_flash_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
+
+    logfile = None
+    if master_process:
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{args.run_id}.txt"
+        print(logfile)
+
+    def log0(msg: str, console: bool = True) -> None:
+        if not master_process:
+            return
+        if console:
+            print(msg)
+        if logfile is not None:
+            with open(logfile, "a", encoding="utf-8") as f:
+                print(msg, file=f)
+
+    log0(code, console=False)
+    log0("=" * 100, console=False)
+    log0(f"Running Python {sys.version}", console=False)
+    log0(f"Running PyTorch {torch.__version__}", console=False)
+    log0(
+        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
+        console=False,
+    )
+    log0("=" * 100, console=False)
+
+    # -----------------------------
+    # TOKENIZER + VALIDATION METRIC SETUP
+    # -----------------------------
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    if not args.tokenizer_path.endswith(".model"):
+        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
+    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    if int(sp.vocab_size()) != args.vocab_size:
+        raise ValueError(
+            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+        )
+    dataset_dir = Path(args.data_path).resolve()
+    actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+        sp, args.vocab_size, device
+    )
+    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
+    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+
+    # -----------------------------
+    # MODEL + OPTIMIZER SETUP
+    # -----------------------------
+
+    base_model = GPT(
+        vocab_size=args.vocab_size,
+        num_layers=args.num_layers,
+        model_dim=args.model_dim,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        mlp_mult=args.mlp_mult,
+        tie_embeddings=args.tie_embeddings,
+        tied_embed_init_std=args.tied_embed_init_std,
+        logit_softcap=args.logit_softcap,
+        rope_base=args.rope_base,
+        qk_gain_init=args.qk_gain_init,
+    ).to(device).bfloat16()
+    for module in base_model.modules():
+        if isinstance(module, CastedLinear):
+            module.float()
+    restore_low_dim_params_to_fp32(base_model)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+
+    # Optimizer split:
+    # - token embedding (Adam) uses EMBED_LR
+    # - untied lm_head (Adam) uses HEAD_LR
+    # - matrix params in transformer blocks use MATRIX_LR via Muon
+    # - vectors/scalars use SCALAR_LR via Adam
+    block_named_params = list(base_model.blocks.named_parameters())
+    matrix_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    scalar_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    optimizer_tok = torch.optim.Adam(
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    optimizer_muon = Muon(
+        matrix_params,
+        lr=args.matrix_lr,
+        momentum=args.muon_momentum,
+        backend_steps=args.muon_backend_steps,
+    )
+    for group in optimizer_muon.param_groups:
+        group["base_lr"] = args.matrix_lr
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if base_model.lm_head is not None:
+        optimizer_head = torch.optim.Adam(
+            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.insert(1, optimizer_head)
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    log0(f"model_params:{n_params}")
+    log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+        f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(f"seed:{args.seed}")
+
+    # -----------------------------
+    # DATA LOADER & MODEL WARMUP
+    # -----------------------------
+
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    def zero_grad_all() -> None:
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+
+    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+
+    def lr_mul(step: int, elapsed_ms: float) -> float:
+        if args.warmdown_iters <= 0:
+            return 1.0
+        if max_wallclock_ms is None:
+            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+        step_ms = elapsed_ms / max(step, 1)
+        warmdown_ms = args.warmdown_iters * step_ms
+        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
+    # initial weights/optimizer state so measured training starts from the true init.
+    if args.warmup_steps > 0:
+        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        model.train()
+        for warmup_step in range(args.warmup_steps):
+            zero_grad_all()
+            for micro_step in range(grad_accum_steps):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    warmup_loss = model(x, y)
+                (warmup_loss * grad_scale).backward()
+            for opt in optimizers:
+                opt.step()
+            zero_grad_all()
+            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        base_model.load_state_dict(initial_model_state, strict=True)
+        for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
+            opt.load_state_dict(state)
+        zero_grad_all()
+        if distributed:
+            model.require_backward_grad_sync = True
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    # -----------------------------
+    # MAIN TRAINING LOOP
+    # -----------------------------
+
+    training_time_ms = 0.0
+    stop_after_step: int | None = None
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    step = 0
+    while True:
+        last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+
+        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        if should_validate:
+            torch.cuda.synchronize()
+            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            val_loss, val_bpb = eval_val(
+                args,
+                model,
+                rank,
+                world_size,
+                device,
+                grad_accum_steps,
+                val_tokens,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+            )
+            log0(
+                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+            )
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            if stop_after_step is not None and step < args.iterations:
+                log0(
+                    f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
+                    f"step:{step}/{args.iterations}"
+                )
+            break
+
+        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        scale = lr_mul(step, elapsed_ms)
+        zero_grad_all()
+        train_loss = torch.zeros((), device=device)
+        for micro_step in range(grad_accum_steps):
+            if distributed:
+                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                loss = model(x, y)
+            train_loss += loss.detach()
+            (loss * grad_scale).backward()
+        train_loss /= grad_accum_steps
+
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        for group in optimizer_muon.param_groups:
+            group["momentum"] = muon_momentum
+
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["base_lr"] * scale
+
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        for opt in optimizers:
+            opt.step()
+        zero_grad_all()
+
+        step += 1
+        approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        should_log_train = (
+            args.train_log_every > 0
+            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
+        )
+        if should_log_train:
+            log0(
+                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+            )
+
+        # Needed to sync whether we've reached the wallclock cap.
+        reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
+        if distributed and max_wallclock_ms is not None:
+            reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
+            dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
+            reached_cap = bool(reached_cap_tensor.item())
+        if stop_after_step is None and reached_cap:
+            stop_after_step = step
+
+    log0(
+        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+    )
+
+    # -----------------------------
+    # SERIALIZATION + ROUNDTRIP VALIDATION
+    # -----------------------------
+    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
+    # the compressed int8+zlib artifact and validate the round-tripped weights.
+
+    if master_process:
+        torch.save(base_model.state_dict(), "final_model.pt")
+        model_bytes = os.path.getsize("final_model.pt")
+        code_bytes = len(code.encode("utf-8"))
+        log0(f"Serialized model: {model_bytes} bytes")
+        log0(f"Code size: {code_bytes} bytes")
+        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_buf = io.BytesIO()
+    torch.save(quant_obj, quant_buf)
+    quant_raw = quant_buf.getvalue()
+    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_raw_bytes = len(quant_raw)
+    if master_process:
+        with open("final_model.int8.ptz", "wb") as f:
+            f.write(quant_blob)
+        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        code_bytes = len(code.encode("utf-8"))
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        log0(
+            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+        )
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+
+    if distributed:
+        dist.barrier()
+    with open("final_model.int8.ptz", "rb") as f:
+        quant_blob_disk = f.read()
+    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    torch.cuda.synchronize()
+    t_qeval = time.perf_counter()
+    q_val_loss, q_val_bpb = eval_val(
+        args,
+        model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+    )
+    torch.cuda.synchronize()
+    log0(
+        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+    )
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if distributed:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
