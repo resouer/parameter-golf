@@ -53,6 +53,28 @@ RESOURCE_SHAPE = os.environ.get("PGOLF_RESOURCE_SHAPE", "gpu.8xh100-sxm")
 CONTAINER_IMAGE = os.environ.get("PGOLF_CONTAINER_IMAGE", "runpod/parameter-golf:latest")
 LOCAL_VOLUME = os.environ.get("PGOLF_LOCAL_VOLUME", "")
 LEP_CLI = os.environ.get("PGOLF_LEP_CLI", "lep")
+FORWARDED_JOB_ENV_KEYS = (
+    "VOCAB_SIZE",
+    "TRAIN_SHARDS_OVERRIDE",
+    "ITERATIONS",
+    "MAX_WALLCLOCK_SECONDS",
+    "VAL_LOSS_EVERY",
+    "SLIDING_WINDOW_ENABLED",
+    "TTT_ENABLED",
+    "TTT_LR",
+    "TTT_EPOCHS",
+    "BIGRAM_VOCAB_SIZE",
+    "BIGRAM_DIM",
+    "GATE_ATTN_OUT",
+    "GATE_WIDTH",
+    "GATE_ATTN_SRC",
+    "SMEAR_GATE",
+    "SMEAR_GATE_WIDTH",
+    "EMBED_BITS",
+    "EMBED_CLIP_SIGMAS",
+    "COMPRESSOR",
+    "QK_GAIN_INIT",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +444,14 @@ def _create_job(commit_sha, node_group=None, branch=None):
     fa3_index = os.environ.get("PGOLF_FA3_WHEEL_INDEX")
     if fa3_index:
         lep_cmd.extend(["-e", f"PGOLF_FA3_WHEEL_INDEX={fa3_index}"])
+    forwarded = []
+    for key in FORWARDED_JOB_ENV_KEYS:
+        value = os.environ.get(key)
+        if value:
+            lep_cmd.extend(["-e", f"{key}={value}"])
+            forwarded.append(f"{key}={value}")
+    if forwarded:
+        _log("Forwarded env: " + ", ".join(forwarded))
 
     _log(f"Creating job {job_name}...")
     result = subprocess.run(lep_cmd, capture_output=True, text=True)
