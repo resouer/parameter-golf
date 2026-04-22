@@ -33,17 +33,9 @@ def detect_vocab():
     try:
         import lzma
         import base64
-        m2 = re.search(r"b85decode\([b]?['\"](.+?)['\"]\)", f, re.DOTALL)
+        m2 = re.search(r"b85decode\(b'(.+?)'\)", f, re.DOTALL)
         if m2:
-            blob = m2.group(1)
-            try:
-                code = lzma.decompress(base64.b85decode(blob)).decode()
-            except Exception:
-                code = lzma.decompress(
-                    base64.b85decode(blob),
-                    format=lzma.FORMAT_RAW,
-                    filters=[{"id": lzma.FILTER_LZMA2}],
-                ).decode()
+            code = lzma.decompress(base64.b85decode(m2.group(1))).decode()
             m3 = re.search(r'VOCAB_SIZE.*?,\s*(\d+)', code)
             if m3:
                 print(m3.group(1))

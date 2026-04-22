@@ -53,28 +53,6 @@ RESOURCE_SHAPE = os.environ.get("PGOLF_RESOURCE_SHAPE", "gpu.8xh100-sxm")
 CONTAINER_IMAGE = os.environ.get("PGOLF_CONTAINER_IMAGE", "runpod/parameter-golf:latest")
 LOCAL_VOLUME = os.environ.get("PGOLF_LOCAL_VOLUME", "")
 LEP_CLI = os.environ.get("PGOLF_LEP_CLI", "lep")
-FORWARDED_JOB_ENV_KEYS = (
-    "VOCAB_SIZE",
-    "TRAIN_SHARDS_OVERRIDE",
-    "ITERATIONS",
-    "MAX_WALLCLOCK_SECONDS",
-    "VAL_LOSS_EVERY",
-    "SLIDING_WINDOW_ENABLED",
-    "TTT_ENABLED",
-    "TTT_LR",
-    "TTT_EPOCHS",
-    "BIGRAM_VOCAB_SIZE",
-    "BIGRAM_DIM",
-    "GATE_ATTN_OUT",
-    "GATE_WIDTH",
-    "GATE_ATTN_SRC",
-    "SMEAR_GATE",
-    "SMEAR_GATE_WIDTH",
-    "EMBED_BITS",
-    "EMBED_CLIP_SIGMAS",
-    "COMPRESSOR",
-    "QK_GAIN_INIT",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -202,8 +180,6 @@ fi
     else:
         data_setup = """
 # Auto-detect vocab size from train_gpt.py (default sp1024, supports sp4096+)
-VOCAB=${VOCAB_SIZE:-}
-if [ -z "$VOCAB" ]; then
 if [ -f remote_helper.py ]; then
     VOCAB=$("$PYBIN" remote_helper.py detect-vocab)
 else
@@ -226,14 +202,10 @@ print('1024')
 PYEOF
 )
 fi
-fi
 [ -z "$VOCAB" ] && VOCAB=1024
-SHARDS=${TRAIN_SHARDS_OVERRIDE:-}
-if [ -z "$SHARDS" ]; then
-    SHARDS=80
-    [ "$VOCAB" -gt 1024 ] && SHARDS=143
-    [ "$VOCAB" -gt 4096 ] && SHARDS=128
-fi
+SHARDS=80
+[ "$VOCAB" -gt 1024 ] && SHARDS=143
+[ "$VOCAB" -gt 4096 ] && SHARDS=128
 echo "data_setup: vocab=$VOCAB shards=$SHARDS"
 # Scylla (998-vocab custom tokenizer): download from HuggingFace
 if [ "$VOCAB" = "998" ]; then
@@ -450,14 +422,6 @@ def _create_job(commit_sha, node_group=None, branch=None):
     fa3_index = os.environ.get("PGOLF_FA3_WHEEL_INDEX")
     if fa3_index:
         lep_cmd.extend(["-e", f"PGOLF_FA3_WHEEL_INDEX={fa3_index}"])
-    forwarded = []
-    for key in FORWARDED_JOB_ENV_KEYS:
-        value = os.environ.get(key)
-        if value:
-            lep_cmd.extend(["-e", f"{key}={value}"])
-            forwarded.append(f"{key}={value}")
-    if forwarded:
-        _log("Forwarded env: " + ", ".join(forwarded))
 
     _log(f"Creating job {job_name}...")
     result = subprocess.run(lep_cmd, capture_output=True, text=True)
@@ -762,6 +726,24 @@ def _log(msg):
     print(f"[evaluate] {msg}", file=sys.stderr)
 
 
+def _notify_tmux(title: str, body: str):
+    pane = (os.environ.get("OMX_NOTIFY_TMUX_PANE") or os.environ.get("TMUX_PANE") or "").strip()
+    tmux = (os.environ.get("TMUX") or "").strip()
+    if not pane or not tmux:
+        return
+    msg = f"[pgolf] {title}: {body}".replace("\n", " ")[:400]
+    try:
+        subprocess.run(
+            ["tmux", "display-message", "-d", "15000", "-t", pane, msg],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def _result_file_path() -> str:
     explicit = (
         os.environ.get("AUTORESEARCH_RESULT_FILE")
@@ -788,8 +770,21 @@ def _output(pass_val, score=None, details=None, error=None):
             json.dump(result, f)
     except Exception:
         pass
+    summary = f"pass={pass_val}"
+    if details and details.get("val_bpb") is not None:
+        summary += f" bpb={details['val_bpb']}"
+    if details and details.get("bytes_total") is not None:
+        summary += f" bytes={details['bytes_total']}"
+    if error:
+        summary += f" error={error}"
+    _notify_tmux("evaluate.py finished", summary)
     print(json.dumps(result))
     sys.exit(0)
+
+
+def _queue_failfast_reasons():
+    raw = os.environ.get("PGOLF_QUEUE_FAILFAST_REASONS", "InsufficientQuota,InsufficientResources")
+    return {item.strip() for item in raw.split(",") if item.strip()}
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +800,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     args = parser.parse_args()
     queue_failfast_seconds = int(os.environ.get("PGOLF_QUEUE_FAILFAST_SECONDS", "300"))
+    queue_failfast_reasons = _queue_failfast_reasons()
 
     # Best-effort node-group health summary before any push/launch.
     if args.node_group:
@@ -909,10 +905,10 @@ def main():
             status == "queueing"
             and queue_failfast_seconds > 0
             and elapsed >= queue_failfast_seconds
-            and status_info.get("reason") == "InsufficientQuota"
+            and status_info.get("reason") in queue_failfast_reasons
         ):
             _stop_job_safe(job_id)
-            _output(False, error=f"queueing>{queue_failfast_seconds}s due to InsufficientQuota")
+            _output(False, error=f"queueing>{queue_failfast_seconds}s due to {status_info.get('reason')}")
 
         if status in ("completed", "failed", "stopped"):
             log_thread.join(timeout=15)
