@@ -49,6 +49,11 @@ class Hyperparameters:
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 8))
     parallel_final_lane = os.environ.get("PARALLEL_FINAL_LANE", "mean")
+    gate_attn_out = bool(int(os.environ.get("GATE_ATTN_OUT", "0")))
+    gate_attn_src = os.environ.get("GATE_ATTN_SRC", "proj")
+    gate_width = int(os.environ.get("GATE_WIDTH", 12))
+    smear_gate_enabled = bool(int(os.environ.get("SMEAR_GATE", "0")))
+    smear_gate_width = int(os.environ.get("SMEAR_GATE_WIDTH", 12))
     min_lr = float(os.environ.get("MIN_LR", 0.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
@@ -620,7 +625,17 @@ def apply_rotary_emb(x, cos, sin, rope_dims=0):
 
 class CausalSelfAttention(nn.Module):
     def __init__(
-        self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len, yarn=True
+        self,
+        dim,
+        num_heads,
+        num_kv_heads,
+        rope_base,
+        qk_gain_init,
+        train_seq_len,
+        yarn=True,
+        gate_attn_out=False,
+        gate_attn_src="proj",
+        gate_width=12,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -646,6 +661,12 @@ class CausalSelfAttention(nn.Module):
             W = torch.empty(num_heads, dim, dtype=torch.float32)
             nn.init.normal_(W, mean=0.0, std=gate_std)
             self.attn_gate_w = nn.Parameter(W)
+        self.gate_attn_out = gate_attn_out
+        self.gate_attn_src = gate_attn_src
+        self.gate_width = gate_width
+        if gate_attn_out:
+            self.attn_gate_proj = CastedLinear(gate_width, num_heads, bias=False)
+            self.attn_gate_proj._zero_init = True
 
     def _xsa_efficient(self, y, v):
         B, T, H, D = y.shape
@@ -658,7 +679,8 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, q_w, k_w, v_w, out_w, cu_seqlens=None, max_seqlen=0):
         bsz, seqlen, dim = x.shape
-        q = F.linear(x, q_w.to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        q_raw = F.linear(x, q_w.to(x.dtype))
+        q = q_raw.reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = F.linear(x, k_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = F.linear(x, v_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
@@ -687,6 +709,11 @@ class CausalSelfAttention(nn.Module):
             # Per-head gate: g = sigmoid(x @ W_g.T), shape (B, T, H). Apply before out_proj.
             x_c = x.contiguous()
             g = torch.sigmoid(F.linear(x_c, self.attn_gate_w.to(x.dtype)))
+            y = y * g[..., None]
+        if self.gate_attn_out:
+            gate_src = q_raw if self.gate_attn_src == "q" else x
+            gate_in = gate_src[..., : self.gate_width].contiguous()
+            g = 2.0 * torch.sigmoid(self.attn_gate_proj(gate_in))
             y = y * g[..., None]
         y = y.reshape(bsz, seqlen, dim)
         self._last_proj_input = y.detach() if getattr(self, "_calib", False) else None
@@ -719,12 +746,24 @@ class Block(nn.Module):
         layer_idx=0,
         ln_scale=False,
         yarn=True,
+        gate_attn_out=False,
+        gate_attn_src="proj",
+        gate_width=12,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(
-            dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len, yarn=yarn
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            train_seq_len,
+            yarn=yarn,
+            gate_attn_out=gate_attn_out,
+            gate_attn_src=gate_attn_src,
+            gate_width=gate_width,
         )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -781,6 +820,9 @@ class GPT(nn.Module):
                     layer_idx=i,
                     ln_scale=h.ln_scale,
                     yarn=h.rope_yarn,
+                    gate_attn_out=h.gate_attn_out,
+                    gate_attn_src=h.gate_attn_src,
+                    gate_width=h.gate_width,
                 )
                 for i in range(h.num_layers)
             ]
@@ -841,6 +883,12 @@ class GPT(nn.Module):
         self.parallel_resid_lambdas = nn.Parameter(
             torch.full((h.num_layers, 2), 1.1, dtype=torch.float32)
         )
+        self.smear_gate_enabled = h.smear_gate_enabled
+        if self.smear_gate_enabled:
+            self.smear_width = h.smear_gate_width
+            self.smear_gate = CastedLinear(self.smear_width, 1, bias=False)
+            self.smear_gate._zero_init = True
+            self.smear_lambda = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         self._init_weights()
 
     def _init_weights(self):
@@ -915,6 +963,10 @@ class GPT(nn.Module):
 
     def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
         x = self.tok_emb(input_ids)
+        if self.smear_gate_enabled:
+            sl = self.smear_lambda.to(dtype=x.dtype)
+            g = sl * torch.sigmoid(self.smear_gate(x[:, 1:, : self.smear_width]))
+            x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1]], dim=1)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips = []
@@ -989,6 +1041,10 @@ class GPT(nn.Module):
 
     def forward_ttt(self, input_ids, target_ids, lora):
         x = self.tok_emb(input_ids)
+        if self.smear_gate_enabled:
+            sl = self.smear_lambda.to(dtype=x.dtype)
+            g = sl * torch.sigmoid(self.smear_gate(x[:, 1:, : self.smear_width]))
+            x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1]], dim=1)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips = []
@@ -1067,7 +1123,8 @@ class GPT(nn.Module):
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
-        q = (F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)).reshape(
+        q_raw = F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)
+        q = q_raw.reshape(
             bsz, seqlen, attn.num_heads, attn.head_dim
         )
         k = F.linear(n, k_w.to(n.dtype))
@@ -1092,6 +1149,11 @@ class GPT(nn.Module):
             n_c = n.contiguous()
             g = torch.sigmoid(F.linear(n_c, attn.attn_gate_w.to(n.dtype)))
             y = y * g[..., None]
+        if getattr(attn, "gate_attn_out", False):
+            gate_src = q_raw if attn.gate_attn_src == "q" else n
+            gate_in = gate_src[..., : attn.gate_width].contiguous()
+            g = 2.0 * torch.sigmoid(attn.attn_gate_proj(gate_in))
+            y = y * g[..., None]
         y = y.reshape(bsz, seqlen, dim)
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
@@ -1114,7 +1176,8 @@ class GPT(nn.Module):
         n = block.attn_norm(attn_read) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
-        q = (F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)).reshape(
+        q_raw = F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)
+        q = q_raw.reshape(
             bsz, seqlen, attn.num_heads, attn.head_dim
         )
         k = F.linear(n, k_w.to(n.dtype))
@@ -1136,6 +1199,11 @@ class GPT(nn.Module):
         if getattr(attn, "gated_attn", False):
             n_c = n.contiguous()
             g = torch.sigmoid(F.linear(n_c, attn.attn_gate_w.to(n.dtype)))
+            y = y * g[..., None]
+        if getattr(attn, "gate_attn_out", False):
+            gate_src = q_raw if attn.gate_attn_src == "q" else n
+            gate_in = gate_src[..., : attn.gate_width].contiguous()
+            g = 2.0 * torch.sigmoid(attn.attn_gate_proj(gate_in))
             y = y * g[..., None]
         y = y.reshape(bsz, seqlen, dim)
         attn_out = F.linear(y, out_w.to(n.dtype))
@@ -1401,7 +1469,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate,smear_gate",
     ).split(",")
     if pattern
 )
