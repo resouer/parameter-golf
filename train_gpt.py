@@ -46,6 +46,7 @@ class Hyperparameters:
     num_loops = int(os.environ.get("NUM_LOOPS", 2))
     loop_start = int(os.environ.get("LOOP_START", 3))
     loop_end = int(os.environ.get("LOOP_END", 5))
+    recur_alpha_enabled = bool(int(os.environ.get("RECUR_ALPHA_ENABLED", "0")))
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 8))
     parallel_final_lane = os.environ.get("PARALLEL_FINAL_LANE", "mean")
@@ -841,6 +842,49 @@ class GPT(nn.Module):
         self.parallel_resid_lambdas = nn.Parameter(
             torch.full((h.num_layers, 2), 1.1, dtype=torch.float32)
         )
+        self.recur_alpha_enabled = bool(h.recur_alpha_enabled) and h.num_loops > 0
+        self.loop_start = h.loop_start
+        self.loop_end = h.loop_end
+        if self.recur_alpha_enabled:
+            self.num_looped = h.loop_end - h.loop_start + 1
+            self.register_buffer(
+                "recur_beta",
+                torch.tensor([1.5973426, 1.8826205, 1.9906198], dtype=torch.float32),
+            )
+            self.register_buffer(
+                "recur_alpha",
+                torch.tensor(
+                    [
+                        [0.251953125, -0.02099609375, -0.01239013671875],
+                        [0.06689453125, -0.34765625, 0.0031280517578125],
+                        [0.138671875, 0.2412109375, 0.0272216796875],
+                    ],
+                    dtype=torch.float32,
+                ),
+            )
+            visits = {}
+            self._encoder_alpha_info = []
+            for idx in self.encoder_indices:
+                pi = visits.get(idx, 0)
+                visits[idx] = pi + 1
+                if self.loop_start <= idx <= self.loop_end and pi > 0:
+                    self._encoder_alpha_info.append((pi - 1, idx - self.loop_start))
+                else:
+                    self._encoder_alpha_info.append(None)
+            self._decoder_alpha_info = []
+            for idx in self.decoder_indices:
+                pi = visits.get(idx, 0)
+                visits[idx] = pi + 1
+                if self.loop_start <= idx <= self.loop_end and pi > 0:
+                    self._decoder_alpha_info.append((pi - 1, idx - self.loop_start))
+                else:
+                    self._decoder_alpha_info.append(None)
+        else:
+            self.num_looped = 0
+            self.recur_beta = None
+            self.recur_alpha = None
+            self._encoder_alpha_info = None
+            self._decoder_alpha_info = None
         self._init_weights()
 
     def _init_weights(self):
@@ -931,13 +975,35 @@ class GPT(nn.Module):
                 self.num_encoder_layers + self.num_decoder_layers,
             )
         )
-        for i in enc_iter:
+        enc_alpha_info = (
+            self._encoder_alpha_info
+            if (self.recur_alpha is not None and self.looping_active)
+            else None
+        )
+        carry = {} if enc_alpha_info is not None else None
+        for step_idx, i in enumerate(enc_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            x_before = x
+            x_new = self.blocks[i](x_before, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            if enc_alpha_info is not None and enc_alpha_info[step_idx] is not None:
+                pass_off, local_idx = enc_alpha_info[step_idx]
+                beta = self.recur_beta[local_idx].to(x_new.dtype)
+                x = beta * x_new
+                for j in range(self.num_looped):
+                    x = x + self.recur_alpha[local_idx, j].to(x_new.dtype) * carry[self.loop_start + j]
+            else:
+                x = x_new
+                if carry is not None and self.loop_start <= i <= self.loop_end:
+                    carry[i] = x_new.detach()
             skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
+        dec_alpha_info = (
+            self._decoder_alpha_info
+            if (self.recur_alpha is not None and self.looping_active)
+            else None
+        )
         for skip_idx, i in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
@@ -967,7 +1033,18 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
-                x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                x_before = x
+                x_new = self.blocks[i](x_before, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                if dec_alpha_info is not None and dec_alpha_info[skip_idx] is not None:
+                    pass_off, local_idx = dec_alpha_info[skip_idx]
+                    beta = self.recur_beta[local_idx].to(x_new.dtype)
+                    x = beta * x_new
+                    for j in range(self.num_looped):
+                        x = x + self.recur_alpha[local_idx, j].to(x_new.dtype) * carry[self.loop_start + j]
+                else:
+                    x = x_new
+                    if carry is not None and self.loop_start <= i <= self.loop_end:
+                        carry[i] = x_new.detach()
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
@@ -1008,14 +1085,36 @@ class GPT(nn.Module):
             )
         )
         slot = 0
-        for i in enc_iter:
+        enc_alpha_info = (
+            self._encoder_alpha_info
+            if (self.recur_alpha is not None and self.looping_active)
+            else None
+        )
+        carry = {} if enc_alpha_info is not None else None
+        for step_idx, i in enumerate(enc_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
+            x_before = x
+            x_new = self._block_with_lora(self.blocks[i], x_before, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
+            if enc_alpha_info is not None and enc_alpha_info[step_idx] is not None:
+                pass_off, local_idx = enc_alpha_info[step_idx]
+                beta = self.recur_beta[local_idx].to(x_new.dtype)
+                x = beta * x_new
+                for j in range(self.num_looped):
+                    x = x + self.recur_alpha[local_idx, j].to(x_new.dtype) * carry[self.loop_start + j]
+            else:
+                x = x_new
+                if carry is not None and self.loop_start <= i <= self.loop_end:
+                    carry[i] = x_new.detach()
             slot += 1
             skips.append(x)
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
+        dec_alpha_info = (
+            self._decoder_alpha_info
+            if (self.recur_alpha is not None and self.looping_active)
+            else None
+        )
         for skip_idx, i in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
@@ -1045,7 +1144,18 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
-                x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
+                x_before = x
+                x_new = self._block_with_lora(self.blocks[i], x_before, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
+                if dec_alpha_info is not None and dec_alpha_info[skip_idx] is not None:
+                    pass_off, local_idx = dec_alpha_info[skip_idx]
+                    beta = self.recur_beta[local_idx].to(x_new.dtype)
+                    x = beta * x_new
+                    for j in range(self.num_looped):
+                        x = x + self.recur_alpha[local_idx, j].to(x_new.dtype) * carry[self.loop_start + j]
+                else:
+                    x = x_new
+                    if carry is not None and self.loop_start <= i <= self.loop_end:
+                        carry[i] = x_new.detach()
             slot += 1
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
