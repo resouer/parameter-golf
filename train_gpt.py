@@ -1,3 +1,5 @@
+# c-20260424-novelty-1: Hessian-trace-conditional per-layer bit allocation for GPTQ
+# (top-1/3 trace(H) -> int7, bottom-1/3 -> int5, middle -> int6; tok_emb keeps embed_bits)
 import base64, collections, copy, fcntl, glob, io, json, lzma, math, os
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
@@ -90,6 +92,10 @@ class Hyperparameters:
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 16))
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 1.5))
+    # c-20260424-novelty-1: Hessian-trace-conditional bit allocation
+    gptq_trace_alloc_enabled = bool(int(os.environ.get("GPTQ_TRACE_ALLOC_ENABLED", "1")))
+    gptq_trace_alloc_top_bits = int(os.environ.get("GPTQ_TRACE_ALLOC_TOP_BITS", 7))
+    gptq_trace_alloc_bottom_bits = int(os.environ.get("GPTQ_TRACE_ALLOC_BOTTOM_BITS", 5))
     phased_ttt_enabled = bool(int(os.environ.get("PHASED_TTT_ENABLED", "1")))
     phased_ttt_prefix_docs = int(os.environ.get("PHASED_TTT_PREFIX_DOCS", 2000))
     phased_ttt_num_phases = int(os.environ.get("PHASED_TTT_NUM_PHASES", 3))
@@ -1714,6 +1720,10 @@ def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
 def gptq_mixed_quantize(state_dict, hessians, h):
     result = {}
     meta = {}
+    # c-20260424-novelty-1: First pass — classify tensors and (optionally) compute trace(H)
+    # for non-tok_emb GPTQ targets to drive per-layer tertile bit allocation.
+    targets = []  # list of (name, tensor, cs, default_bits)
+    trace_records = []  # (name, trace) for tertile sorting
     for (name, tensor) in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         if not t.is_floating_point() or t.numel() <= 65536:
@@ -1728,7 +1738,35 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             cs = h.attn_clip_sigmas
         else:
             cs = h.matrix_clip_sigmas
-        bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
+        default_bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
+        targets.append((name, t, cs, default_bits))
+        if h.gptq_trace_alloc_enabled and "tok_emb" not in name:
+            H = hessians.get(name)
+            if H is not None:
+                trace_records.append((name, float(H.diagonal().sum().item())))
+    # c-20260424-novelty-1: Sort by trace(H) ascending; bottom-1/3 -> low_bits,
+    # top-1/3 -> high_bits, middle-1/3 -> default matrix_bits.
+    bits_override = {}
+    if h.gptq_trace_alloc_enabled and len(trace_records) >= 3:
+        trace_records.sort(key=lambda kv: kv[1])
+        n = len(trace_records)
+        third = n // 3
+        low_bits = h.gptq_trace_alloc_bottom_bits
+        high_bits = h.gptq_trace_alloc_top_bits
+        for i, (lname, tr) in enumerate(trace_records):
+            if i < third:
+                bits_override[lname] = low_bits
+            elif i >= n - third:
+                bits_override[lname] = high_bits
+            # middle tertile inherits default matrix_bits (no override)
+        log(
+            f"GPTQ trace-alloc: n={n}, low={low_bits} ({third}), "
+            f"high={high_bits} ({third}), middle=default ({n - 2 * third}); "
+            f"trace span [{trace_records[0][1]:.2e}, {trace_records[-1][1]:.2e}]"
+        )
+    # Quantize using assigned bits
+    for (name, t, cs, default_bits) in targets:
+        bits = bits_override.get(name, default_bits)
         clip_range = 2 ** (bits - 1) - 1
         ret = gptq_quantize_weight(
             t, hessians[name], clip_sigmas=cs, clip_range=clip_range
