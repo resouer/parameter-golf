@@ -112,6 +112,13 @@ class Hyperparameters:
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 15.0))
     mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 12.0))
     attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
+    # c-20260425-novelty-8: LQER -- rank-K low-rank quantization error reconstruction
+    # Default: mlp.proj.weight only (~5KB raw fp16 / layer * 11 layers = ~56KB raw,
+    # brotli-compresses to ~50KB. Adding mlp.fc would double that and risk 16MB bust
+    # on top of safetri's 15,938,246 baseline.)
+    lqer_enabled = bool(int(os.environ.get("LQER_ENABLED", "1")))
+    lqer_rank = int(os.environ.get("LQER_RANK", 1))
+    lqer_targets = os.environ.get("LQER_TARGETS", "mlp.proj.weight")
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1712,6 +1719,14 @@ def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
 
 
 def gptq_mixed_quantize(state_dict, hessians, h):
+    # c-20260425-novelty-8: LQER -- rank-K low-rank quantization error reconstruction
+    lqer_targets = tuple(
+        s.strip() for s in getattr(h, "lqer_targets", "").split(",") if s.strip()
+    )
+    lqer_rank = int(getattr(h, "lqer_rank", 0))
+    lqer_enabled = bool(getattr(h, "lqer_enabled", False)) and lqer_rank > 0 and len(lqer_targets) > 0
+    lqer_layers_added = 0
+    lqer_bytes_estimate = 0
     result = {}
     meta = {}
     for (name, tensor) in state_dict.items():
@@ -1737,6 +1752,33 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         result[name + ".q"] = q
         result[name + ".scale"] = s
         meta[name] = f"gptq (int{bits})"
+        if lqer_enabled and any(name.endswith(suf) for suf in lqer_targets):
+            # Closed-form low-rank reconstruction of GPTQ quantization error.
+            # No autograd, no SGD: pure SVD on (W_orig - dequant(W_q)).
+            W_orig = t.float()
+            if s.ndim > 0:
+                W_dequant = q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1))
+            else:
+                W_dequant = q.float() * float(s.item())
+            E = W_orig - W_dequant  # 2-D error tensor
+            try:
+                U_full, S_full, Vt_full = torch.linalg.svd(E, full_matrices=False)
+            except Exception as e:  # pragma: no cover -- numerical safety net
+                log(f"LQER:svd_failed name={name} err={type(e).__name__}:{e}")
+                continue
+            k = min(lqer_rank, S_full.numel())
+            U_k = U_full[:, :k].contiguous().to(torch.float16)
+            V_scaled = (Vt_full[:k, :] * S_full[:k, None]).contiguous().to(torch.float16)
+            result[name + ".lqer_U"] = U_k
+            result[name + ".lqer_V"] = V_scaled
+            meta[name] = f"gptq+lqer{k} (int{bits})"
+            lqer_layers_added += 1
+            lqer_bytes_estimate += (U_k.numel() + V_scaled.numel()) * 2
+    if lqer_enabled:
+        log(
+            f"LQER:added rank-{lqer_rank} correction to {lqer_layers_added} layers, "
+            f"raw_fp16_bytes~{lqer_bytes_estimate}"
+        )
     categories = collections.defaultdict(set)
     for (name, cat) in meta.items():
         short = re.sub("\\.\\d+$", "", re.sub("blocks\\.\\d+", "blocks", name))
@@ -1765,11 +1807,16 @@ def dequantize_mixed(result, meta, template_sd):
             continue
         q, s = result[name + ".q"], result[name + ".scale"]
         if s.ndim > 0:
-            out[name] = (
-                q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1))
-            ).to(orig_dtype)
+            W = q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1))
         else:
-            out[name] = (q.float() * float(s.item())).to(orig_dtype)
+            W = q.float() * float(s.item())
+        # c-20260425-novelty-8: apply LQER rank-K correction if present
+        if "lqer" in info:
+            U = result.get(name + ".lqer_U")
+            V = result.get(name + ".lqer_V")
+            if U is not None and V is not None:
+                W = W + (U.float() @ V.float())
+        out[name] = W.to(orig_dtype)
     return out
 
 
