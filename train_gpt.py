@@ -622,9 +622,70 @@ def apply_rotary_emb(x, cos, sin, rope_dims=0):
     return torch.cat((x1 * cos + x2 * sin, x1 * -sin + x2 * cos), dim=-1)
 
 
+# Differential Attention (Ye et al., Microsoft 2024, arXiv:2410.05258).
+# Split each head's d_head into two halves, compute two attention maps,
+# and subtract the second (scaled by a learnable per-head lambda) from the first.
+# Lambda init follows the paper's depth-dependent schedule:
+#   lambda_init = 0.8 - 0.6 * exp(-0.3 * layer_idx)
+# which descends from ~0.5 at layer 0 to ~0.8 at deep layers.
+def _diff_attn_lambda_init(layer_idx: int) -> float:
+    return float(0.8 - 0.6 * math.exp(-0.3 * float(layer_idx)))
+
+
+def _diff_attention(q, k, v, attn_lambda, lambda_init, num_heads, num_kv_heads):
+    """Differential causal attention with GQA, using two PyTorch SDPA calls.
+
+    Args:
+        q: [B, T, num_heads, head_dim]
+        k: [B, T, num_kv_heads, head_dim]
+        v: [B, T, num_kv_heads, head_dim]
+        attn_lambda: nn.Parameter of shape [num_heads], learnable per-head lambda
+        lambda_init: float, the per-layer lambda init (used for output rescale)
+        num_heads, num_kv_heads: ints
+
+    Returns:
+        y: [B, T, num_heads, head_dim] — the differential attention output.
+    """
+    B, T, H, D = q.shape
+    Hkv = k.size(2)
+    if D % 2 != 0:
+        raise ValueError(f"head_dim must be even for diff-attn, got {D}")
+    d_half = D // 2
+    # Split q/k along head_dim into two halves of d_half each
+    q1, q2 = q[..., :d_half], q[..., d_half:]  # [B, T, H, d_half]
+    k1, k2 = k[..., :d_half], k[..., d_half:]  # [B, T, Hkv, d_half]
+    # SDPA expects [B, H, T, D]
+    q1 = q1.transpose(1, 2).contiguous()  # [B, H, T, d_half]
+    q2 = q2.transpose(1, 2).contiguous()
+    k1 = k1.transpose(1, 2).contiguous()  # [B, Hkv, T, d_half]
+    k2 = k2.transpose(1, 2).contiguous()
+    v_t = v.transpose(1, 2).contiguous()  # [B, Hkv, T, D]
+    # Manual GQA expansion (avoid PyTorch enable_gqa flag for portability):
+    # broadcast K, V from Hkv heads to H heads via repeat_interleave.
+    if Hkv != H:
+        if H % Hkv != 0:
+            raise ValueError(f"num_heads {H} must be divisible by num_kv_heads {Hkv}")
+        group = H // Hkv
+        k1 = k1.repeat_interleave(group, dim=1)
+        k2 = k2.repeat_interleave(group, dim=1)
+        v_t = v_t.repeat_interleave(group, dim=1)
+    # Two causal attention maps; SDPA scales by 1/sqrt(d_half) internally.
+    out1 = F.scaled_dot_product_attention(q1, k1, v_t, is_causal=True)
+    out2 = F.scaled_dot_product_attention(q2, k2, v_t, is_causal=True)
+    # Per-head differential subtraction
+    lam = attn_lambda.to(dtype=out1.dtype).view(1, H, 1, 1)
+    out = out1 - lam * out2  # [B, H, T, D]
+    # Per-head LayerNorm (no learnable affine), as in the paper's renormalization.
+    out = F.layer_norm(out, (D,))
+    # Rescale to roughly match a single softmax-attn variance: paper uses (1 - lambda_init).
+    out = out * (1.0 - lambda_init)
+    # Back to [B, T, H, D]
+    return out.transpose(1, 2).contiguous()
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
-        self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len, yarn=True
+        self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len, yarn=True, layer_idx=0
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -644,6 +705,13 @@ class CausalSelfAttention(nn.Module):
         self.use_xsa = False
         self.gate_attn_out = False
         self.gate_attn_width = 12
+        # Differential attention parameters (Ye et al., 2024).
+        # Per-head learnable lambda, init from paper's depth-dependent schedule.
+        self.layer_idx = int(layer_idx)
+        self._diff_lambda_init = _diff_attn_lambda_init(self.layer_idx)
+        self.attn_lambda = nn.Parameter(
+            torch.full((num_heads,), self._diff_lambda_init, dtype=torch.float32)
+        )
 
     def _xsa_efficient(self, y, v):
         B, T, H, D = y.shape
@@ -666,6 +734,11 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
         if cu_seqlens is not None:
+            # varlen path is used for sliding-window training; the diff-attn
+            # split-head subtraction does not have a varlen FA kernel, so we
+            # fall back to packed attention here. With sliding_window_enabled=0
+            # in the safetri default, this branch is not exercised at training
+            # time and we keep it identical to the FA3 packed path for safety.
             y = flash_attn_varlen_func(
                 q[0],
                 k[0],
@@ -678,7 +751,12 @@ class CausalSelfAttention(nn.Module):
                 window_size=(-1, -1),
             )[None]
         else:
-            y = flash_attn_3_func(q, k, v, causal=True)
+            # Differential attention (paper formulation).
+            y = _diff_attention(
+                q, k, v,
+                self.attn_lambda, self._diff_lambda_init,
+                self.num_heads, self.num_kv_heads,
+            )
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, self.num_heads, self.head_dim)
@@ -721,7 +799,8 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(
-            dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len, yarn=yarn
+            dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len, yarn=yarn,
+            layer_idx=layer_idx,
         )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1100,7 +1179,11 @@ class GPT(nn.Module):
         q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
         k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
         q = q * attn.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        y = _diff_attention(
+            q, k, v,
+            attn.attn_lambda, attn._diff_lambda_init,
+            attn.num_heads, attn.num_kv_heads,
+        )
         if attn.use_xsa:
             y = attn._xsa_efficient(y, v)
         if attn.gate_attn_out:
@@ -1144,7 +1227,11 @@ class GPT(nn.Module):
         q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
         k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
         q = q * attn.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        y = _diff_attention(
+            q, k, v,
+            attn.attn_lambda, attn._diff_lambda_init,
+            attn.num_heads, attn.num_kv_heads,
+        )
         if attn.use_xsa:
             y = attn._xsa_efficient(y, v)
         if attn.gate_attn_out:
@@ -1423,7 +1510,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,attn_lambda",
     ).split(",")
     if pattern
 )
