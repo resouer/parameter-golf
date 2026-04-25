@@ -93,6 +93,10 @@ class Hyperparameters:
     phased_ttt_enabled = bool(int(os.environ.get("PHASED_TTT_ENABLED", "1")))
     phased_ttt_prefix_docs = int(os.environ.get("PHASED_TTT_PREFIX_DOCS", 2000))
     phased_ttt_num_phases = int(os.environ.get("PHASED_TTT_NUM_PHASES", 3))
+    sapt_enabled = bool(int(os.environ.get("SAPT_ENABLED", "1")))
+    sapt_scale_lr_mult = float(os.environ.get("SAPT_SCALE_LR_MULT", 0.1))
+    sapt_scale_clip = float(os.environ.get("SAPT_SCALE_CLIP", 0.5))
+    sapt_grad_clip = float(os.environ.get("SAPT_GRAD_CLIP", 1.0))
     smear_gate_enabled = bool(int(os.environ.get("SMEAR_GATE", "1")))
     smear_gate_width = int(os.environ.get("SMEAR_GATE_WIDTH", 12))
     gate_attn_out = bool(int(os.environ.get("GATE_ATTN_OUT", "1")))
@@ -1954,7 +1958,179 @@ def deserialize(h, device):
     hidden_dim = int(h.mlp_mult * h.model_dim)
     deq_state = _rebank_state_dict(deq_flat, h.num_layers, h.model_dim, kv_dim, hidden_dim)
     eval_model.load_state_dict(deq_state, strict=True)
+    eval_model._sapt_quant_w = quant_state["w"]
+    eval_model._sapt_quant_meta = quant_state["m"]
     return eval_model
+
+
+def attach_sapt_state(model, h, device):
+    # Builds ParameterList scales (trainable) + frozen int q buffers from the
+    # quant blob already attached to the model in deserialize(). Patches
+    # _bank_weights() so that during phased TTT the bank tensors are recomputed
+    # from q * s on every forward pass, allowing autograd to flow back to s.
+    if getattr(model, "sapt_active", False):
+        return  # already attached
+    quant_w = getattr(model, "_sapt_quant_w", None)
+    quant_meta = getattr(model, "_sapt_quant_meta", None)
+    if quant_w is None or quant_meta is None:
+        raise RuntimeError(
+            "attach_sapt_state called on model without _sapt_quant_w; "
+            "deserialize must populate this."
+        )
+    n = h.num_layers
+
+    def _grab(flat_name):
+        info = quant_meta.get(flat_name)
+        if info is None or "passthrough" in info:
+            raise RuntimeError(
+                f"SAPT expected quantized layer for {flat_name}, got {info!r}"
+            )
+        q = quant_w[flat_name + ".q"]
+        s = quant_w[flat_name + ".scale"]
+        return q, s
+
+    qo_q_list, qo_s_list = [], []
+    kv_q_list, kv_s_list = [], []
+    mlp_up_q_list, mlp_up_s_list = [], []
+    mlp_down_q_list, mlp_down_s_list = [], []
+    for i in range(n):
+        q, s = _grab(f"blocks.{i}.attn.c_q.weight")
+        qo_q_list.append(q); qo_s_list.append(s)
+    for i in range(n):
+        q, s = _grab(f"blocks.{i}.attn.proj.weight")
+        qo_q_list.append(q); qo_s_list.append(s)
+    for i in range(n):
+        q, s = _grab(f"blocks.{i}.attn.c_k.weight")
+        kv_q_list.append(q); kv_s_list.append(s)
+    for i in range(n):
+        q, s = _grab(f"blocks.{i}.attn.c_v.weight")
+        kv_q_list.append(q); kv_s_list.append(s)
+    for i in range(n):
+        q, s = _grab(f"blocks.{i}.mlp.fc.weight")
+        mlp_up_q_list.append(q); mlp_up_s_list.append(s)
+    for i in range(n):
+        q, s = _grab(f"blocks.{i}.mlp.proj.weight")
+        mlp_down_q_list.append(q); mlp_down_s_list.append(s)
+
+    def _make_q_buffers(prefix, q_list):
+        # Store q tensors via numbered register_buffer entries so that they
+        # follow .to(device) semantics without being treated as parameters.
+        # The patched _bank_weights stacks them once into a single tensor that
+        # torch.compile can index by integer without graph breaks.
+        stacked = torch.stack(
+            [q.to(device=device, dtype=torch.int8).contiguous() for q in q_list],
+            dim=0,
+        ).contiguous()
+        model.register_buffer(f"{prefix}_q", stacked, persistent=False)
+
+    def _make_s_params(name, s_list):
+        params = nn.ParameterList()
+        s0_stack = []
+        for s in s_list:
+            sf = s.to(device=device, dtype=torch.float32).contiguous()
+            params.append(nn.Parameter(sf.clone(), requires_grad=True))
+            s0_stack.append(sf.clone().detach())
+        setattr(model, name, params)
+        # Stack initial scales into one tensor for vectorized clamp bounds.
+        # Shapes within a bank are uniform (same flat name pattern) so stack
+        # works directly.
+        try:
+            init_stacked = torch.stack(s0_stack, dim=0).contiguous()
+        except RuntimeError:
+            init_stacked = None
+        # Per-element init buffers (used when shapes are not uniform).
+        for idx, s0 in enumerate(s0_stack):
+            model.register_buffer(f"{name}_init_{idx}", s0, persistent=False)
+        if init_stacked is not None:
+            model.register_buffer(f"{name}_init_stack", init_stacked, persistent=False)
+
+    _make_q_buffers("sapt_qo", qo_q_list)
+    _make_q_buffers("sapt_kv", kv_q_list)
+    _make_q_buffers("sapt_mlp_up", mlp_up_q_list)
+    _make_q_buffers("sapt_mlp_down", mlp_down_q_list)
+    _make_s_params("sapt_qo_scales", qo_s_list)
+    _make_s_params("sapt_kv_scales", kv_s_list)
+    _make_s_params("sapt_mlp_up_scales", mlp_up_s_list)
+    _make_s_params("sapt_mlp_down_scales", mlp_down_s_list)
+
+    # Patch _bank_weights to recompute q*s on every call. This enables
+    # autograd to flow back to scale Parameters from the per-token loss.
+    def _bank_weights_sapt(self, i):
+        nn_ = self.num_layers
+
+        def _qs(q_stack, scales, idx):
+            q = q_stack[idx]              # int8 tensor (rows, cols)
+            s = scales[idx]               # nn.Parameter (rows,)
+            return (q.float() * s.unsqueeze(-1)).to(torch.bfloat16)
+
+        return (
+            _qs(self.sapt_qo_q, self.sapt_qo_scales, i),
+            _qs(self.sapt_kv_q, self.sapt_kv_scales, i),
+            _qs(self.sapt_kv_q, self.sapt_kv_scales, nn_ + i),
+            _qs(self.sapt_qo_q, self.sapt_qo_scales, nn_ + i),
+            _qs(self.sapt_mlp_up_q, self.sapt_mlp_up_scales, i),
+            _qs(self.sapt_mlp_down_q, self.sapt_mlp_down_scales, i),
+        )
+
+    model._bank_weights_orig = model._bank_weights
+    model._bank_weights = _bank_weights_sapt.__get__(model, model.__class__)
+    model.sapt_active = True
+    # Keep bank Parameters intact so other code paths (state_dict introspection,
+    # global SGD optimizer construction) remain stable. They are unused in
+    # forward once _bank_weights is patched, so they receive no gradients and
+    # are skipped by optimizer.step() (grad is None after zero_grad).
+    for nm in ("qo_bank", "kv_bank", "mlp_up_bank", "mlp_down_bank"):
+        p = getattr(model, nm)
+        p.requires_grad_(False)
+
+
+def collect_sapt_scale_params(model):
+    out = []
+    for nm in (
+        "sapt_qo_scales",
+        "sapt_kv_scales",
+        "sapt_mlp_up_scales",
+        "sapt_mlp_down_scales",
+    ):
+        pl = getattr(model, nm, None)
+        if pl is None:
+            continue
+        for p in pl:
+            out.append(p)
+    return out
+
+
+def collect_sapt_initial_scales(model):
+    out = []
+    for nm in (
+        "sapt_qo_scales",
+        "sapt_kv_scales",
+        "sapt_mlp_up_scales",
+        "sapt_mlp_down_scales",
+    ):
+        pl = getattr(model, nm, None)
+        if pl is None:
+            continue
+        for idx in range(len(pl)):
+            out.append(getattr(model, f"{nm}_init_{idx}"))
+    return out
+
+
+def clamp_sapt_scales_(model, clip_frac):
+    if clip_frac <= 0:
+        return 0.0
+    max_delta = 0.0
+    params = collect_sapt_scale_params(model)
+    inits = collect_sapt_initial_scales(model)
+    with torch.no_grad():
+        for p, s0 in zip(params, inits):
+            lo = (1.0 - clip_frac) * s0
+            hi = (1.0 + clip_frac) * s0
+            p.data.clamp_(min=lo, max=hi)
+            md = ((p.data - s0).abs() / s0.clamp_min(1e-12)).max().item()
+            if md > max_delta:
+                max_delta = md
+    return max_delta
 
 
 def _loss_bpb(loss_sum, token_count, byte_count):
@@ -2256,7 +2432,13 @@ def train_val_ttt_global_sgd_distributed(h, device, val_data, base_model, val_to
     ttt_chunk = h.global_ttt_chunk_tokens
     batch_seqs = h.global_ttt_batch_seqs if batch_seqs is None else batch_seqs
     num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
-    ttt_params = [p for p in base_model.parameters()]
+    sapt_scale_set = set()
+    if getattr(base_model, "sapt_active", False):
+        sapt_scale_set = {id(p) for p in collect_sapt_scale_params(base_model)}
+        # Freeze SAPT scales during global SGD; phased TTT inner loop owns them.
+        for p in collect_sapt_scale_params(base_model):
+            p.requires_grad_(False)
+    ttt_params = [p for p in base_model.parameters() if id(p) not in sapt_scale_set]
     for p in ttt_params:
         p.requires_grad_(True)
     optimizer = torch.optim.SGD(
@@ -2338,6 +2520,11 @@ def train_val_ttt_global_sgd_distributed(h, device, val_data, base_model, val_to
             )
     for p in base_model.parameters():
         p.requires_grad_(True)
+    if getattr(base_model, "sapt_active", False):
+        # Restore SAPT scales as the only trainable params after global SGD;
+        # phased TTT will re-freeze the bulk weights when it returns.
+        for p in collect_sapt_scale_params(base_model):
+            p.requires_grad_(True)
     base_model.eval()
 
 
@@ -2348,6 +2535,11 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
     base_model.eval()
     for p in base_model.parameters():
         p.requires_grad_(False)
+    sapt_scale_params = []
+    if getattr(base_model, "sapt_active", False):
+        sapt_scale_params = collect_sapt_scale_params(base_model)
+        for p in sapt_scale_params:
+            p.requires_grad_(True)
     all_tokens = val_data.val_tokens
     all_tokens_idx = all_tokens.to(torch.int32)
     docs = _find_docs(all_tokens)
@@ -2412,6 +2604,26 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
         )
 
     reusable_opt = _build_opt(reusable_lora)
+    sapt_opt = None
+    sapt_step_count = 0
+    sapt_loss_first = None
+    sapt_loss_last = None
+    sapt_phase_step_count = 0
+    sapt_phase_loss_first = None
+    sapt_phase_loss_last = None
+    if sapt_scale_params:
+        sapt_lr = h.ttt_lora_lr * h.sapt_scale_lr_mult
+        sapt_opt = torch.optim.AdamW(
+            sapt_scale_params,
+            lr=sapt_lr,
+            betas=(h.ttt_beta1, h.ttt_beta2),
+            eps=1e-10,
+            weight_decay=0.0,
+        )
+        log(
+            f"sapt:phase 0 added scales={sum(p.numel() for p in sapt_scale_params)} "
+            f"to optimizer (lr={sapt_lr:.6f}); waiting for first loss"
+        )
     local_scored_docs = []
     global_ttt_done = prefix_doc_limit == 0
     try:
@@ -2507,8 +2719,27 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                         :, chunk_offset : chunk_offset + chunk_size
                     ].mean(dim=-1)
                     cur_opt.zero_grad(set_to_none=True)
-                    (per_doc * activate_chunk_mask).sum().backward()
+                    if sapt_opt is not None:
+                        sapt_opt.zero_grad(set_to_none=True)
+                    loss_train = (per_doc * activate_chunk_mask).sum()
+                    loss_train.backward()
                     cur_opt.step()
+                    if sapt_opt is not None:
+                        if h.sapt_grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(
+                                sapt_scale_params, h.sapt_grad_clip
+                            )
+                        sapt_opt.step()
+                        clamp_sapt_scales_(base_model, h.sapt_scale_clip)
+                        loss_val = float(loss_train.detach().item())
+                        if sapt_loss_first is None:
+                            sapt_loss_first = loss_val
+                        sapt_loss_last = loss_val
+                        if sapt_phase_loss_first is None:
+                            sapt_phase_loss_first = loss_val
+                        sapt_phase_loss_last = loss_val
+                        sapt_step_count += 1
+                        sapt_phase_step_count += 1
             else:
                 del per_tok_loss
         batch_num = orig_batch_idx + 1
@@ -2582,11 +2813,29 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                         f"gd:{len(scored_docs_for_global)} "
                         f"t:{time.perf_counter() - t_start:.1f}s"
                     )
+                if sapt_opt is not None and sapt_phase_step_count > 0:
+                    max_delta_log = clamp_sapt_scales_(
+                        base_model, h.sapt_scale_clip
+                    )
+                    if h.rank == 0:
+                        log(
+                            f"sapt:phase {current_phase} done "
+                            f"steps={sapt_phase_step_count} "
+                            f"start_loss={sapt_phase_loss_first:.4f} "
+                            f"end_loss={sapt_phase_loss_last:.4f} "
+                            f"max|Δs/s|={max_delta_log:.4f}"
+                        )
+                    sapt_phase_step_count = 0
+                    sapt_phase_loss_first = None
+                    sapt_phase_loss_last = None
                 train_val_ttt_global_sgd_distributed(
                     h, device, val_data, base_model, global_ttt_tokens
                 )
                 for p in base_model.parameters():
                     p.requires_grad_(False)
+                if sapt_scale_params:
+                    for p in sapt_scale_params:
+                        p.requires_grad_(True)
                 reusable_lora = BatchedTTTLoRA(
                     h.ttt_batch_size, base_model, h.ttt_lora_rank,
                     k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
@@ -2602,6 +2851,11 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                             os.remove(pause_flag_path)
                         except FileNotFoundError:
                             pass
+                    if sapt_opt is not None and h.rank == 0:
+                        log(
+                            f"sapt:phase {current_phase} starting; "
+                            f"continuing optimizer state from previous phase"
+                        )
                 if dist.is_available() and dist.is_initialized():
                     dist.barrier()
                 if h.rank == 0:
@@ -2613,6 +2867,25 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(byte_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+    if sapt_opt is not None and sapt_phase_step_count > 0:
+        max_delta_log = clamp_sapt_scales_(base_model, h.sapt_scale_clip)
+        if h.rank == 0:
+            log(
+                f"sapt:phase {current_phase} done (final) "
+                f"steps={sapt_phase_step_count} "
+                f"start_loss={sapt_phase_loss_first:.4f} "
+                f"end_loss={sapt_phase_loss_last:.4f} "
+                f"max|Δs/s|={max_delta_log:.4f}"
+            )
+    if sapt_opt is not None and h.rank == 0:
+        max_delta_total = clamp_sapt_scales_(base_model, h.sapt_scale_clip)
+        if sapt_loss_first is not None:
+            log(
+                f"sapt:total steps={sapt_step_count} "
+                f"first_loss={sapt_loss_first:.4f} "
+                f"last_loss={sapt_loss_last:.4f} "
+                f"max|Δs/s|_overall={max_delta_total:.4f}"
+            )
     for p in base_model.parameters():
         p.requires_grad_(True)
     base_model.train()
@@ -2905,6 +3178,19 @@ def train_and_eval(h, device):
             ttt_model.looping_active = True
         for p in ttt_model.parameters():
             p.requires_grad_(False)
+        if h.sapt_enabled:
+            attach_sapt_state(ttt_model, h, device)
+            for p in collect_sapt_scale_params(ttt_model):
+                p.requires_grad_(True)
+            # Match QAFT lessons: looping/eval/no-fused-MLP trio for autograd
+            ttt_model.eval()
+            for blk in ttt_model.blocks:
+                blk.mlp.use_fused = False
+            n_scales = sum(p.numel() for p in collect_sapt_scale_params(ttt_model))
+            log(
+                f"sapt:attached scales={n_scales} "
+                f"lr_mult={h.sapt_scale_lr_mult} clip={h.sapt_scale_clip}"
+            )
 
         if h.rope_yarn:
             _yarn_seqlen = h.train_batch_tokens // h.grad_accum_steps
