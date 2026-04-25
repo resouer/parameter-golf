@@ -90,6 +90,14 @@ class Hyperparameters:
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 16))
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 1.5))
+    # c-20260424-novelty-2: TGNBA — Training-Gradient-Norm Bit Allocation.
+    # Sensitivity = ||grad_W L_train||^2 from one calibration batch on training data.
+    # Top-N gradient layers go up to high_bits, bottom-N go down to low_bits, rest stay at default.
+    gptq_grad_alloc_enabled = bool(int(os.environ.get("GPTQ_GRAD_ALLOC_ENABLED", "1")))
+    gptq_grad_alloc_top_n = int(os.environ.get("GPTQ_GRAD_ALLOC_TOP_N", 8))
+    gptq_grad_alloc_bottom_n = int(os.environ.get("GPTQ_GRAD_ALLOC_BOTTOM_N", 16))
+    gptq_grad_alloc_top_bits = int(os.environ.get("GPTQ_GRAD_ALLOC_TOP_BITS", 7))
+    gptq_grad_alloc_bottom_bits = int(os.environ.get("GPTQ_GRAD_ALLOC_BOTTOM_BITS", 5))
     phased_ttt_enabled = bool(int(os.environ.get("PHASED_TTT_ENABLED", "1")))
     phased_ttt_prefix_docs = int(os.environ.get("PHASED_TTT_PREFIX_DOCS", 2000))
     phased_ttt_num_phases = int(os.environ.get("PHASED_TTT_NUM_PHASES", 3))
@@ -1711,9 +1719,105 @@ def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
     return Q[:, invperm], s
 
 
-def gptq_mixed_quantize(state_dict, hessians, h):
+def compute_layer_grad_norms(model, h, device):
+    """c-20260424-novelty-2: per-layer ||grad_W L_train||^2 from one calibration batch.
+
+    Returns dict keyed by unbanked tensor name (e.g. ``blocks.5.attn.c_q.weight``)
+    so it lines up with state_dict produced by _unbank_state_dict.
+    Falls back to per-layer ||W||^2 if backward fails.
+    """
+    n = h.num_layers
+    saved_training = model.training
+    saved_requires = [
+        (p, p.requires_grad) for p in (model.qo_bank, model.kv_bank, model.mlp_up_bank, model.mlp_down_bank)
+    ]
+    for p, _ in saved_requires:
+        p.requires_grad_(True)
+    model.zero_grad(set_to_none=True)
+    grad_norms = {}
+    used_fallback = False
+    fallback_reason = ""
+    try:
+        loader = ShuffledSequenceLoader(h, device)
+        x, y = loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
+        model.train()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            loss = model(x, y)
+        loss.backward()
+        # Slice each bank gradient per-layer.
+        qo_g = model.qo_bank.grad
+        kv_g = model.kv_bank.grad
+        up_g = model.mlp_up_bank.grad
+        down_g = model.mlp_down_bank.grad
+        if any(g is None for g in (qo_g, kv_g, up_g, down_g)):
+            raise RuntimeError("bank gradient is None after backward")
+        for i in range(n):
+            grad_norms[f"blocks.{i}.attn.c_q.weight"] = float((qo_g[i] ** 2).sum().item())
+            grad_norms[f"blocks.{i}.attn.proj.weight"] = float((qo_g[n + i] ** 2).sum().item())
+            grad_norms[f"blocks.{i}.attn.c_k.weight"] = float((kv_g[i] ** 2).sum().item())
+            grad_norms[f"blocks.{i}.attn.c_v.weight"] = float((kv_g[n + i] ** 2).sum().item())
+            grad_norms[f"blocks.{i}.mlp.fc.weight"] = float((up_g[i] ** 2).sum().item())
+            grad_norms[f"blocks.{i}.mlp.proj.weight"] = float((down_g[i] ** 2).sum().item())
+    except Exception as exc:
+        used_fallback = True
+        fallback_reason = repr(exc)
+        with torch.no_grad():
+            qo = model.qo_bank.detach()
+            kv = model.kv_bank.detach()
+            up = model.mlp_up_bank.detach()
+            down = model.mlp_down_bank.detach()
+            for i in range(n):
+                grad_norms[f"blocks.{i}.attn.c_q.weight"] = float((qo[i] ** 2).sum().item())
+                grad_norms[f"blocks.{i}.attn.proj.weight"] = float((qo[n + i] ** 2).sum().item())
+                grad_norms[f"blocks.{i}.attn.c_k.weight"] = float((kv[i] ** 2).sum().item())
+                grad_norms[f"blocks.{i}.attn.c_v.weight"] = float((kv[n + i] ** 2).sum().item())
+                grad_norms[f"blocks.{i}.mlp.fc.weight"] = float((up[i] ** 2).sum().item())
+                grad_norms[f"blocks.{i}.mlp.proj.weight"] = float((down[i] ** 2).sum().item())
+    finally:
+        model.zero_grad(set_to_none=True)
+        if saved_training:
+            model.train()
+        else:
+            model.eval()
+        for p, was_req in saved_requires:
+            p.requires_grad_(was_req)
+    if used_fallback:
+        log(f"TGNBA: gradient backward failed ({fallback_reason}); fell back to ||W||^2 weight norms")
+    return grad_norms
+
+
+def gptq_mixed_quantize(state_dict, hessians, h, grad_norms=None):
     result = {}
     meta = {}
+    bits_override = {}
+    if grad_norms and h.gptq_grad_alloc_enabled:
+        # Rank only quantized GPTQ targets (skip tok_emb, skip passthrough tensors).
+        sortable = []
+        for name, tensor in state_dict.items():
+            if "tok_emb" in name:
+                continue
+            if (not tensor.is_floating_point()) or tensor.numel() <= 65536:
+                continue
+            if name in grad_norms:
+                sortable.append((name, grad_norms[name]))
+        sortable.sort(key=lambda kv: kv[1])  # ascending: low-sensitivity first
+        n = len(sortable)
+        bot_n = min(h.gptq_grad_alloc_bottom_n, n)
+        top_n = min(h.gptq_grad_alloc_top_n, max(0, n - bot_n))
+        bottom = sortable[:bot_n]
+        top = sortable[n - top_n:] if top_n > 0 else []
+        for nm, _ in bottom:
+            bits_override[nm] = h.gptq_grad_alloc_bottom_bits
+        for nm, _ in top:
+            bits_override[nm] = h.gptq_grad_alloc_top_bits
+        log(
+            f"TGNBA: ranked n={n} GPTQ targets by ||grad||^2; "
+            f"bottom-{bot_n} -> int{h.gptq_grad_alloc_bottom_bits}, "
+            f"top-{top_n} -> int{h.gptq_grad_alloc_top_bits}, "
+            f"middle-{n - bot_n - top_n} -> int{h.matrix_bits} (default)"
+        )
+        log(f"TGNBA: top-{top_n} layers: {[(nm, f'{g:.3e}') for nm, g in top]}")
+        log(f"TGNBA: bottom-{bot_n} layers: {[(nm, f'{g:.3e}') for nm, g in bottom]}")
     for (name, tensor) in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         if not t.is_floating_point() or t.numel() <= 65536:
@@ -1728,7 +1832,8 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             cs = h.attn_clip_sigmas
         else:
             cs = h.matrix_clip_sigmas
-        bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
+        default_bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
+        bits = bits_override.get(name, default_bits)
         clip_range = 2 ** (bits - 1) - 1
         ret = gptq_quantize_weight(
             t, hessians[name], clip_sigmas=cs, clip_range=clip_range
@@ -1913,6 +2018,19 @@ def serialize(h, base_model, code):
         log(f"Code size (compressed): {code_bytes} bytes")
     sd_cpu = _unbank_state_dict(base_model.state_dict(), h.num_layers)
     device = torch.device("cuda", h.local_rank)
+    grad_norms = None
+    if h.gptq_grad_alloc_enabled:
+        log("TGNBA: computing per-layer grad-norm sensitivity from training calibration batch...")
+        t_g = time.perf_counter()
+        grad_norms = compute_layer_grad_norms(base_model, h, device)
+        if h.distributed and dist.is_available() and dist.is_initialized() and grad_norms:
+            keys = sorted(grad_norms.keys())
+            buf = torch.tensor([grad_norms[k] for k in keys], dtype=torch.float64, device=device)
+            dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+            buf = buf / float(h.world_size)
+            for i, k in enumerate(keys):
+                grad_norms[k] = float(buf[i].item())
+        log(f"TGNBA: grad-norm sensitivity ready in {time.perf_counter()-t_g:.1f}s ({len(grad_norms)} entries)")
     log("GPTQ:collecting Hessians from calibration data...")
     t0 = time.perf_counter()
     calib_loader = ShuffledSequenceLoader(h, device)
@@ -1924,7 +2042,7 @@ def serialize(h, base_model, code):
         n_calibration_batches=h.gptq_calibration_batches,
     )
     log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter()-t0:.1f}s")
-    quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, h)
+    quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, h, grad_norms=grad_norms)
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
