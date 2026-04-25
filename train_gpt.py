@@ -1,3 +1,4 @@
+# c-20260425-novelty-4: Robust loss-plateau early-stop in Phased TTT (v2 multi-condition gate)
 import base64, collections, copy, fcntl, glob, io, json, lzma, math, os
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
@@ -2341,7 +2342,7 @@ def train_val_ttt_global_sgd_distributed(h, device, val_data, base_model, val_to
     base_model.eval()
 
 
-def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
+def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, quantized_val_loss=None):
     global BOS_ID
     if BOS_ID is None:
         BOS_ID = 1
@@ -2367,6 +2368,20 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
         f" num_phases:{num_phases} boundaries:{phase_boundaries}"
     )
     chunk_size, eval_seq_len = h.ttt_chunk_size, h.ttt_eval_seq_len
+    # c-20260425-novelty-4: precompute per-phase total chunk count (across all ranks)
+    # so each rank can compute phase_progress_frac as phase_chunks_seen / per_rank_chunk_budget.
+    # Phase p contains doc_entries[phase_boundaries[p-1]:phase_boundaries[p]] (open-prev / closed-cur).
+    phase_chunk_budgets = []
+    for pi in range(num_phases):
+        prev_b = phase_boundaries[pi - 1] if pi > 0 else 0
+        cur_b = phase_boundaries[pi]
+        total_chunks = 0
+        for _, doc_len in doc_entries[prev_b:cur_b]:
+            pl = max(0, doc_len - 1)
+            total_chunks += (pl + chunk_size - 1) // chunk_size
+        # Distribute roughly evenly across ranks; per-rank budget for phase progress.
+        per_rank = total_chunks // max(int(h.world_size), 1)
+        phase_chunk_budgets.append(max(per_rank, 1))
     eval_batch_set = None
     if h.ttt_eval_batches:
         eval_batch_set = set(int(x) for x in h.ttt_eval_batches.split(",") if x.strip())
@@ -2414,6 +2429,27 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
     reusable_opt = _build_opt(reusable_lora)
     local_scored_docs = []
     global_ttt_done = prefix_doc_limit == 0
+    # c-20260425-novelty-4: v2 multi-condition plateau detector state.
+    # All 4 conditions must hold simultaneously to skip the LoRA step:
+    #   (1) phase_chunks_seen >= N_MIN  (cold-start gate)
+    #   (2) phase_chunks_seen / phase_chunk_budget >= 0.25  (phase-progress gate)
+    #   (3) |mean(loss[-W:]) - mean(loss[start:start+W])| < epsilon  (long-horizon plateau)
+    #   (4) mean(loss[-W:]) < quantized_val_loss * 1.05  (loss-floor gate)
+    # phase_loss_history grows for the entire phase (we keep first-W-window means too).
+    plateau_window_size = 8
+    plateau_n_min = 64
+    plateau_phase_progress_min = 0.25
+    plateau_epsilon = 2e-3
+    plateau_loss_floor_mult = 1.05
+    plateau_floor_loss = (
+        float(quantized_val_loss) if quantized_val_loss is not None else float("inf")
+    )
+    plateau_recent = collections.deque(maxlen=plateau_window_size)
+    phase_loss_history = []  # all chunk losses for this phase (in order seen on this rank).
+    phase_skip_adapt = False
+    phase_chunks_seen = 0
+    phase_chunks_adapted = 0
+    plateau_fire_count = 0  # diagnostic: number of phases this rank fired the plateau gate.
     try:
       while True:
         queue_idx = _claim_next_batch(counter_path, queue_len)
@@ -2499,16 +2535,82 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 )
             if needs_train:
                 activate_chunk_mask = (num_chunks_t - 1 > ci).float()
-                for gi in range(h.ttt_grad_steps):
-                    if gi > 0:
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
-                    per_doc = per_tok_loss[
-                        :, chunk_offset : chunk_offset + chunk_size
-                    ].mean(dim=-1)
-                    cur_opt.zero_grad(set_to_none=True)
-                    (per_doc * activate_chunk_mask).sum().backward()
-                    cur_opt.step()
+                # c-20260425-novelty-4: only this phase's prefix-doc batches drive
+                # adaptation. Score-first: _accumulate_bpb already ran above this block.
+                in_phase_adapt = (not global_ttt_done) and (not phase_skip_adapt)
+                phase_chunks_seen += 1
+                if in_phase_adapt:
+                    for gi in range(h.ttt_grad_steps):
+                        if gi > 0:
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
+                        per_doc = per_tok_loss[
+                            :, chunk_offset : chunk_offset + chunk_size
+                        ].mean(dim=-1)
+                        cur_opt.zero_grad(set_to_none=True)
+                        (per_doc * activate_chunk_mask).sum().backward()
+                        cur_opt.step()
+                    phase_chunks_adapted += 1
+                    # Append the post-step chunk loss (mean over active docs) to history.
+                    with torch.no_grad():
+                        active_mask_f = activate_chunk_mask
+                        denom = active_mask_f.sum().clamp_min(1.0)
+                        chunk_loss_scalar = (
+                            (per_doc.detach().float() * active_mask_f).sum() / denom
+                        ).item()
+                    phase_loss_history.append(chunk_loss_scalar)
+                    plateau_recent.append(chunk_loss_scalar)
+                    # Run the v2 multi-condition plateau check.
+                    if (
+                        len(phase_loss_history) >= plateau_window_size
+                        and len(plateau_recent) == plateau_window_size
+                    ):
+                        cur_phase_budget = phase_chunk_budgets[
+                            min(current_phase, len(phase_chunk_budgets) - 1)
+                        ]
+                        phase_progress_frac = phase_chunks_seen / max(cur_phase_budget, 1)
+                        early_window = phase_loss_history[:plateau_window_size]
+                        early_mean = sum(early_window) / plateau_window_size
+                        later_mean = sum(plateau_recent) / plateau_window_size
+                        abs_delta = abs(early_mean - later_mean)
+                        floor_threshold = plateau_floor_loss * plateau_loss_floor_mult
+                        cond_min_chunks = phase_chunks_seen >= plateau_n_min
+                        cond_phase_prog = phase_progress_frac >= plateau_phase_progress_min
+                        cond_abs_plat = abs_delta < plateau_epsilon
+                        cond_loss_floor = later_mean < floor_threshold
+                        # Diagnostic log every check (rank 0 only, gated by chunks).
+                        if h.rank == 0 and (phase_chunks_seen % 16 == 0):
+                            log(
+                                f"phased_ttt_plateau_v2_check: phase={current_phase + 1}/{num_phases} "
+                                f"chunks_done={phase_chunks_seen}/{cur_phase_budget} "
+                                f"phase_progress_frac={phase_progress_frac:.3f} "
+                                f"abs_delta={abs_delta:.6f} "
+                                f"later_mean={later_mean:.5f} "
+                                f"floor_threshold={floor_threshold:.5f} "
+                                f"conds=[min:{int(cond_min_chunks)} prog:{int(cond_phase_prog)} "
+                                f"plat:{int(cond_abs_plat)} floor:{int(cond_loss_floor)}]"
+                            )
+                        if (
+                            cond_min_chunks
+                            and cond_phase_prog
+                            and cond_abs_plat
+                            and cond_loss_floor
+                        ):
+                            phase_skip_adapt = True
+                            plateau_fire_count += 1
+                            if h.rank == 0:
+                                log(
+                                    f"phased_ttt_plateau_v2: phase={current_phase + 1}/{num_phases} "
+                                    f"chunks_done={phase_chunks_seen}/{cur_phase_budget} "
+                                    f"early_mean={early_mean:.5f} later_mean={later_mean:.5f} "
+                                    f"threshold={floor_threshold:.5f} "
+                                    f"abs_delta={abs_delta:.6f} "
+                                    f"-- skipping remaining adaptation"
+                                )
+                else:
+                    # Plateau triggered (or global done): skip adaptation but keep
+                    # scoring untouched. Free the loss tensor.
+                    del per_tok_loss
             else:
                 del per_tok_loss
         batch_num = orig_batch_idx + 1
@@ -2593,6 +2695,12 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 ).to(device)
                 reusable_opt = _build_opt(reusable_lora)
                 current_phase += 1
+                # c-20260425-novelty-4: reset per-phase plateau state at phase boundary.
+                plateau_recent.clear()
+                phase_loss_history = []
+                phase_skip_adapt = False
+                phase_chunks_seen = 0
+                phase_chunks_adapted = 0
                 if current_phase >= num_phases:
                     global_ttt_done = True
                 else:
@@ -2877,7 +2985,7 @@ def train_and_eval(h, device):
     compiled_forward_logits = torch.compile(
         eval_model.forward_logits, dynamic=False, fullgraph=True
     )
-    timed_eval(
+    quantized_val_loss, _quantized_val_bpb = timed_eval(
         "diagnostic quantized",
         eval_val,
         h,
@@ -2964,7 +3072,8 @@ def train_and_eval(h, device):
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         ttt_val_loss, ttt_val_bpb = eval_val_ttt_phased(
-            h, ttt_model, device, val_data, forward_ttt_train=fwd_ttt_compiled
+            h, ttt_model, device, val_data, forward_ttt_train=fwd_ttt_compiled,
+            quantized_val_loss=quantized_val_loss,
         )
         torch.cuda.synchronize()
         ttt_eval_elapsed = time.perf_counter() - t_ttt
