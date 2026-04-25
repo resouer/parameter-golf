@@ -1,3 +1,4 @@
+# c-20260424-novelty-3: Loss-plateau early-stop in Phased TTT (early break when running TTT loss plateaus per phase)
 import base64, collections, copy, fcntl, glob, io, json, lzma, math, os
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
@@ -2414,6 +2415,20 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
     reusable_opt = _build_opt(reusable_lora)
     local_scored_docs = []
     global_ttt_done = prefix_doc_limit == 0
+    # c-20260424-novelty-3: per-phase loss-plateau early-stop state.
+    # Buffer holds the most recent W=8 chunk-level post-TTT-step losses for the
+    # CURRENT phase. When the earlier-half mean minus later-half mean drops below
+    # epsilon for K=2 consecutive checks, we set phase_skip_adapt=True for the
+    # remainder of this phase: scoring of every chunk continues unchanged, but
+    # the LoRA adaptation step (backward + cur_opt.step()) is skipped.
+    plateau_window_size = 8
+    plateau_epsilon = 1e-4
+    plateau_consec_required = 2
+    plateau_loss_buf = collections.deque(maxlen=plateau_window_size)
+    plateau_consec = 0
+    phase_skip_adapt = False
+    phase_chunks_seen = 0
+    phase_chunks_adapted = 0
     try:
       while True:
         queue_idx = _claim_next_batch(counter_path, queue_len)
@@ -2499,16 +2514,56 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 )
             if needs_train:
                 activate_chunk_mask = (num_chunks_t - 1 > ci).float()
-                for gi in range(h.ttt_grad_steps):
-                    if gi > 0:
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
-                    per_doc = per_tok_loss[
-                        :, chunk_offset : chunk_offset + chunk_size
-                    ].mean(dim=-1)
-                    cur_opt.zero_grad(set_to_none=True)
-                    (per_doc * activate_chunk_mask).sum().backward()
-                    cur_opt.step()
+                # c-20260424-novelty-3: only this phase's prefix-doc batches drive
+                # adaptation. Track chunk count for the per-phase plateau monitor.
+                in_phase_adapt = (not global_ttt_done) and (not phase_skip_adapt)
+                phase_chunks_seen += 1
+                if in_phase_adapt:
+                    for gi in range(h.ttt_grad_steps):
+                        if gi > 0:
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
+                        per_doc = per_tok_loss[
+                            :, chunk_offset : chunk_offset + chunk_size
+                        ].mean(dim=-1)
+                        cur_opt.zero_grad(set_to_none=True)
+                        (per_doc * activate_chunk_mask).sum().backward()
+                        cur_opt.step()
+                    phase_chunks_adapted += 1
+                    # Append the post-step chunk loss (mean over active docs) to the
+                    # rolling buffer. We use the last per_doc that was just optimized,
+                    # masked so inactive batch slots do not skew the mean.
+                    with torch.no_grad():
+                        active_mask_f = activate_chunk_mask
+                        denom = active_mask_f.sum().clamp_min(1.0)
+                        chunk_loss_scalar = (
+                            (per_doc.detach().float() * active_mask_f).sum() / denom
+                        ).item()
+                    plateau_loss_buf.append(chunk_loss_scalar)
+                    if len(plateau_loss_buf) == plateau_window_size:
+                        half = plateau_window_size // 2
+                        early_mean = sum(list(plateau_loss_buf)[:half]) / half
+                        later_mean = sum(list(plateau_loss_buf)[half:]) / half
+                        delta = early_mean - later_mean
+                        if delta < plateau_epsilon:
+                            plateau_consec += 1
+                        else:
+                            plateau_consec = 0
+                        if plateau_consec >= plateau_consec_required:
+                            phase_skip_adapt = True
+                            if h.rank == 0:
+                                log(
+                                    f"phased_ttt_plateau: phase={current_phase + 1}/{num_phases} "
+                                    f"chunks_completed={phase_chunks_adapted} "
+                                    f"chunks_seen={phase_chunks_seen} "
+                                    f"early_mean={early_mean:.5f} later_mean={later_mean:.5f} "
+                                    f"delta={delta:.6f} breaking adaptation early"
+                                )
+                else:
+                    # Plateau triggered (or global done): skip adaptation but keep the
+                    # forward pass scoring path untouched. Free the loss tensor so it
+                    # doesn't retain the autograd graph.
+                    del per_tok_loss
             else:
                 del per_tok_loss
         batch_num = orig_batch_idx + 1
@@ -2593,6 +2648,12 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 ).to(device)
                 reusable_opt = _build_opt(reusable_lora)
                 current_phase += 1
+                # c-20260424-novelty-3: reset per-phase plateau state at phase boundary.
+                plateau_loss_buf.clear()
+                plateau_consec = 0
+                phase_skip_adapt = False
+                phase_chunks_seen = 0
+                phase_chunks_adapted = 0
                 if current_phase >= num_phases:
                     global_ttt_done = True
                 else:
