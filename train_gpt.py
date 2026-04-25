@@ -90,6 +90,10 @@ class Hyperparameters:
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 16))
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 1.5))
+    # c-20260425-novelty-5: Post-Quant Per-Layer Scale Recalibration (PQSR)
+    pqsr_enabled = bool(int(os.environ.get("PQSR_ENABLED", "1")))
+    pqsr_calibration_batches = int(os.environ.get("PQSR_CALIBRATION_BATCHES", 4))
+    pqsr_clamp = float(os.environ.get("PQSR_CLAMP", 1.5))
     phased_ttt_enabled = bool(int(os.environ.get("PHASED_TTT_ENABLED", "1")))
     phased_ttt_prefix_docs = int(os.environ.get("PHASED_TTT_PREFIX_DOCS", 2000))
     phased_ttt_num_phases = int(os.environ.get("PHASED_TTT_NUM_PHASES", 3))
@@ -1903,6 +1907,187 @@ def _compressed_code_size(code):
     return len(code_raw), len(wrapper)
 
 
+# c-20260425-novelty-5: Post-Quant Per-Layer Scale Recalibration (PQSR)
+# Closed-form per-layer scalar correction applied to attn_scale / mlp_scale
+# parameters AFTER GPTQ. Solves min_c ||c * q_layer_out - fp_layer_out||_F^2
+# per (layer, attn|mlp). Updates the passthrough float16 scales in-place
+# inside the quantized result dict (no byte budget impact). One forward pass
+# each (no SGD, no gradients). Weights are not modified.
+def post_quant_scale_recalibrate(model, sd_cpu, quant_result, quant_meta, h, device):
+    n = h.num_layers
+    # Sanity: all layers must have passthrough scale entries.
+    for l in range(n):
+        if (
+            f"blocks.{l}.attn_scale" not in quant_result
+            or f"blocks.{l}.mlp_scale" not in quant_result
+        ):
+            log(f"PQSR: missing scale for layer {l}, skipping recalibration")
+            return quant_result
+    t0 = time.perf_counter()
+    log("PQSR: starting post-quant per-layer scale recalibration")
+    # Build full dequantized state dict (same path used at deserialize time).
+    deq_flat = dequantize_mixed(quant_result, quant_meta, sd_cpu)
+    head_dim = h.model_dim // h.num_heads
+    kv_dim = h.num_kv_heads * head_dim
+    hidden_dim = int(h.mlp_mult * h.model_dim)
+    deq_state_cpu = _rebank_state_dict(
+        deq_flat, n, h.model_dim, kv_dim, hidden_dim
+    )
+    # Save original FP weights and prepare device-side tensors.
+    orig_state = {
+        k: v.detach().clone() for (k, v) in model.state_dict().items()
+    }
+    deq_state_device = {}
+    for (k, orig) in orig_state.items():
+        if k in deq_state_cpu:
+            deq_state_device[k] = deq_state_cpu[k].to(
+                device=orig.device, dtype=orig.dtype
+            )
+        else:
+            # Should not happen — rebank produces full state dict.
+            deq_state_device[k] = orig.clone()
+    # Capture per-channel scale^2 weights for the closed-form numerator/denom.
+    # The "layer output" in the spec is post-scale, so weighting the inner
+    # product by s^2 per-channel matches sum((s*fp)*(s*q)) / sum((s*q)^2).
+    s2_attn = [
+        model.blocks[l].attn_scale.detach().float().square().to(device)
+        for l in range(n)
+    ]
+    s2_mlp = [
+        model.blocks[l].mlp_scale.detach().float().square().to(device)
+        for l in range(n)
+    ]
+    # Hooks: capture pre-scale attn/mlp module outputs per layer per call.
+    cur_outs = {}
+    hooks = []
+    def _make_hook(layer_idx, kind):
+        def _hook(_m, _i, out):
+            cur_outs.setdefault((layer_idx, kind), []).append(out.detach())
+        return _hook
+    for l, block in enumerate(model.blocks):
+        hooks.append(block.attn.register_forward_hook(_make_hook(l, "attn")))
+        hooks.append(block.mlp.register_forward_hook(_make_hook(l, "mlp")))
+    # Per-layer scalar accumulators: <fp,q> and <q,q> weighted by s^2.
+    fpq_attn = [0.0] * n
+    qq_attn = [0.0] * n
+    fpq_mlp = [0.0] * n
+    qq_mlp = [0.0] * n
+    n_batches = max(1, int(h.pqsr_calibration_batches))
+    calib_loader = ShuffledSequenceLoader(h, device)
+    was_training = model.training
+    model.eval()
+    def _swap_in(state_to_load):
+        with torch.no_grad():
+            sd = model.state_dict()
+            for k, v in state_to_load.items():
+                if k in sd:
+                    sd[k].copy_(v)
+    try:
+        with torch.no_grad():
+            for batch_idx in range(n_batches):
+                x, _y = calib_loader.next_batch(
+                    h.train_batch_tokens, h.grad_accum_steps
+                )
+                # Pass 1: dequantized weights swapped in. Keep activations
+                # in their native dtype to save GPU memory; convert per-call
+                # during accumulation.
+                _swap_in(deq_state_device)
+                cur_outs.clear()
+                model.forward_logits(x)
+                q_buf = {}
+                for l in range(n):
+                    q_buf[l] = (
+                        list(cur_outs.get((l, "attn"), [])),
+                        list(cur_outs.get((l, "mlp"), [])),
+                    )
+                # Pass 2: original FP weights swapped back in.
+                _swap_in(orig_state)
+                cur_outs.clear()
+                model.forward_logits(x)
+                for l in range(n):
+                    fp_attn_list = cur_outs.get((l, "attn"), [])
+                    fp_mlp_list = cur_outs.get((l, "mlp"), [])
+                    q_attn_list, q_mlp_list = q_buf[l]
+                    if len(fp_attn_list) != len(q_attn_list):
+                        log(
+                            f"PQSR: layer={l} attn invocation count mismatch "
+                            f"fp={len(fp_attn_list)} q={len(q_attn_list)}, skipping layer"
+                        )
+                        continue
+                    if len(fp_mlp_list) != len(q_mlp_list):
+                        log(
+                            f"PQSR: layer={l} mlp invocation count mismatch "
+                            f"fp={len(fp_mlp_list)} q={len(q_mlp_list)}, skipping layer"
+                        )
+                        continue
+                    sa = s2_attn[l]
+                    sm = s2_mlp[l]
+                    for fa, qa in zip(fp_attn_list, q_attn_list):
+                        fa_f = fa.float()
+                        qa_f = qa.float()
+                        fpq_attn[l] += float((sa * fa_f * qa_f).sum().item())
+                        qq_attn[l] += float((sa * qa_f * qa_f).sum().item())
+                    for fm, qm in zip(fp_mlp_list, q_mlp_list):
+                        fm_f = fm.float()
+                        qm_f = qm.float()
+                        fpq_mlp[l] += float((sm * fm_f * qm_f).sum().item())
+                        qq_mlp[l] += float((sm * qm_f * qm_f).sum().item())
+                # Free per-batch activation references before next iteration.
+                q_buf = None
+    finally:
+        for hook in hooks:
+            hook.remove()
+        # Always restore original FP weights so downstream training/eval
+        # paths see the pre-PQSR model.
+        _swap_in(orig_state)
+        if was_training:
+            model.train()
+    # Reduce sums across ranks (each rank used independent calibration data).
+    if h.distributed and dist.is_available() and dist.is_initialized():
+        sums_tensor = torch.tensor(
+            fpq_attn + qq_attn + fpq_mlp + qq_mlp,
+            dtype=torch.float64,
+            device=device,
+        )
+        dist.all_reduce(sums_tensor, op=dist.ReduceOp.SUM)
+        sums_list = sums_tensor.cpu().tolist()
+        fpq_attn = sums_list[0:n]
+        qq_attn = sums_list[n : 2 * n]
+        fpq_mlp = sums_list[2 * n : 3 * n]
+        qq_mlp = sums_list[3 * n : 4 * n]
+    # Compute per-layer scalar c_l and apply to scales (clamped for safety).
+    clamp_lo = 1.0 / max(h.pqsr_clamp, 1.0 + 1e-6)
+    clamp_hi = max(h.pqsr_clamp, 1.0 + 1e-6)
+    n_updated = 0
+    for l in range(n):
+        c_attn = (
+            (fpq_attn[l] / qq_attn[l]) if qq_attn[l] > 0.0 else 1.0
+        )
+        c_mlp = (fpq_mlp[l] / qq_mlp[l]) if qq_mlp[l] > 0.0 else 1.0
+        if not math.isfinite(c_attn):
+            c_attn = 1.0
+        if not math.isfinite(c_mlp):
+            c_mlp = 1.0
+        c_attn_clamped = float(min(clamp_hi, max(clamp_lo, c_attn)))
+        c_mlp_clamped = float(min(clamp_hi, max(clamp_lo, c_mlp)))
+        a_key = f"blocks.{l}.attn_scale"
+        m_key = f"blocks.{l}.mlp_scale"
+        a_t = quant_result[a_key]
+        m_t = quant_result[m_key]
+        quant_result[a_key] = (a_t.float() * c_attn_clamped).to(a_t.dtype)
+        quant_result[m_key] = (m_t.float() * c_mlp_clamped).to(m_t.dtype)
+        n_updated += 2
+        log(
+            f"PQSR: layer={l} attn c_l={c_attn:.4f} (clamped={c_attn_clamped:.4f}) "
+            f"mlp c_l={c_mlp:.4f} (clamped={c_mlp_clamped:.4f})"
+        )
+    log(
+        f"PQSR: updated {n_updated} scale tensors across {n} layers "
+        f"in {time.perf_counter() - t0:.1f}s ({n_batches} batches)"
+    )
+    return quant_result
+
+
 def serialize(h, base_model, code):
     code_bytes_uncompressed, code_bytes = _compressed_code_size(code)
     if h.is_main_process:
@@ -1925,6 +2110,10 @@ def serialize(h, base_model, code):
     )
     log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter()-t0:.1f}s")
     quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, h)
+    if h.pqsr_enabled:
+        quant_result = post_quant_scale_recalibrate(
+            base_model, sd_cpu, quant_result, quant_meta, h, device
+        )
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
