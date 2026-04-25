@@ -89,7 +89,14 @@ class Hyperparameters:
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 16))
-    gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 1.5))
+    gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 30.0))
+    qaft_enabled = bool(int(os.environ.get("QAFT_ENABLED", "1")))
+    qaft_steps = int(os.environ.get("QAFT_STEPS", 100))
+    qaft_lr = float(os.environ.get("QAFT_LR", 2e-4))
+    qaft_batch_seqs_per_rank = int(os.environ.get("QAFT_BATCH_SEQS_PER_RANK", 2))
+    qaft_seq_len = int(os.environ.get("QAFT_SEQ_LEN", 2048))
+    qaft_log_every = int(os.environ.get("QAFT_LOG_EVERY", 20))
+    qaft_clip_grad = float(os.environ.get("QAFT_CLIP_GRAD", 1.0))
     phased_ttt_enabled = bool(int(os.environ.get("PHASED_TTT_ENABLED", "1")))
     phased_ttt_prefix_docs = int(os.environ.get("PHASED_TTT_PREFIX_DOCS", 2000))
     phased_ttt_num_phases = int(os.environ.get("PHASED_TTT_NUM_PHASES", 3))
@@ -1773,6 +1780,195 @@ def dequantize_mixed(result, meta, template_sd):
     return out
 
 
+def qaft_finetune_quantized(h, quant_result, quant_meta, device):
+    """Quantization-Aware Fine-Tuning of GPTQ-quantized weights via STE.
+
+    Builds a fresh eval-mode model loaded with dequantized weights, then runs a
+    short SGD loop on calibration data. The "trainable" parameters are continuous
+    float copies of the quantized weights; on each forward we apply STE-rounded
+    quantize-dequantize, so gradients flow through the rounding operation.
+
+    Critical: model.eval() + use_fused=False disables the Triton-fused MLP path,
+    and looping_active=True ensures the iteration order matches the eventual eval.
+    """
+    log(f"QAFT:start steps={h.qaft_steps} lr={h.qaft_lr} batch_seqs/rank={h.qaft_batch_seqs_per_rank}")
+    t_qaft = time.perf_counter()
+
+    # Build a fresh GPT model and load it with the dequantized GPTQ weights.
+    eval_model = GPT(h).to(device).bfloat16()
+    restore_fp32_params(eval_model)
+    flat_template = _unbank_state_dict(eval_model.state_dict(), h.num_layers)
+    deq_flat = dequantize_mixed(quant_result, quant_meta, flat_template)
+    head_dim = h.model_dim // h.num_heads
+    kv_dim = h.num_kv_heads * head_dim
+    hidden_dim = int(h.mlp_mult * h.model_dim)
+    deq_state = _rebank_state_dict(deq_flat, h.num_layers, h.model_dim, kv_dim, hidden_dim)
+    eval_model.load_state_dict(deq_state, strict=True)
+
+    # Configure the model for an autograd-friendly forward path.
+    if h.num_loops > 0:
+        eval_model.looping_active = True
+    eval_model.eval()  # MLP forward then takes the pure-PyTorch branch
+    for blk in eval_model.blocks:
+        blk.mlp.use_fused = False  # Defense-in-depth even if training=True
+
+    # Freeze every model parameter; we never write back to the model itself.
+    for p in eval_model.parameters():
+        p.requires_grad_(False)
+
+    # Identify the GPTQ-quantized bank weights and build STE wrappers for them.
+    n = h.num_layers
+    bank_suffixes = (
+        ".attn.c_q.weight",
+        ".attn.c_k.weight",
+        ".attn.c_v.weight",
+        ".attn.proj.weight",
+        ".mlp.fc.weight",
+        ".mlp.proj.weight",
+    )
+    bank_names = [
+        f"blocks.{i}{suf}" for i in range(n) for suf in bank_suffixes
+    ]
+    trainable_fp = {}
+    scales = {}
+    clip_ranges = {}
+    skipped = []
+    for name in bank_names:
+        info = quant_meta.get(name, "")
+        if "passthrough" in info or name + ".q" not in quant_result:
+            skipped.append(name)
+            continue
+        q = quant_result[name + ".q"]  # int8 in [-cr, cr]
+        s = quant_result[name + ".scale"]  # fp16, shape (rows,)
+        # int{bits}: clip_range from 2^(bits-1)-1
+        bits = h.matrix_bits  # bank weights are matrix_bits (not embed_bits)
+        cr = 2 ** (bits - 1) - 1
+        sf = s.float().to(device)
+        q_dev = q.to(device).float()
+        s_view = sf.view(q.shape[0], *[1] * (q.ndim - 1))
+        w_fp = (q_dev * s_view).clone().contiguous()
+        w_fp = nn.Parameter(w_fp, requires_grad=True)
+        trainable_fp[name] = w_fp
+        scales[name] = sf
+        clip_ranges[name] = cr
+    if skipped:
+        log(f"QAFT:skipped {len(skipped)} non-quantized bank slots: {skipped[:3]}{'...' if len(skipped) > 3 else ''}")
+    log(f"QAFT:trainable {len(trainable_fp)} weights ({sum(p.numel() for p in trainable_fp.values())/1e6:.1f}M float params)")
+
+    def ste_dequant(w_fp_tensor, scale_per_row, cr):
+        s_view = scale_per_row.view(w_fp_tensor.shape[0], *[1] * (w_fp_tensor.ndim - 1))
+        w_norm = w_fp_tensor / s_view
+        q_round = w_norm.round().clamp(-cr, cr)
+        # STE: forward = q_round*s, backward = identity through q_round
+        q_ste = w_norm + (q_round - w_norm).detach()
+        return (q_ste * s_view).to(torch.bfloat16)
+
+    bound_self = eval_model
+
+    def qaft_bank_weights(_self, i):
+        names = (
+            f"blocks.{i}.attn.c_q.weight",
+            f"blocks.{i}.attn.c_k.weight",
+            f"blocks.{i}.attn.c_v.weight",
+            f"blocks.{i}.attn.proj.weight",
+            f"blocks.{i}.mlp.fc.weight",
+            f"blocks.{i}.mlp.proj.weight",
+        )
+        # Order expected by callers: q_w, k_w, v_w, out_w, up_w, down_w
+        weights = []
+        for nm in names:
+            if nm in trainable_fp:
+                weights.append(ste_dequant(trainable_fp[nm], scales[nm], clip_ranges[nm]))
+            else:
+                # Fallback: read from the model's banked tensor at the original slot
+                if ".attn.c_q.weight" in nm:
+                    weights.append(bound_self.qo_bank[i])
+                elif ".attn.proj.weight" in nm:
+                    weights.append(bound_self.qo_bank[n + i])
+                elif ".attn.c_k.weight" in nm:
+                    weights.append(bound_self.kv_bank[i])
+                elif ".attn.c_v.weight" in nm:
+                    weights.append(bound_self.kv_bank[n + i])
+                elif ".mlp.fc.weight" in nm:
+                    weights.append(bound_self.mlp_up_bank[i])
+                elif ".mlp.proj.weight" in nm:
+                    weights.append(bound_self.mlp_down_bank[i])
+                else:
+                    raise RuntimeError(f"qaft: unexpected weight name {nm}")
+        return tuple(weights)
+
+    # Bind override of _bank_weights on this specific instance.
+    eval_model._bank_weights = qaft_bank_weights.__get__(eval_model, type(eval_model))
+
+    # Calibration loader (independent from the GPTQ Hessian collection).
+    # Use a small batch per step to bound peak memory.
+    qaft_loader = ShuffledSequenceLoader(h, device)
+    # We override seq_len if requested (default = train_seq_len)
+    qaft_loader.seq_len = h.qaft_seq_len
+    # Reset shards under the new seq_len so start_inds align.
+    for si in range(len(qaft_loader.files)):
+        qaft_loader._reset_shard(si)
+
+    # Build a global_tokens that yields qaft_batch_seqs_per_rank sequences per rank.
+    # ShuffledSequenceLoader: device_tokens = global_tokens // (world_size * grad_accum_steps)
+    # device_batch_size = device_tokens // self.seq_len
+    # We want device_batch_size == qaft_batch_seqs_per_rank, with grad_accum_steps=1.
+    qaft_global_tokens = (
+        h.qaft_batch_seqs_per_rank * h.world_size * h.qaft_seq_len
+    )
+
+    # Optimizer: Adam over the float-trainable wrappers.
+    optimizer = torch.optim.Adam(list(trainable_fp.values()), lr=h.qaft_lr)
+
+    losses = []
+    backward_ok = False
+    for step in range(h.qaft_steps):
+        x, y = qaft_loader.next_batch(qaft_global_tokens, 1)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss = eval_model(x, y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if h.qaft_clip_grad > 0:
+            torch.nn.utils.clip_grad_norm_(
+                list(trainable_fp.values()), h.qaft_clip_grad
+            )
+        if h.distributed:
+            # All-reduce gradients across ranks (manual since no DDP wrap here).
+            for p in trainable_fp.values():
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                    p.grad.mul_(1.0 / h.world_size)
+        optimizer.step()
+        backward_ok = True
+        losses.append(loss.item())
+        if (step + 1) % max(1, h.qaft_log_every) == 0 or step == 0 or step + 1 == h.qaft_steps:
+            log(f"QAFT:step {step+1}/{h.qaft_steps} loss={loss.item():.4f}")
+
+    # Final hard re-quantization back to int6 indices in quant_result.
+    n_updated = 0
+    with torch.no_grad():
+        for name, w_fp_param in trainable_fp.items():
+            w_fp = w_fp_param.data
+            sf = scales[name]
+            cr = clip_ranges[name]
+            s_view = sf.view(w_fp.shape[0], *[1] * (w_fp.ndim - 1))
+            q_new = (w_fp / s_view).round().clamp(-cr, cr).to(torch.int8).cpu()
+            quant_result[name + ".q"] = q_new
+            n_updated += 1
+
+    elapsed = time.perf_counter() - t_qaft
+    if losses:
+        log(
+            f"QAFT:done updated={n_updated} backward_ok={backward_ok} "
+            f"loss[0]={losses[0]:.4f} loss[-1]={losses[-1]:.4f} elapsed={elapsed:.1f}s"
+        )
+    else:
+        log(f"QAFT:done updated={n_updated} backward_ok={backward_ok} elapsed={elapsed:.1f}s (no steps)")
+
+    del eval_model, trainable_fp, optimizer, qaft_loader
+    torch.cuda.empty_cache()
+
+
 _BSHF_MAGIC = b"BSHF"
 
 
@@ -1925,6 +2121,12 @@ def serialize(h, base_model, code):
     )
     log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter()-t0:.1f}s")
     quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, h)
+    if h.qaft_enabled:
+        try:
+            qaft_finetune_quantized(h, quant_result, quant_meta, device)
+        except Exception as e:
+            log(f"QAFT:exception {type(e).__name__}: {e}")
+            raise
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
