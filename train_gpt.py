@@ -3343,7 +3343,9 @@ def train_and_eval(h, device):
     if h.ttt_enabled:
         if not ttt_eval_only:
             del compiled_model
-        del eval_model
+        else:
+            # eval_model wasn't deleted in the diagnostic-quantized path; clean it up here.
+            del eval_model
         torch._dynamo.reset()
         torch.cuda.empty_cache()
         ttt_model = deserialize(h, device)
