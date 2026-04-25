@@ -632,6 +632,43 @@ def _diff_attn_lambda_init(layer_idx: int) -> float:
     return float(0.8 - 0.6 * math.exp(-0.3 * float(layer_idx)))
 
 
+# Resolve SDPA backend selection at import time so the per-step path is
+# torch.compile-friendly (no try/except in the hot path).
+try:
+    from torch.nn.attention import sdpa_kernel as _sdpa_kernel
+    from torch.nn.attention import SDPBackend as _SDPBackend
+    _SDPA_BACKENDS = [
+        _SDPBackend.FLASH_ATTENTION,
+        _SDPBackend.EFFICIENT_ATTENTION,
+        _SDPBackend.MATH,
+    ]
+    _USE_NEW_SDPA_API = True
+except (ImportError, AttributeError):
+    _sdpa_kernel = None
+    _SDPBackend = None
+    _SDPA_BACKENDS = None
+    _USE_NEW_SDPA_API = False
+
+
+def _diff_attn_sdpa(q, k, v):
+    """Causal scaled-dot-product attention that picks a backend supported on H100.
+
+    The default SDPA dispatcher on H100 + bf16 + small head_dim (32 here, after
+    splitting head_dim=64 into two halves) can raise "RuntimeError: Invalid
+    backend" outside of a torch.autocast context (e.g. during GPTQ
+    calibration which runs in pure eager bf16 + no_grad). We explicitly allow
+    the FlashAttention, mem-efficient and math kernels and disable the cuDNN
+    kernel, which lets the dispatcher fall back to FlashAttention for d_half=32.
+    """
+    if _USE_NEW_SDPA_API:
+        with _sdpa_kernel(backends=_SDPA_BACKENDS):
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    with torch.backends.cuda.sdp_kernel(
+        enable_flash=True, enable_mem_efficient=True, enable_math=True, enable_cudnn=False
+    ):
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+
 def _diff_attention(q, k, v, attn_lambda, lambda_init, num_heads, num_kv_heads):
     """Differential causal attention with GQA, using two PyTorch SDPA calls.
 
@@ -670,8 +707,8 @@ def _diff_attention(q, k, v, attn_lambda, lambda_init, num_heads, num_kv_heads):
         k2 = k2.repeat_interleave(group, dim=1)
         v_t = v_t.repeat_interleave(group, dim=1)
     # Two causal attention maps; SDPA scales by 1/sqrt(d_half) internally.
-    out1 = F.scaled_dot_product_attention(q1, k1, v_t, is_causal=True)
-    out2 = F.scaled_dot_product_attention(q2, k2, v_t, is_causal=True)
+    out1 = _diff_attn_sdpa(q1, k1, v_t)
+    out2 = _diff_attn_sdpa(q2, k2, v_t)
     # Per-head differential subtraction
     lam = attn_lambda.to(dtype=out1.dtype).view(1, H, 1, 1)
     out = out1 - lam * out2  # [B, H, T, D]
