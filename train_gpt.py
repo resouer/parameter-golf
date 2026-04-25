@@ -445,6 +445,26 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+class DynamicTanh(nn.Module):
+    """alpha * tanh(beta * x). Drop-in replacement for RMSNorm.
+
+    From Zhu et al. "Transformers without Normalization", arXiv:2503.10622.
+    Per-channel learnable alpha and beta, no statistics, no rsqrt -- just one
+    elementwise tanh. Faster than RMSNorm and competitive in quality.
+    """
+
+    def __init__(self, dim: int, alpha_init: float = 1.0, beta_init: float = 0.5):
+        super().__init__()
+        self.dim = dim
+        self.alpha = nn.Parameter(torch.full((dim,), alpha_init, dtype=torch.float32))
+        self.beta = nn.Parameter(torch.full((dim,), beta_init, dtype=torch.float32))
+
+    def forward(self, x):
+        a = self.alpha.to(dtype=x.dtype)
+        b = self.beta.to(dtype=x.dtype)
+        return a * torch.tanh(b * x)
+
+
 class CastedLinear(nn.Linear):
     def forward(self, x):
         w = self.weight.to(x.dtype)
@@ -718,8 +738,8 @@ class Block(nn.Module):
         yarn=True,
     ):
         super().__init__()
-        self.attn_norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
+        self.attn_norm = DynamicTanh(dim)
+        self.mlp_norm = DynamicTanh(dim)
         self.attn = CausalSelfAttention(
             dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len, yarn=yarn
         )
@@ -793,7 +813,7 @@ class GPT(nn.Module):
                     rope_dims=h.rope_dims,
                     yarn=h.rope_yarn,
                 )
-        self.final_norm = RMSNorm()
+        self.final_norm = DynamicTanh(h.model_dim)
         self.lm_head = (
             None
             if h.tie_embeddings
