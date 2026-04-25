@@ -1,0 +1,46 @@
+{
+  "name": "SP8192 + Polar Express NS + MIN_LR + Tight GPTQ on PR #1790 stack",
+  "author": "resouer",
+  "github_id": "resouer",
+  "track": "track_10min_16mb",
+  "date": "2026-04-25",
+  "commit": "fb75c716619576f5175cc282875f8a2206d46bf5",
+  "val_bpb": 1.06891880,
+  "std_bpb": 0.00030627,
+  "seeds": {
+    "1337": 1.06887604,
+    "42": 1.06924420,
+    "2025": 1.06863616
+  },
+  "bytes_total": 15941018,
+  "seed_bytes": {
+    "1337": 15938246,
+    "42": 15941018,
+    "2025": 15938565
+  },
+  "nearest_prior_pr": "#1790",
+  "novelty": "Cross-stack combination: ports four mechanisms from PR #1792 (Polar Express NS coefficients from #1344, VAL_LOSS_EVERY=0, MIN_LR=0.10, GPTQ_RESERVE_SECONDS=1.5) onto PR #1790's stack (SP8192 + SmearGate + AttnOutGate(w24) + LoRA-TTT + Phased TTT). Polar Express NS replaces the single fixed (3.4445,-4.775,2.0315) Newton-Schulz tuple with 5 per-iteration minimax-optimal tuples in Muon's optimizer; MIN_LR=0.10 floors the warmdown LR; tight GPTQ_RESERVE=1.5s reclaims pre-quant budget while keeping enough cushion for stable serialization across nodes. No upstream PR has this combination on the #1790 stack.",
+  "compliance": {
+    "score_first_ttt": true,
+    "no_target_in_key_ngram": true,
+    "no_pre_quant_ttt_on_val": true,
+    "no_caseops": true,
+    "no_slot": true,
+    "tokenizer_unchanged": true,
+    "dataset_unchanged": true
+  },
+  "reproducibility": {
+    "cross_node_validated": true,
+    "cross_group_validated": true,
+    "seed_node_breakdown": {
+      "1337": {"node": "node-ip-10-0-120-106", "node_group": "gcp-iad-leptondev-002"},
+      "42":   {"node": "node-ip-10-0-112-30",  "node_group": "gcp-iad-leptondev-002"},
+      "2025": {"node": "node-ip-10-0-119-97",  "node_group": "training-dev-0"}
+    }
+  },
+  "credits": {
+    "pr_1790_base_stack": "miaoyuxun (SP8192 + SmearGate + AttnOutGate + LoRA-TTT + Phased TTT)",
+    "pr_1792_recipe": "ported VAL_LOSS_EVERY=0, MIN_LR=0.10, GPTQ_RESERVE tweaks",
+    "pr_1344_polar_express_ns": "orangekame3 et al. (5 per-iteration NS coefficients)"
+  }
+}
