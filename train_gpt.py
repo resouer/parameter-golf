@@ -2762,6 +2762,13 @@ def train_model(h, device, val_data):
         for (name, t) in base_model.state_dict().items()
     }
     ema_decay = h.ema_decay
+    # c-20260425-novelty-6: Dual-EMA weighted final blend
+    ema_state_fast = {
+        name: t.detach().float().clone()
+        for (name, t) in base_model.state_dict().items()
+    }
+    ema_decay_fast = 0.99
+    assert ema_state_fast.keys() == ema_state.keys()
     training_time_ms = 0.0
     stop_after_step = None
     torch.cuda.synchronize()
@@ -2808,8 +2815,13 @@ def train_model(h, device, val_data):
         train_loss = step_fn(step, scale)
         with torch.no_grad():
             for (name, t) in base_model.state_dict().items():
+                t_fp32 = t.detach().float()
                 ema_state[name].mul_(ema_decay).add_(
-                    t.detach().float(), alpha=1.0 - ema_decay
+                    t_fp32, alpha=1.0 - ema_decay
+                )
+                # c-20260425-novelty-6: Dual-EMA weighted final blend
+                ema_state_fast[name].mul_(ema_decay_fast).add_(
+                    t_fp32, alpha=1.0 - ema_decay_fast
                 )
         step += 1
         approx_training_time_ms = training_time_ms + 1e3 * (time.perf_counter() - t0)
@@ -2833,10 +2845,15 @@ def train_model(h, device, val_data):
     log(
         f"peak memory allocated: {torch.cuda.max_memory_allocated()//1024//1024} MiB reserved: {torch.cuda.max_memory_reserved()//1024//1024} MiB"
     )
-    log("ema:applying EMA weights")
+    # c-20260425-novelty-6: Dual-EMA weighted final blend
+    log("ema:applying DUAL EMA weights (slow=0.9965, fast=0.99, blend=0.5)")
     current_state = base_model.state_dict()
+    blended = {
+        name: 0.5 * ema_state[name] + 0.5 * ema_state_fast[name]
+        for name in ema_state
+    }
     avg_state = {
-        name: t.to(dtype=current_state[name].dtype) for (name, t) in ema_state.items()
+        name: t.to(dtype=current_state[name].dtype) for (name, t) in blended.items()
     }
     base_model.load_state_dict(avg_state, strict=True)
     return base_model, compiled_model, compiled_forward_logits
