@@ -632,41 +632,22 @@ def _diff_attn_lambda_init(layer_idx: int) -> float:
     return float(0.8 - 0.6 * math.exp(-0.3 * float(layer_idx)))
 
 
-# Resolve SDPA backend selection at import time so the per-step path is
-# torch.compile-friendly (no try/except in the hot path).
+# Disable the cuDNN SDPA backend globally at import time. The default dispatcher
+# on H100 + bf16 + small head_dim (32, after splitting head_dim=64 into two
+# halves for differential attention) can raise "RuntimeError: Invalid backend"
+# from cuDNN's selection path when called outside of torch.autocast (e.g.
+# during the GPTQ calibration phase which runs in pure eager bf16 + no_grad).
+# Disabling globally avoids inserting a per-call context manager that would
+# trigger torch.compile graph breaks and dramatically slow training.
 try:
-    from torch.nn.attention import sdpa_kernel as _sdpa_kernel
-    from torch.nn.attention import SDPBackend as _SDPBackend
-    _SDPA_BACKENDS = [
-        _SDPBackend.FLASH_ATTENTION,
-        _SDPBackend.EFFICIENT_ATTENTION,
-        _SDPBackend.MATH,
-    ]
-    _USE_NEW_SDPA_API = True
-except (ImportError, AttributeError):
-    _sdpa_kernel = None
-    _SDPBackend = None
-    _SDPA_BACKENDS = None
-    _USE_NEW_SDPA_API = False
+    torch.backends.cuda.enable_cudnn_sdp(False)
+except Exception:
+    pass
 
 
 def _diff_attn_sdpa(q, k, v):
-    """Causal scaled-dot-product attention that picks a backend supported on H100.
-
-    The default SDPA dispatcher on H100 + bf16 + small head_dim (32 here, after
-    splitting head_dim=64 into two halves) can raise "RuntimeError: Invalid
-    backend" outside of a torch.autocast context (e.g. during GPTQ
-    calibration which runs in pure eager bf16 + no_grad). We explicitly allow
-    the FlashAttention, mem-efficient and math kernels and disable the cuDNN
-    kernel, which lets the dispatcher fall back to FlashAttention for d_half=32.
-    """
-    if _USE_NEW_SDPA_API:
-        with _sdpa_kernel(backends=_SDPA_BACKENDS):
-            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
-    with torch.backends.cuda.sdp_kernel(
-        enable_flash=True, enable_mem_efficient=True, enable_math=True, enable_cudnn=False
-    ):
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    """Causal scaled-dot-product attention with cuDNN SDPA already disabled."""
+    return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
 
 def _diff_attention(q, k, v, attn_lambda, lambda_init, num_heads, num_kv_heads):
