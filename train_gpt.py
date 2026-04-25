@@ -645,62 +645,43 @@ except Exception:
     pass
 
 
+# Resolve the torch.nn.attention API once at module load.
+try:
+    from torch.nn.attention import sdpa_kernel as _SDPA_KERNEL
+    from torch.nn.attention import SDPBackend as _SDPB
+    _SDPA_BACKENDS_LIST = [
+        _SDPB.FLASH_ATTENTION,
+        _SDPB.EFFICIENT_ATTENTION,
+        _SDPB.MATH,
+    ]
+    _HAVE_SDP_KERNEL = True
+except (ImportError, AttributeError):
+    _SDPA_KERNEL = None
+    _SDPB = None
+    _SDPA_BACKENDS_LIST = None
+    _HAVE_SDP_KERNEL = False
+
+
 def _diff_attn_sdpa(q, k, v):
-    """Causal scaled-dot-product attention selecting non-cudnn backends.
+    """Causal SDPA that explicitly avoids the cuDNN backend everywhere.
 
-    During torch.compile / autocast training, the compiled graph already
-    selects FlashAttention (cuDNN was rejected once at trace time and the
-    decision is baked in). During pure eager inference (e.g. GPTQ
-    calibration), the dispatcher re-evaluates per call and may try cuDNN
-    SDPA again, which fails for d_half=32 + bf16. Using the public
-    SDPBackend context manager forces the dispatcher to skip cuDNN.
+    Both eager (GPTQ calibration) and torch.compile traces (training and
+    TTT eval) try to dispatch through cuDNN SDPA on H100 with bf16 + small
+    head_dim (32 here, after splitting head_dim=64 in two), which raises
+    "RuntimeError: Invalid backend". We unconditionally enter a no-cudnn
+    `sdpa_kernel` context. Recent torch (2.4+) handles this context
+    inside torch.compile via Dynamo without graph breaks.
     """
-    if torch.compiler.is_compiling():
-        # Inside torch.compile, the compiled graph has already picked a kernel
-        # at trace time. Adding a context manager here would only trigger a
-        # graph break, so we issue the call directly. cuDNN was disabled at
-        # module import, which is honoured during tracing.
+    if _HAVE_SDP_KERNEL:
+        with _SDPA_KERNEL(backends=_SDPA_BACKENDS_LIST):
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    with torch.backends.cuda.sdp_kernel(
+        enable_flash=True,
+        enable_mem_efficient=True,
+        enable_math=True,
+        enable_cudnn=False,
+    ):
         return F.scaled_dot_product_attention(q, k, v, is_causal=True)
-    # Eager path: explicitly disable cuDNN SDPA via context manager so the
-    # dispatcher chooses Flash / mem-efficient / math regardless of any
-    # external thread-local state changes.
-    with _SDP_KERNEL_CTX:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
-
-
-def _make_sdp_kernel_ctx():
-    """Build a no-cudnn SDPA context manager once at module import."""
-    try:
-        from torch.nn.attention import sdpa_kernel as _sdpa_kernel
-        from torch.nn.attention import SDPBackend as _SDPBackend
-        return _sdpa_kernel(
-            backends=[
-                _SDPBackend.FLASH_ATTENTION,
-                _SDPBackend.EFFICIENT_ATTENTION,
-                _SDPBackend.MATH,
-            ]
-        )
-    except (ImportError, AttributeError):
-        return torch.backends.cuda.sdp_kernel(
-            enable_flash=True,
-            enable_mem_efficient=True,
-            enable_math=True,
-            enable_cudnn=False,
-        )
-
-
-# Note: sdpa_kernel context managers are NOT reusable across enter/exit pairs
-# in some torch versions, so we build a fresh one per call via a helper.
-class _ReusableSDPCtx:
-    def __enter__(self):
-        self._inner = _make_sdp_kernel_ctx()
-        return self._inner.__enter__()
-
-    def __exit__(self, *args):
-        return self._inner.__exit__(*args)
-
-
-_SDP_KERNEL_CTX = _ReusableSDPCtx()
 
 
 def _diff_attention(q, k, v, attn_lambda, lambda_init, num_heads, num_kv_heads):
