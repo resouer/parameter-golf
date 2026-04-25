@@ -1772,6 +1772,12 @@ def qaft_finetune(quant_result, quant_meta, h, device, num_steps=50, lr=1e-5):
     deq_state = _rebank_state_dict(deq_flat, h.num_layers, h.model_dim, kv_dim, hidden_dim)
     eval_model.load_state_dict(deq_state, strict=True)
     eval_model.train()
+    # Disable the FusedLeakyReLUSquareMLP triton kernel: it requires more shared
+    # memory than H100 SMEM in this freshly-launched context (matches the workaround
+    # used by collect_hessians at line ~1576). Standard PyTorch autograd handles the
+    # non-fused path's backward correctly.
+    for blk in eval_model.blocks:
+        blk.mlp.use_fused = False
     trainable_names = ("tok_emb.weight", "qo_bank", "kv_bank", "mlp_up_bank", "mlp_down_bank")
     # Upgrade trainable params to fp32 for stable SGD; restore_fp32_params already
     # handled the banks but tok_emb.weight may still be bfloat16.
@@ -1787,8 +1793,11 @@ def qaft_finetune(quant_result, quant_meta, h, device, num_steps=50, lr=1e-5):
             p.requires_grad_(False)
     optimizer = torch.optim.SGD(qaft_params, lr=lr)
     calib_loader = ShuffledSequenceLoader(h, device)
+    # QAFT runs only on rank 0 with a fresh non-fused MLP path; reduce batch
+    # tokens by world_size to keep activation memory comfortable on a single H100.
+    qaft_global_tokens = max(h.train_batch_tokens // h.world_size, h.train_seq_len * h.grad_accum_steps)
     for step in range(num_steps):
-        x, y = calib_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
+        x, y = calib_loader.next_batch(qaft_global_tokens, h.grad_accum_steps)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
             loss = eval_model(x, y, cu_seqlens=None, max_seqlen=0)
         loss.backward()
