@@ -2376,8 +2376,10 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train, quan
         prev_b = phase_boundaries[pi - 1] if pi > 0 else 0
         cur_b = phase_boundaries[pi]
         total_chunks = 0
-        for _, doc_len in doc_entries[prev_b:cur_b]:
-            pl = max(0, doc_len - 1)
+        # doc_entries items are (orig_idx, (doc_start, doc_len)).
+        for _, doc_tuple in doc_entries[prev_b:cur_b]:
+            doc_len = doc_tuple[1] if isinstance(doc_tuple, tuple) else int(doc_tuple)
+            pl = max(0, int(doc_len) - 1)
             total_chunks += (pl + chunk_size - 1) // chunk_size
         # Distribute roughly evenly across ranks; per-rank budget for phase progress.
         per_rank = total_chunks // max(int(h.world_size), 1)
