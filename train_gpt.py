@@ -11,6 +11,8 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+# c-20260425-novelty-7: QAFT — post-GPTQ STE-based fine-tune of quantized weights
+
 
 class Hyperparameters:
     data_dir = os.environ.get("DATA_DIR", "./data/")
@@ -1747,6 +1749,81 @@ def gptq_mixed_quantize(state_dict, hessians, h):
     return result, meta
 
 
+def qaft_finetune(quant_result, quant_meta, h, device, num_steps=50, lr=1e-5):
+    """Quantization-Aware Fine-Tune (QAFT) — post-GPTQ STE pass.
+
+    Loads `quant_result` (GPTQ output) into a temporary eval_model on rank 0, runs
+    `num_steps` SGD steps over training calibration batches with the dequantized
+    weights as continuous parameters, then re-quantizes each weight to its original
+    int-bucket using the SAME GPTQ scales. Net storage cost is zero (same int8
+    storage, same scales) — only bucket assignments change. Other ranks no-op.
+    """
+    if not h.is_main_process:
+        return quant_result
+    log(f"qaft: starting num_steps={num_steps} lr={lr}")
+    t_start = time.perf_counter()
+    eval_model = GPT(h).to(device).bfloat16()
+    restore_fp32_params(eval_model)
+    flat_template = _unbank_state_dict(eval_model.state_dict(), h.num_layers)
+    deq_flat = dequantize_mixed(quant_result, quant_meta, flat_template)
+    head_dim = h.model_dim // h.num_heads
+    kv_dim = h.num_kv_heads * head_dim
+    hidden_dim = int(h.mlp_mult * h.model_dim)
+    deq_state = _rebank_state_dict(deq_flat, h.num_layers, h.model_dim, kv_dim, hidden_dim)
+    eval_model.load_state_dict(deq_state, strict=True)
+    eval_model.train()
+    trainable_names = ("tok_emb.weight", "qo_bank", "kv_bank", "mlp_up_bank", "mlp_down_bank")
+    # Upgrade trainable params to fp32 for stable SGD; restore_fp32_params already
+    # handled the banks but tok_emb.weight may still be bfloat16.
+    for name, p in eval_model.named_parameters():
+        if name in trainable_names and p.dtype != torch.float32:
+            p.data = p.data.float()
+    qaft_params = []
+    for name, p in eval_model.named_parameters():
+        if name in trainable_names:
+            p.requires_grad_(True)
+            qaft_params.append(p)
+        else:
+            p.requires_grad_(False)
+    optimizer = torch.optim.SGD(qaft_params, lr=lr)
+    calib_loader = ShuffledSequenceLoader(h, device)
+    for step in range(num_steps):
+        x, y = calib_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            loss = eval_model(x, y, cu_seqlens=None, max_seqlen=0)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        log(f"qaft: step={step+1}/{num_steps} loss={loss.item():.4f}")
+    # Re-quantize using the SAME GPTQ scales — preserves byte count exactly.
+    eval_model.eval()
+    with torch.no_grad():
+        flat_sd_new = _unbank_state_dict(eval_model.state_dict(), h.num_layers)
+        n_repacked = 0
+        for name in list(quant_result.keys()):
+            if not name.endswith(".q"):
+                continue
+            base_name = name[:-2]
+            info = quant_meta.get(base_name, "")
+            if "gptq" not in info:
+                continue
+            bits = h.embed_bits if "tok_emb" in base_name else h.matrix_bits
+            clip_range = 2 ** (bits - 1) - 1
+            w_new = flat_sd_new[base_name].detach().float().cpu()
+            s = quant_result[base_name + ".scale"].float()
+            sf = s.view(w_new.shape[0], *[1] * (w_new.ndim - 1))
+            q_new = torch.clamp(torch.round(w_new / sf), -clip_range, clip_range).to(torch.int8)
+            assert q_new.shape == quant_result[name].shape, (
+                f"qaft: shape mismatch on {base_name}: {q_new.shape} vs {quant_result[name].shape}"
+            )
+            quant_result[name] = q_new
+            n_repacked += 1
+    log(f"qaft: re-quantized {n_repacked} layers in {time.perf_counter()-t_start:.1f}s")
+    del eval_model
+    torch.cuda.empty_cache()
+    return quant_result
+
+
 def dequantize_mixed(result, meta, template_sd):
     out = {}
     for (name, orig) in template_sd.items():
@@ -1925,6 +2002,7 @@ def serialize(h, base_model, code):
     )
     log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter()-t0:.1f}s")
     quant_result, quant_meta = gptq_mixed_quantize(sd_cpu, hessians, h)
+    quant_result = qaft_finetune(quant_result, quant_meta, h, device)
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
