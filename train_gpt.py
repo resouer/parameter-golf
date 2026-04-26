@@ -62,6 +62,9 @@ class Hyperparameters:
     )
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     muon_row_normalize = bool(int(os.environ.get("MUON_ROW_NORMALIZE", "1")))
+    lookahead_enabled = bool(int(os.environ.get("LOOKAHEAD_ENABLED", "1")))
+    lookahead_k = int(os.environ.get("LOOKAHEAD_K", 5))
+    lookahead_alpha = float(os.environ.get("LOOKAHEAD_ALPHA", 0.5))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-08))
@@ -2641,6 +2644,19 @@ def train_model(h, device, val_data):
     model = compiled_model
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
     optimizers = Optimizers(h, base_model)
+    # Lookahead-Muon: maintain slow weights for Muon-managed matrix params only.
+    # After every K fast Muon steps, blend slow weights toward fast then sync fast = slow.
+    # Reference: Zhang et al. 2019, "Lookahead Optimizer: k steps forward, 1 step back"
+    lookahead_slow_weights = {}
+    if h.lookahead_enabled:
+        for group in optimizers.optimizer_muon.param_groups:
+            for p in group["params"]:
+                lookahead_slow_weights[id(p)] = p.data.detach().clone()
+        log(
+            f"lookahead:enabled k={h.lookahead_k} alpha={h.lookahead_alpha} "
+            f"params={len(lookahead_slow_weights)}"
+        )
+    lookahead_sync_count = [0]
     train_loader = DocumentPackingLoader(h, device)
     max_wallclock_ms = (
         1e3 * h.max_wallclock_seconds if h.max_wallclock_seconds > 0 else None
@@ -2691,6 +2707,18 @@ def train_model(h, device, val_data):
         if h.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), h.grad_clip_norm)
         optimizers.step(distributed=h.distributed)
+        # Lookahead-Muon sync: every K fast steps, blend slow toward fast then snap fast to slow.
+        # Applied ONLY to Muon (matrix) params; scalar Adam params are untouched.
+        if h.lookahead_enabled and (step + 1) % h.lookahead_k == 0:
+            with torch.no_grad():
+                for group in optimizers.optimizer_muon.param_groups:
+                    for p in group["params"]:
+                        slow = lookahead_slow_weights[id(p)]
+                        # phi <- phi + alpha * (theta - phi)
+                        slow.add_(p.data - slow, alpha=h.lookahead_alpha)
+                        # theta <- phi
+                        p.data.copy_(slow)
+            lookahead_sync_count[0] += 1
         return train_loss
 
     if h.warmup_steps > 0:
@@ -2756,6 +2784,15 @@ def train_model(h, device, val_data):
         for (opt, state) in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         optimizers.zero_grad_all()
+        # Lookahead-Muon: reset slow weights after warmup unwinds the model to initial state.
+        # During warmup, sync may have fired and mutated slow_weights; we must re-clone
+        # the freshly-reset fast weights so phi == theta at the start of real training.
+        if h.lookahead_enabled:
+            for group in optimizers.optimizer_muon.param_groups:
+                for p in group["params"]:
+                    lookahead_slow_weights[id(p)].copy_(p.data.detach())
+            lookahead_sync_count[0] = 0
+            log("lookahead:slow_weights reset post-warmup")
         train_loader = DocumentPackingLoader(h, device)
     ema_state = {
         name: t.detach().float().clone()
@@ -2821,6 +2858,22 @@ def train_model(h, device, val_data):
             log(
                 f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}"
             )
+        # Lookahead diagnostic: every 1000 steps, log max|theta - phi| as drift sanity check.
+        if h.lookahead_enabled and lookahead_slow_weights and step % 1000 == 0 and h.is_main_process:
+            with torch.no_grad():
+                max_dist = 0.0
+                for group in optimizers.optimizer_muon.param_groups:
+                    for p in group["params"]:
+                        d = (p.data - lookahead_slow_weights[id(p)]).abs().max().item()
+                        if d > max_dist:
+                            max_dist = d
+            log(
+                f"LOOKAHEAD:step {step} max|theta-phi|={max_dist:.6f} sync_count={lookahead_sync_count[0]}"
+            )
+            if max_dist > 5.0:
+                raise RuntimeError(
+                    f"lookahead_runaway: max|theta-phi|={max_dist:.4f} at step {step}"
+                )
         reached_cap = (
             max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         )
