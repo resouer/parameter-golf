@@ -84,6 +84,12 @@ class Hyperparameters:
     ttt_k_lora = bool(int(os.environ.get("TTT_K_LORA", "1")))
     ttt_mlp_lora = bool(int(os.environ.get("TTT_MLP_LORA", "1")))
     ttt_o_lora = bool(int(os.environ.get("TTT_O_LORA", "1")))
+    # Novelty-17: TokEmbLoRA-TTT — adapt a per-doc rank-r LoRA on the input
+    # token embedding during phased TTT. Lives only inside BatchedTTTLoRA at
+    # eval time (NOT a model parameter), so adds zero to artifact size.
+    ttt_tokemb_lora = bool(int(os.environ.get("TTT_TOKEMB_LORA", "1")))
+    ttt_tokemb_rank = int(os.environ.get("TTT_TOKEMB_RANK", 1))
+    ttt_tokemb_init_std = float(os.environ.get("TTT_TOKEMB_INIT_STD", 1e-3))
     ttt_optimizer = os.environ.get("TTT_OPTIMIZER", "adam")
     ttt_eval_batches = os.environ.get("TTT_EVAL_BATCHES", "")
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
@@ -1002,6 +1008,13 @@ class GPT(nn.Module):
 
     def forward_ttt(self, input_ids, target_ids, lora):
         x = self.tok_emb(input_ids)
+        # Novelty-17: input-side TokEmbLoRA correction. Initial B=0 means the
+        # added term is zero on the first forward; once the per-doc TTT
+        # optimizer takes a step, this lets the model learn a per-doc
+        # correction to the embedding manifold before any downstream ops
+        # (smear / norm / blocks) consume it.
+        if lora.tok_emb_lora is not None:
+            x = x + lora.tok_emb_lora(input_ids).to(dtype=x.dtype)
         if self.smear_gate_enabled and x.dim() == 3 and x.size(1) > 1:
             sl = self.smear_lambda.to(dtype=x.dtype)
             g = sl * torch.sigmoid(self.smear_gate(x[:, 1:, :self.smear_width]))
@@ -1197,8 +1210,47 @@ class BatchedLinearLoRA(nn.Module):
         return ((x @ self.A.transpose(1, 2)) @ self.B.transpose(1, 2)) * self._scale
 
 
+class BatchedEmbeddingLoRA(nn.Module):
+    """Per-doc LoRA on the input token embedding for phased TTT.
+
+    Stores per-doc factors (A:[bsz, vocab, rank], B:[bsz, rank, dim]). Initial
+    forward output is zero (B=0), so the corrected embedding equals the base
+    embedding before any TTT optimization step. Adapted by the same optimizer
+    that drives the rest of the per-doc TTT LoRAs (q/k/v/o/mlp/lm_head).
+    """
+
+    def __init__(self, bsz, vocab_size, dim, rank, init_std=1e-3):
+        super().__init__()
+        self.bsz = bsz
+        self.vocab_size = vocab_size
+        self.rank = rank
+        self._init_std = init_std
+        # A: per-doc, per-token-id row -> rank-dim feature.
+        self.A = nn.Parameter(torch.randn(bsz, vocab_size, rank) * init_std)
+        # B: per-doc projection from rank back to model_dim. Init zero so the
+        # initial correction is identically zero for any input ids.
+        self.B = nn.Parameter(torch.zeros(bsz, rank, dim))
+
+    def reset(self):
+        with torch.no_grad():
+            self.A.normal_(0.0, self._init_std)
+            self.B.zero_()
+
+    def forward(self, input_ids):
+        # input_ids: [bsz, seqlen] (int64). For each batch row b we want
+        # (A[b][input_ids[b]] @ B[b]). We achieve this with torch.gather along
+        # the vocab dim of A so the per-doc parameter dimension stays explicit
+        # and there is no for-loop over the batch.
+        bsz, seqlen = input_ids.shape
+        idx = input_ids.to(torch.int64).unsqueeze(-1).expand(bsz, seqlen, self.rank)
+        # gather along vocab dim (dim=1) -> [bsz, seqlen, rank]
+        a_rows = torch.gather(self.A, 1, idx)
+        return a_rows @ self.B  # -> [bsz, seqlen, dim]
+
+
 class BatchedTTTLoRA(nn.Module):
-    def __init__(self, bsz, model, rank, k_lora=True, mlp_lora=True, o_lora=True):
+    def __init__(self, bsz, model, rank, k_lora=True, mlp_lora=True, o_lora=True,
+                 tokemb_lora=False, tokemb_rank=1, tokemb_init_std=1e-3):
         super().__init__()
         self.bsz = bsz
         dim = model.qo_bank.shape[-1]
@@ -1212,6 +1264,15 @@ class BatchedTTTLoRA(nn.Module):
         )
         embed_dim = model.tok_emb.embedding_dim
         self.lm_head_lora = BatchedLinearLoRA(bsz, embed_dim, vocab, rank)
+        # Novelty-17: per-doc input-side embedding LoRA. Initial output is zero
+        # (B init zero), so behavior matches the existing TTT stack until the
+        # first optimizer step, after which gradient flows through tok_emb +
+        # correction. Adds zero artifact bytes (eval-time only).
+        self.tok_emb_lora = (
+            BatchedEmbeddingLoRA(bsz, vocab, embed_dim, tokemb_rank, tokemb_init_std)
+            if tokemb_lora
+            else None
+        )
         self.q_loras = nn.ModuleList(
             [BatchedLinearLoRA(bsz, dim, dim, rank) for _ in range(num_slots)]
         )
@@ -1243,6 +1304,8 @@ class BatchedTTTLoRA(nn.Module):
     def reset(self):
         with torch.no_grad():
             self.lm_head_lora.reset()
+            if self.tok_emb_lora is not None:
+                self.tok_emb_lora.reset()
             for loras in [self.q_loras, self.v_loras, self.k_loras,
                           self.mlp_loras, self.o_loras]:
                 if loras is not None:
@@ -2397,6 +2460,8 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
     reusable_lora = BatchedTTTLoRA(
         h.ttt_batch_size, base_model, h.ttt_lora_rank,
         k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
+        tokemb_lora=h.ttt_tokemb_lora, tokemb_rank=h.ttt_tokemb_rank,
+        tokemb_init_std=h.ttt_tokemb_init_std,
     ).to(device)
 
     def _build_opt(lora):
@@ -2439,6 +2504,8 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
             cur_lora = BatchedTTTLoRA(
                 bsz, base_model, h.ttt_lora_rank,
                 k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
+                tokemb_lora=h.ttt_tokemb_lora, tokemb_rank=h.ttt_tokemb_rank,
+                tokemb_init_std=h.ttt_tokemb_init_std,
             ).to(device)
             cur_opt = _build_opt(cur_lora)
         pred_lens = [doc_len - 1 for _, doc_len in batch]
@@ -2533,6 +2600,13 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 f"rl:{r_loss:.4f} rb:{r_bpb:.4f} dl:{min(doc_lens)}-{max(doc_lens)} "
                 f"gd:{int(global_ttt_done)}"
             )
+            # Novelty-17: log TokEmbLoRA norms so we can verify the per-doc
+            # input-side LoRA is actually being adapted by the TTT optimizer.
+            if cur_lora.tok_emb_lora is not None and (batch_num % 20 == 0):
+                with torch.no_grad():
+                    a_n = cur_lora.tok_emb_lora.A.norm().item()
+                    b_n = cur_lora.tok_emb_lora.B.norm().item()
+                log(f"tokemb_lora: b{batch_num} a_norm:{a_n:.4f} b_norm:{b_n:.4f}")
         if not global_ttt_done:
             local_scored_docs.extend(
                 (orig_batch_idx, pos, doc_start, doc_len)
@@ -2590,6 +2664,8 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 reusable_lora = BatchedTTTLoRA(
                     h.ttt_batch_size, base_model, h.ttt_lora_rank,
                     k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
+                    tokemb_lora=h.ttt_tokemb_lora, tokemb_rank=h.ttt_tokemb_rank,
+                    tokemb_init_std=h.ttt_tokemb_init_std,
                 ).to(device)
                 reusable_opt = _build_opt(reusable_lora)
                 current_phase += 1
@@ -2939,6 +3015,8 @@ def train_and_eval(h, device):
             wl = BatchedTTTLoRA(
                 bsz, ttt_model, h.ttt_lora_rank,
                 k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
+                tokemb_lora=h.ttt_tokemb_lora, tokemb_rank=h.ttt_tokemb_rank,
+                tokemb_init_std=h.ttt_tokemb_init_std,
             ).to(device)
             wo = torch.optim.AdamW(
                 wl.parameters(),
