@@ -112,6 +112,9 @@ class Hyperparameters:
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 15.0))
     mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 12.0))
     attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
+    gni_enabled = bool(int(os.environ.get("GNI_ENABLED", "1")))
+    gni_eta = float(os.environ.get("GNI_ETA", 0.01))
+    gni_gamma = float(os.environ.get("GNI_GAMMA", 0.55))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -2690,6 +2693,21 @@ def train_model(h, device, val_data):
                 group["lr"] = group["base_lr"] * lr_scale
         if h.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), h.grad_clip_norm)
+        if h.gni_enabled:
+            # Neelakantan et al. 2015 (arXiv:1511.06807): annealed Gaussian noise
+            # added to gradients improves learning for very deep networks.
+            # sigma_t = sqrt(eta / (1 + t)^gamma); applied only to Muon matrix grads.
+            # Each rank injects independent noise; in distributed mode reduce-scatter
+            # then averages by world_size, so effective noise std is sigma/sqrt(WS).
+            gni_sigma = (h.gni_eta / (1.0 + step) ** h.gni_gamma) ** 0.5
+            with torch.no_grad():
+                for group in optimizers.optimizer_muon.param_groups:
+                    for p in group["params"]:
+                        if p.grad is None:
+                            continue
+                        p.grad.add_(torch.randn_like(p.grad) * gni_sigma)
+            if h.is_main_process and (step <= 5 or step % 500 == 0):
+                log(f"GNI:step {step} sigma={gni_sigma:.6f}")
         optimizers.step(distributed=h.distributed)
         return train_loss
 
