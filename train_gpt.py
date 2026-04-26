@@ -108,6 +108,11 @@ class Hyperparameters:
     global_ttt_respect_doc_boundaries = bool(int(os.environ.get("GLOBAL_TTT_RESPECT_DOC_BOUNDARIES", "1")))
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
     embed_bits = int(os.environ.get("EMBED_BITS", 7))
+    mtp_enabled = bool(int(os.environ.get("MTP_ENABLED", "1")))
+    mtp_k = int(os.environ.get("MTP_K", 2))
+    mtp_beta = float(os.environ.get("MTP_BETA", 0.1))
+    mtp_rank = int(os.environ.get("MTP_RANK", 128))
+    mtp_stride = int(os.environ.get("MTP_STRIDE", 2))
     matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 15.0))
     mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 12.0))
@@ -850,6 +855,15 @@ class GPT(nn.Module):
             self.smear_gate = CastedLinear(self.smear_width, 1, bias=False)
             nn.init.zeros_(self.smear_gate.weight)
             self.smear_lambda = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        self.mtp_enabled = bool(getattr(h, "mtp_enabled", False))
+        self.mtp_k = int(getattr(h, "mtp_k", 2))
+        self.mtp_beta = float(getattr(h, "mtp_beta", 0.1))
+        self.mtp_stride = max(1, int(getattr(h, "mtp_stride", 2)))
+        if self.mtp_enabled:
+            mtp_rank = int(getattr(h, "mtp_rank", 128))
+            self.mtp_proj_down = CastedLinear(h.model_dim, mtp_rank, bias=False)
+            self.mtp_proj_up = CastedLinear(mtp_rank, h.model_dim, bias=False)
+            self.mtp_proj_up._zero_init = True
         self._init_weights()
 
     def _init_weights(self):
@@ -922,7 +936,7 @@ class GPT(nn.Module):
             return lane0
         return 0.5 * (lane0 + lane1)
 
-    def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
+    def _forward_to_hidden(self, input_ids, cu_seqlens=None, max_seqlen=0):
         x = self.tok_emb(input_ids)
         if self.smear_gate_enabled and x.dim() == 3 and x.size(1) > 1:
             sl = self.smear_lambda.to(dtype=x.dtype)
@@ -984,21 +998,54 @@ class GPT(nn.Module):
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
+        return x
+
+    def _project_logits(self, x):
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
+    def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
+        x = self._forward_to_hidden(input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        return self._project_logits(x)
+
     def forward(self, input_ids, target_ids, cu_seqlens=None, max_seqlen=0):
-        logits = self.forward_logits(
+        x = self._forward_to_hidden(
             input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
         )
-        return F.cross_entropy(
+        logits = self._project_logits(x)
+        main_loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)).float(),
             target_ids.reshape(-1),
             reduction="mean",
         )
+        if not (self.mtp_enabled and self.training and self.mtp_k > 1 and self.mtp_beta > 0.0):
+            return main_loss
+        # Multi-token prediction auxiliary head: predict token at pos t+K from final hidden state at pos t.
+        # target_ids[i] is token at pos t+1 of input_ids[i], so MTP target at K=k is target_ids[i + (k-1)].
+        # We truncate the last (k-1) positions where the t+K target would lie outside the batch.
+        # mtp_stride subsamples positions to keep training overhead small (every Nth token).
+        shift = self.mtp_k - 1
+        stride = self.mtp_stride
+        if x.size(1) <= shift:
+            return main_loss
+        x_sub = x[:, :x.size(1) - shift:stride, :]
+        aux_targets = target_ids[:, shift::stride]
+        # Align lengths in case truncation rules differ by one position.
+        n = min(x_sub.size(1), aux_targets.size(1))
+        x_sub = x_sub[:, :n, :]
+        aux_targets = aux_targets[:, :n]
+        h_aux = self.mtp_proj_up(self.mtp_proj_down(x_sub))
+        aux_logits_proj = F.linear(h_aux, self.tok_emb.weight)
+        aux_logits = self.logit_softcap * torch.tanh(aux_logits_proj / self.logit_softcap)
+        aux_loss = F.cross_entropy(
+            aux_logits.reshape(-1, aux_logits.size(-1)).float(),
+            aux_targets.reshape(-1),
+            reduction="mean",
+        )
+        return main_loss + self.mtp_beta * aux_loss
 
     def forward_ttt(self, input_ids, target_ids, lora):
         x = self.tok_emb(input_ids)
@@ -1440,6 +1487,9 @@ class Optimizers:
             base_model.mlp_up_bank,
             base_model.mlp_down_bank,
         ]
+        if getattr(base_model, "mtp_enabled", False):
+            matrix_params.append(base_model.mtp_proj_down.weight)
+            matrix_params.append(base_model.mtp_proj_up.weight)
         block_named_params = list(base_model.blocks.named_parameters())
         scalar_params = [
             p
