@@ -70,6 +70,12 @@ class Hyperparameters:
     adam_wd = float(os.environ.get("ADAM_WD", 0.02))
     muon_wd = float(os.environ.get("MUON_WD", 0.095))
     embed_wd = float(os.environ.get("EMBED_WD", 0.085))
+    # SAM-Muon: sharpness-aware minimization wrapping Muon (Foret et al. 2021).
+    # Apply only to matrix params (Muon optimizer); scalar/embedding params untouched.
+    sam_enabled = bool(int(os.environ.get("SAM_ENABLED", "1")))
+    sam_rho = float(os.environ.get("SAM_RHO", 0.05))
+    sam_every_k_steps = int(os.environ.get("SAM_EVERY_K_STEPS", 4))
+    sam_log_every = int(os.environ.get("SAM_LOG_EVERY", 100))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 128))
@@ -2663,18 +2669,106 @@ def train_model(h, device, val_data):
             return max((1.0 - frac) / h.warmdown_frac, h.min_lr)
         return 1.0
 
+    matrix_params_for_sam = [
+        base_model.qo_bank,
+        base_model.kv_bank,
+        base_model.mlp_up_bank,
+        base_model.mlp_down_bank,
+    ]
+
     def step_fn(step, lr_scale):
+        sam_active = (
+            h.sam_enabled
+            and h.sam_every_k_steps > 0
+            and step % h.sam_every_k_steps == 0
+        )
         optimizers.zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        cached_batches = [] if sam_active else None
         for micro_step in range(h.grad_accum_steps):
             x, y, cu_seqlens, _max_seqlen = train_loader.next_batch(
                 h.train_batch_tokens, h.grad_accum_steps
             )
+            if sam_active:
+                cached_batches.append((x, y, cu_seqlens))
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y, cu_seqlens=cu_seqlens, max_seqlen=h.train_seq_len)
             train_loss += loss.detach()
             (loss / h.grad_accum_steps).backward()
         train_loss /= h.grad_accum_steps
+        sam_loss_delta = None
+        if sam_active:
+            # SAM (Foret et al. 2021) on Muon's matrix params only:
+            # 1) all-reduce gradients across ranks so the perturbation is identical
+            #    on every rank (matrix params are replicated; reduce_scatter would
+            #    only run inside Muon's step which we have not called yet).
+            if h.distributed:
+                handles = [
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True)
+                    for p in matrix_params_for_sam
+                    if p.grad is not None
+                ]
+                for handle in handles:
+                    handle.wait()
+            # 2) compute global grad norm of just the matrix params.
+            with torch.no_grad():
+                gnorm_sq = torch.zeros((), device=device, dtype=torch.float32)
+                for p in matrix_params_for_sam:
+                    if p.grad is not None:
+                        gnorm_sq = gnorm_sq + p.grad.float().pow(2).sum()
+                gnorm = gnorm_sq.sqrt()
+                gnorm_val = gnorm.item()
+            if gnorm_val > 1e-12:
+                # 3) perturb weights: w_adv = w + rho * g / ||g||  (in-place; cache
+                # the perturbation vector so we can subtract it back later — no need
+                # to clone the full param tensor).
+                scale = h.sam_rho / (gnorm_val + 1e-12)
+                perturbations = []
+                with torch.no_grad():
+                    for p in matrix_params_for_sam:
+                        if p.grad is None:
+                            perturbations.append(None)
+                            continue
+                        # Clone-then-cast: avoid aliasing p.grad's storage. Always
+                        # produces a fresh tensor we can later subtract to restore.
+                        delta = p.grad.detach().clone().to(p.data.dtype)
+                        delta.mul_(scale)
+                        p.data.add_(delta)
+                        perturbations.append(delta)
+                # 4) zero grads from the first pass, then recompute grads at the
+                # perturbed weights using the SAME cached batches.
+                optimizers.zero_grad_all()
+                sam_loss = torch.zeros((), device=device)
+                for (x2, y2, cu2) in cached_batches:
+                    with torch.autocast(
+                        device_type="cuda", dtype=torch.bfloat16, enabled=True
+                    ):
+                        loss2 = model(
+                            x2, y2, cu_seqlens=cu2, max_seqlen=h.train_seq_len
+                        )
+                    sam_loss += loss2.detach()
+                    (loss2 / h.grad_accum_steps).backward()
+                sam_loss /= h.grad_accum_steps
+                sam_loss_delta = (sam_loss - train_loss).item()
+                # 5) restore weights: w_adv -> w by subtracting cached deltas.
+                with torch.no_grad():
+                    for p, delta in zip(matrix_params_for_sam, perturbations):
+                        if delta is not None:
+                            p.data.sub_(delta)
+                if (
+                    h.is_main_process
+                    and h.sam_log_every > 0
+                    and step % h.sam_log_every == 0
+                ):
+                    log(
+                        f"sam: step {step} grad_norm={gnorm_val:.4f}"
+                        f" rho={h.sam_rho} loss_delta={sam_loss_delta:.4f}"
+                    )
+            else:
+                # gradient was effectively zero — fall through with the original
+                # gradients still in place (we never zeroed them this branch).
+                if h.is_main_process and h.sam_log_every > 0 and step % h.sam_log_every == 0:
+                    log(f"sam: step {step} skipped (grad_norm={gnorm_val:.2e})")
         frac = (
             min(step / h.muon_momentum_warmup_steps, 1.0)
             if h.muon_momentum_warmup_steps > 0
