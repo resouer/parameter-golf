@@ -1461,11 +1461,31 @@ class Optimizers:
             base_model.mlp_down_bank,
         ]
         block_named_params = list(base_model.blocks.named_parameters())
+        # DyT alpha/beta are pre-norm scale/slope params; weight decay would
+        # destroy them (0.02 wd at scalar_lr=0.02 -> ~0.135x after 5k steps).
+        # Route them to a no-decay group, both inside blocks and at final_norm.
+        dyt_param_ids = set()
+        dyt_params = []
+        for name, p in block_named_params:
+            if (".attn_norm." in name or ".mlp_norm." in name) and (
+                name.endswith(".alpha") or name.endswith(".beta")
+            ):
+                dyt_params.append(p)
+                dyt_param_ids.add(id(p))
+        # final_norm is on base_model, not inside blocks: include it explicitly
+        if isinstance(base_model.final_norm, DynamicTanh):
+            dyt_params.append(base_model.final_norm.alpha)
+            dyt_params.append(base_model.final_norm.beta)
+            dyt_param_ids.add(id(base_model.final_norm.alpha))
+            dyt_param_ids.add(id(base_model.final_norm.beta))
         scalar_params = [
             p
             for (name, p) in block_named_params
-            if p.ndim < 2
-            or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if (
+                p.ndim < 2
+                or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            )
+            and id(p) not in dyt_param_ids
         ]
         if base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
@@ -1499,8 +1519,20 @@ class Optimizers:
         )
         for group in self.optimizer_muon.param_groups:
             group["base_lr"] = h.matrix_lr
+        scalar_param_groups = [
+            {"params": scalar_params, "lr": h.scalar_lr, "base_lr": h.scalar_lr}
+        ]
+        if dyt_params:
+            scalar_param_groups.append(
+                {
+                    "params": dyt_params,
+                    "lr": h.scalar_lr,
+                    "base_lr": h.scalar_lr,
+                    "weight_decay": 0.0,
+                }
+            )
         self.optimizer_scalar = torch.optim.AdamW(
-            [{"params": scalar_params, "lr": h.scalar_lr, "base_lr": h.scalar_lr}],
+            scalar_param_groups,
             betas=(h.beta1, h.beta2),
             eps=h.adam_eps,
             weight_decay=h.adam_wd,
@@ -1513,6 +1545,8 @@ class Optimizers:
         ]
         self.replicated_params = list(tok_params[0]["params"])
         self.replicated_params.extend(scalar_params)
+        # DyT alpha/beta also need cross-rank gradient sync (separate group for no-decay).
+        self.replicated_params.extend(dyt_params)
         self.replicated_large_params = []
         self.replicated_packed_params = []
         for p in self.replicated_params:
