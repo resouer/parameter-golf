@@ -2719,22 +2719,22 @@ def train_model(h, device, val_data):
                 gnorm = gnorm_sq.sqrt()
                 gnorm_val = gnorm.item()
             if gnorm_val > 1e-12:
-                # 3) perturb weights: w_adv = w + rho * g / ||g||  (in-place; cache
-                # the perturbation vector so we can subtract it back later — no need
-                # to clone the full param tensor).
+                # 3) perturb weights: w_adv = w + rho * g / ||g||
+                # We snapshot the ORIGINAL weights (fp32 clone) so we can do an
+                # exact `copy_(orig)` restore later — `add(delta)` then `sub(delta)`
+                # is NOT bit-exact in fp32, and we want zero per-step drift across
+                # thousands of SAM steps.
                 scale = h.sam_rho / (gnorm_val + 1e-12)
-                perturbations = []
+                weight_backups = []
                 with torch.no_grad():
                     for p in matrix_params_for_sam:
                         if p.grad is None:
-                            perturbations.append(None)
+                            weight_backups.append(None)
                             continue
-                        # Clone-then-cast: avoid aliasing p.grad's storage. Always
-                        # produces a fresh tensor we can later subtract to restore.
-                        delta = p.grad.detach().clone().to(p.data.dtype)
-                        delta.mul_(scale)
-                        p.data.add_(delta)
-                        perturbations.append(delta)
+                        weight_backups.append(p.data.detach().clone())
+                        # In-place perturb. p.grad is fp32 (param-dtype-matched
+                        # accumulation); scale * p.grad keeps the same dtype.
+                        p.data.add_(p.grad, alpha=scale)
                 # 4) zero grads from the first pass, then recompute grads at the
                 # perturbed weights using the SAME cached batches.
                 optimizers.zero_grad_all()
@@ -2750,11 +2750,13 @@ def train_model(h, device, val_data):
                     (loss2 / h.grad_accum_steps).backward()
                 sam_loss /= h.grad_accum_steps
                 sam_loss_delta = (sam_loss - train_loss).item()
-                # 5) restore weights: w_adv -> w by subtracting cached deltas.
+                # 5) restore the ORIGINAL weights by exact copy. After this,
+                # p.data is bit-identical to before the perturbation, but
+                # p.grad still holds the second-pass (post-perturbation) gradient.
                 with torch.no_grad():
-                    for p, delta in zip(matrix_params_for_sam, perturbations):
-                        if delta is not None:
-                            p.data.sub_(delta)
+                    for p, w_orig in zip(matrix_params_for_sam, weight_backups):
+                        if w_orig is not None:
+                            p.data.copy_(w_orig)
                 if (
                     h.is_main_process
                     and h.sam_log_every > 0
