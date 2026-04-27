@@ -755,6 +755,12 @@ class GPT(nn.Module):
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
         self.tok_emb = nn.Embedding(h.vocab_size, h.model_dim)
+        # PCB: per-class output bias on logits. Init at 0 → identity at step 0
+        # (preserves safetri baseline). With tied embeddings, F.linear(x, tok_emb.weight)
+        # has NO bias term — adding lm_head_bias is a genuinely new degree of freedom that
+        # adjusts the marginal token distribution post-EMA. Distinct from tied embeddings
+        # (which model token-direction structure, not class priors).
+        self.lm_head_bias = nn.Parameter(torch.zeros(h.vocab_size, dtype=torch.float32))
         self.num_layers = h.num_layers
         head_dim = h.model_dim // h.num_heads
         kv_dim = h.num_kv_heads * head_dim
@@ -988,6 +994,8 @@ class GPT(nn.Module):
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             logits_proj = self.lm_head(x)
+        # PCB: per-class learnable bias on logits before softcap.
+        logits_proj = logits_proj + self.lm_head_bias.to(dtype=logits_proj.dtype)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids, target_ids, cu_seqlens=None, max_seqlen=0):
@@ -1072,6 +1080,8 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits + lora.lm_head_lora(x)
+        # PCB: per-class learnable bias on logits before softcap (matches forward_logits).
+        logits = logits + self.lm_head_bias.to(dtype=logits.dtype)
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         bsz, sl, V = logits.shape
         return F.cross_entropy(
@@ -1423,7 +1433,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,lm_head_bias,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj",
     ).split(",")
     if pattern
 )
