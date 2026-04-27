@@ -639,6 +639,13 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(
             torch.full((num_heads,), qk_gain_init, dtype=torch.float32)
         )
+        # Q-K Norm: per-channel learnable weight on the rms_norm of Q and K.
+        # Init at 1.0 so initial behavior matches existing weightless rms_norm
+        # (preserves safetri baseline at step 0). Distinct from per-head q_gain
+        # because rms_norm is non-linear in the channel dim — q_norm_weight cannot
+        # be absorbed into the q_proj linear weight nor into per-head q_gain.
+        self.q_norm_weight = nn.Parameter(torch.ones(self.head_dim, dtype=torch.float32))
+        self.k_norm_weight = nn.Parameter(torch.ones(self.head_dim, dtype=torch.float32))
         self.rope_dims = 0
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=train_seq_len, yarn=yarn)
         self.use_xsa = False
@@ -659,8 +666,9 @@ class CausalSelfAttention(nn.Module):
         q = F.linear(x, q_w.to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = F.linear(x, k_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = F.linear(x, v_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
+        # Q-K Norm: rms_norm with learnable per-channel weight (init=1.0 preserves baseline).
+        q = F.rms_norm(q, (q.size(-1),), weight=self.q_norm_weight.to(dtype=q.dtype))
+        k = F.rms_norm(k, (k.size(-1),), weight=self.k_norm_weight.to(dtype=k.dtype))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
@@ -1094,8 +1102,9 @@ class GPT(nn.Module):
         v = (F.linear(n, v_w.to(n.dtype)) + lora.v_loras[slot](n)).reshape(
             bsz, seqlen, attn.num_kv_heads, attn.head_dim
         )
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
+        # Q-K Norm: rms_norm with learnable per-channel weight (matches CausalSelfAttention.forward).
+        q = F.rms_norm(q, (q.size(-1),), weight=attn.q_norm_weight.to(dtype=q.dtype))
+        k = F.rms_norm(k, (k.size(-1),), weight=attn.k_norm_weight.to(dtype=k.dtype))
         cos, sin = attn.rotary(seqlen, n.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
         k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
@@ -1138,8 +1147,9 @@ class GPT(nn.Module):
         v = (F.linear(n, v_w.to(n.dtype)) + lora.v_loras[slot](n)).reshape(
             bsz, seqlen, attn.num_kv_heads, attn.head_dim
         )
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
+        # Q-K Norm: rms_norm with learnable per-channel weight (matches CausalSelfAttention.forward).
+        q = F.rms_norm(q, (q.size(-1),), weight=attn.q_norm_weight.to(dtype=q.dtype))
+        k = F.rms_norm(k, (k.size(-1),), weight=attn.k_norm_weight.to(dtype=k.dtype))
         cos, sin = attn.rotary(seqlen, n.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin, attn.rope_dims)
         k = apply_rotary_emb(k, cos, sin, attn.rope_dims)
@@ -1423,7 +1433,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,q_norm_weight,k_norm_weight,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj",
     ).split(",")
     if pattern
 )
