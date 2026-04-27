@@ -2503,9 +2503,12 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                             per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
-                    per_doc = per_tok_loss[
-                        :, chunk_offset : chunk_offset + chunk_size
-                    ].mean(dim=-1)
+                    chunk_loss = per_tok_loss[:, chunk_offset : chunk_offset + chunk_size]
+                    # HTTL: weight per-token loss by sqrt of detached current NLL
+                    # (hard-token mining — focus TTT optimization on tokens with higher loss)
+                    weights = chunk_loss.detach().clamp(min=1e-6) ** 0.5
+                    weights = weights / (weights.mean(dim=-1, keepdim=True) + 1e-8)
+                    per_doc = (chunk_loss * weights).mean(dim=-1)
                     cur_opt.zero_grad(set_to_none=True)
                     (per_doc * activate_chunk_mask).sum().backward()
                     cur_opt.step()
