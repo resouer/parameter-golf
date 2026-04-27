@@ -4,7 +4,7 @@ import random,re,subprocess,sys,time,uuid,numpy as np,sentencepiece as spm,torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor,nn
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
-class Hyperparameters:data_dir=os.environ.get('DATA_DIR','./data/');seed=int(os.environ.get('SEED',1337));run_id=os.environ.get('RUN_ID',str(uuid.uuid4()));iterations=int(os.environ.get('ITERATIONS',20000));warmdown_frac=float(os.environ.get('WARMDOWN_FRAC',.72));warmup_steps=int(os.environ.get('WARMUP_STEPS',20));train_batch_tokens=int(os.environ.get('TRAIN_BATCH_TOKENS',786432));train_seq_len=int(os.environ.get('TRAIN_SEQ_LEN',2048));train_log_every=int(os.environ.get('TRAIN_LOG_EVERY',500));max_wallclock_seconds=float(os.environ.get('MAX_WALLCLOCK_SECONDS',6e2));val_batch_tokens=int(os.environ.get('VAL_BATCH_TOKENS',524288));eval_seq_len=int(os.environ.get('EVAL_SEQ_LEN',2048));val_loss_every=int(os.environ.get('VAL_LOSS_EVERY',4000));sliding_window_enabled=bool(int(os.environ.get('SLIDING_WINDOW_ENABLED','1')));vocab_size=int(os.environ.get('VOCAB_SIZE',8192));num_layers=int(os.environ.get('NUM_LAYERS',11));xsa_last_n=int(os.environ.get('XSA_LAST_N',11));model_dim=int(os.environ.get('MODEL_DIM',512));embedding_dim=int(os.environ.get('EMBEDDING_DIM',512));num_kv_heads=int(os.environ.get('NUM_KV_HEADS',4));num_heads=int(os.environ.get('NUM_HEADS',8));mlp_mult=float(os.environ.get('MLP_MULT',4.));skip_gates_enabled=bool(int(os.environ.get('SKIP_GATES_ENABLED','1')));tie_embeddings=bool(int(os.environ.get('TIE_EMBEDDINGS','1')));logit_softcap=float(os.environ.get('LOGIT_SOFTCAP',3e1));rope_base=float(os.environ.get('ROPE_BASE',1e4));rope_dims=int(os.environ.get('ROPE_DIMS',16));rope_train_seq_len=int(os.environ.get('ROPE_TRAIN_SEQ_LEN',2048));ln_scale=bool(int(os.environ.get('LN_SCALE','1')));qk_gain_init=float(os.environ.get('QK_GAIN_INIT',5.));num_loops=int(os.environ.get('NUM_LOOPS',2));loop_start=int(os.environ.get('LOOP_START',3));loop_end=int(os.environ.get('LOOP_END',5));enable_looping_at=float(os.environ.get('ENABLE_LOOPING_AT',.35));parallel_residual_start=int(os.environ.get('PARALLEL_RESIDUAL_START',7));min_lr=float(os.environ.get('MIN_LR',.0));embed_lr=float(os.environ.get('EMBED_LR',.6));head_lr=float(os.environ.get('HEAD_LR',.008));tied_embed_lr=float(os.environ.get('TIED_EMBED_LR',.03));tied_embed_init_std=float(os.environ.get('TIED_EMBED_INIT_STD',.005));matrix_lr=float(os.environ.get('MATRIX_LR',.022));scalar_lr=float(os.environ.get('SCALAR_LR',.02));muon_momentum=float(os.environ.get('MUON_MOMENTUM',.99));muon_backend_steps=int(os.environ.get('MUON_BACKEND_STEPS',5));muon_momentum_warmup_start=float(os.environ.get('MUON_MOMENTUM_WARMUP_START',.92));muon_momentum_warmup_steps=int(os.environ.get('MUON_MOMENTUM_WARMUP_STEPS',1500));muon_row_normalize=bool(int(os.environ.get('MUON_ROW_NORMALIZE','1')));beta1=float(os.environ.get('BETA1',.9));beta2=float(os.environ.get('BETA2',.95));adam_eps=float(os.environ.get('ADAM_EPS',1e-08));grad_clip_norm=float(os.environ.get('GRAD_CLIP_NORM',.3));eval_stride=int(os.environ.get('EVAL_STRIDE',64));muon_beta2=float(os.environ.get('MUON_BETA2',.95));adam_wd=float(os.environ.get('ADAM_WD',.02));muon_wd=float(os.environ.get('MUON_WD',.095));embed_wd=float(os.environ.get('EMBED_WD',.085));ema_decay=float(os.environ.get('EMA_DECAY',.9965));ttt_enabled=bool(int(os.environ.get('TTT_ENABLED','0')));ttt_lr=float(os.environ.get('TTT_LR',.005));ttt_epochs=int(os.environ.get('TTT_EPOCHS',3));ttt_momentum=float(os.environ.get('TTT_MOMENTUM',.9));ttt_chunk_tokens=int(os.environ.get('TTT_CHUNK_TOKENS',32768));etlb_enabled=bool(int(os.environ.get('ETLB_ENABLED','0')));etlb_lr=float(os.environ.get('ETLB_LR',.05));etlb_steps=int(os.environ.get('ETLB_STEPS',5));etlb_clip=float(os.environ.get('ETLB_CLIP',3.));compressor=os.environ.get('COMPRESSOR','brotli');gptq_calibration_batches=int(os.environ.get('GPTQ_CALIBRATION_BATCHES',64));gptq_reserve_seconds=float(os.environ.get('GPTQ_RESERVE_SECONDS',12.));matrix_bits=int(os.environ.get('MATRIX_BITS',6));embed_bits=int(os.environ.get('EMBED_BITS',8));matrix_clip_sigmas=float(os.environ.get('MATRIX_CLIP_SIGMAS',12.85));embed_clip_sigmas=float(os.environ.get('EMBED_CLIP_SIGMAS',2e1));vernier_enabled=bool(int(os.environ.get('VERNIER_ENABLED','1')));vernier_delta=float(os.environ.get('VERNIER_DELTA',str(.5/31.)));vernier_target_layers=os.environ.get('VERNIER_TARGET_LAYERS','mlp_attn');distributed='RANK'in os.environ and'WORLD_SIZE'in os.environ;rank=int(os.environ.get('RANK','0'));world_size=int(os.environ.get('WORLD_SIZE','1'));local_rank=int(os.environ.get('LOCAL_RANK','0'));is_main_process=rank==0;grad_accum_steps=8//world_size;datasets_dir=os.path.join(data_dir,'datasets',f"fineweb10B_sp{vocab_size}");train_files=os.path.join(datasets_dir,'fineweb_train_*.bin');val_files=os.path.join(datasets_dir,'fineweb_val_*.bin');tokenizer_path=os.path.join(data_dir,'tokenizers',f"fineweb_{vocab_size}_bpe.model");logfile=f"logs/{run_id}.txt";model_path='final_model.pt';quantized_model_path='final_model.int6.ptz'
+class Hyperparameters:data_dir=os.environ.get('DATA_DIR','./data/');seed=int(os.environ.get('SEED',1337));run_id=os.environ.get('RUN_ID',str(uuid.uuid4()));iterations=int(os.environ.get('ITERATIONS',20000));warmdown_frac=float(os.environ.get('WARMDOWN_FRAC',.72));warmup_steps=int(os.environ.get('WARMUP_STEPS',20));train_batch_tokens=int(os.environ.get('TRAIN_BATCH_TOKENS',786432));train_seq_len=int(os.environ.get('TRAIN_SEQ_LEN',2048));train_log_every=int(os.environ.get('TRAIN_LOG_EVERY',500));max_wallclock_seconds=float(os.environ.get('MAX_WALLCLOCK_SECONDS',6e2));val_batch_tokens=int(os.environ.get('VAL_BATCH_TOKENS',524288));eval_seq_len=int(os.environ.get('EVAL_SEQ_LEN',2048));val_loss_every=int(os.environ.get('VAL_LOSS_EVERY',4000));sliding_window_enabled=bool(int(os.environ.get('SLIDING_WINDOW_ENABLED','1')));vocab_size=int(os.environ.get('VOCAB_SIZE',8192));num_layers=int(os.environ.get('NUM_LAYERS',11));xsa_last_n=int(os.environ.get('XSA_LAST_N',11));model_dim=int(os.environ.get('MODEL_DIM',512));embedding_dim=int(os.environ.get('EMBEDDING_DIM',512));num_kv_heads=int(os.environ.get('NUM_KV_HEADS',4));num_heads=int(os.environ.get('NUM_HEADS',8));mlp_mult=float(os.environ.get('MLP_MULT',4.));skip_gates_enabled=bool(int(os.environ.get('SKIP_GATES_ENABLED','1')));tie_embeddings=bool(int(os.environ.get('TIE_EMBEDDINGS','1')));logit_softcap=float(os.environ.get('LOGIT_SOFTCAP',3e1));rope_base=float(os.environ.get('ROPE_BASE',1e4));rope_dims=int(os.environ.get('ROPE_DIMS',16));rope_train_seq_len=int(os.environ.get('ROPE_TRAIN_SEQ_LEN',2048));ln_scale=bool(int(os.environ.get('LN_SCALE','1')));qk_gain_init=float(os.environ.get('QK_GAIN_INIT',5.));num_loops=int(os.environ.get('NUM_LOOPS',2));loop_start=int(os.environ.get('LOOP_START',3));loop_end=int(os.environ.get('LOOP_END',5));enable_looping_at=float(os.environ.get('ENABLE_LOOPING_AT',.35));parallel_residual_start=int(os.environ.get('PARALLEL_RESIDUAL_START',7));min_lr=float(os.environ.get('MIN_LR',.0));embed_lr=float(os.environ.get('EMBED_LR',.6));head_lr=float(os.environ.get('HEAD_LR',.008));tied_embed_lr=float(os.environ.get('TIED_EMBED_LR',.03));tied_embed_init_std=float(os.environ.get('TIED_EMBED_INIT_STD',.005));matrix_lr=float(os.environ.get('MATRIX_LR',.022));scalar_lr=float(os.environ.get('SCALAR_LR',.02));muon_momentum=float(os.environ.get('MUON_MOMENTUM',.99));muon_backend_steps=int(os.environ.get('MUON_BACKEND_STEPS',5));muon_momentum_warmup_start=float(os.environ.get('MUON_MOMENTUM_WARMUP_START',.92));muon_momentum_warmup_steps=int(os.environ.get('MUON_MOMENTUM_WARMUP_STEPS',1500));muon_row_normalize=bool(int(os.environ.get('MUON_ROW_NORMALIZE','1')));beta1=float(os.environ.get('BETA1',.9));beta2=float(os.environ.get('BETA2',.95));adam_eps=float(os.environ.get('ADAM_EPS',1e-08));grad_clip_norm=float(os.environ.get('GRAD_CLIP_NORM',.3));eval_stride=int(os.environ.get('EVAL_STRIDE',64));muon_beta2=float(os.environ.get('MUON_BETA2',.95));adam_wd=float(os.environ.get('ADAM_WD',.02));muon_wd=float(os.environ.get('MUON_WD',.095));embed_wd=float(os.environ.get('EMBED_WD',.085));ema_decay=float(os.environ.get('EMA_DECAY',.9965));ttt_enabled=bool(int(os.environ.get('TTT_ENABLED','0')));ttt_lr=float(os.environ.get('TTT_LR',.005));ttt_epochs=int(os.environ.get('TTT_EPOCHS',3));ttt_momentum=float(os.environ.get('TTT_MOMENTUM',.9));ttt_chunk_tokens=int(os.environ.get('TTT_CHUNK_TOKENS',32768));etlb_enabled=bool(int(os.environ.get('ETLB_ENABLED','0')));etlb_lr=float(os.environ.get('ETLB_LR',.05));etlb_steps=int(os.environ.get('ETLB_STEPS',5));etlb_clip=float(os.environ.get('ETLB_CLIP',3.));compressor=os.environ.get('COMPRESSOR','brotli');gptq_calibration_batches=int(os.environ.get('GPTQ_CALIBRATION_BATCHES',64));gptq_reserve_seconds=float(os.environ.get('GPTQ_RESERVE_SECONDS',12.));matrix_bits=int(os.environ.get('MATRIX_BITS',6));embed_bits=int(os.environ.get('EMBED_BITS',8));matrix_clip_sigmas=float(os.environ.get('MATRIX_CLIP_SIGMAS',12.85));embed_clip_sigmas=float(os.environ.get('EMBED_CLIP_SIGMAS',2e1));vernier_enabled=bool(int(os.environ.get('VERNIER_ENABLED','1')));vernier_delta=float(os.environ.get('VERNIER_DELTA',str(.5/31.)));vernier_target_layers=os.environ.get('VERNIER_TARGET_LAYERS','attn');vernier_byte_budget=int(os.environ.get('VERNIER_BYTE_BUDGET','15800000'));distributed='RANK'in os.environ and'WORLD_SIZE'in os.environ;rank=int(os.environ.get('RANK','0'));world_size=int(os.environ.get('WORLD_SIZE','1'));local_rank=int(os.environ.get('LOCAL_RANK','0'));is_main_process=rank==0;grad_accum_steps=8//world_size;datasets_dir=os.path.join(data_dir,'datasets',f"fineweb10B_sp{vocab_size}");train_files=os.path.join(datasets_dir,'fineweb_train_*.bin');val_files=os.path.join(datasets_dir,'fineweb_val_*.bin');tokenizer_path=os.path.join(data_dir,'tokenizers',f"fineweb_{vocab_size}_bpe.model");logfile=f"logs/{run_id}.txt";model_path='final_model.pt';quantized_model_path='final_model.int6.ptz'
 _logger_hparams=None
 def set_logging_hparams(h):global _logger_hparams;_logger_hparams=h
 def log(msg,console=True):
@@ -260,7 +260,7 @@ def gptq_vernier_quantize_weight(w,H,clip_sigmas=3.,clip_range=63,block_size=128
 	#   grid_b values: level_b * s_b + 0.5 * s_a, where s_b = s_a*(1+delta)
 	# Per-weight: pick the lower-error grid; record 1-bit selector.
 	# Per-row acceptance gate: fall back to plain int6 if vernier MSE worse for that row.
-	# Returns (Q[int8 rows,cols], Sel[uint8 rows,cols], s_a[fp16 rows], use_vernier[bool rows]).
+	# Returns (Q_final[int8], Sel_final[uint8], s_a[fp16], use_vernier[bool], Q_p[int8 plain int6], sse_v[float64], sse_p[float64]).
 	W_orig=w.float().clone();rows,cols=W_orig.shape;H=H.float().clone();dead=torch.diag(H)==0;H[dead,dead]=1;damp=.01*H.diag().mean();H.diagonal().add_(damp);perm=torch.argsort(H.diag(),descending=True);invperm=torch.argsort(perm);W_perm=W_orig[:,perm].clone();W_perm[:,dead[perm]]=0;H=H[perm][:,perm];Hinv=torch.cholesky_inverse(torch.linalg.cholesky(H));Hinv=torch.linalg.cholesky(Hinv,upper=True);row_std=W_orig.std(dim=1);s_a=(clip_sigmas*row_std/clip_range).clamp_min(1e-10).to(torch.float16);sf=s_a.float();sf_b=sf*(1.+float(delta));half_a=.5*sf
 	# Vernier pass with GPTQ error correction (mirrors gptq_quantize_weight, but per-weight grid choice).
 	Q_v=torch.zeros(rows,cols,dtype=torch.int8);Sel_v=torch.zeros(rows,cols,dtype=torch.uint8);W_work=W_perm.clone();sse_v=torch.zeros(rows,dtype=torch.float64)
@@ -288,7 +288,6 @@ def gptq_vernier_quantize_weight(w,H,clip_sigmas=3.,clip_range=63,block_size=128
 		if i2<cols:W_work[:,i2:]-=Err@Hinv[i1:i2,i2:]
 	# Per-row acceptance gate.
 	use_vernier=sse_v<=sse_p
-	# Merge: rows that fall back use plain int6 levels (selectors all 0; dequant ignores sel for those rows).
 	uv=use_vernier.view(rows,1)
 	Q_final=torch.where(uv,Q_v,Q_p)
 	Sel_final=torch.where(uv,Sel_v,torch.zeros_like(Sel_v))
@@ -296,10 +295,22 @@ def gptq_vernier_quantize_weight(w,H,clip_sigmas=3.,clip_range=63,block_size=128
 	n_v=int(use_vernier.sum().item());n_total=int(rows);n_sel=int(Sel_final.sum().item())
 	mse_v=float(sse_v.sum().item()/(rows*cols));mse_p=float(sse_p.sum().item()/(rows*cols))
 	log(f"  vernier: rows_using_vernier={n_v}/{n_total} sel_density={n_sel/(rows*cols):.3f} mse_vernier={mse_v:.6e} mse_int6={mse_p:.6e}")
-	return Q_final[:,invperm],Sel_final[:,invperm],s_a,use_vernier
+	# Also return the plain-int6 quantized levels for tensor-level demotion if needed.
+	return Q_final[:,invperm],Sel_final[:,invperm],s_a,use_vernier,Q_p[:,invperm],sse_v,sse_p
+def _vernier_demote_tensor(name,result,meta,bits=6):
+	# Convert a Vernier-quantized tensor entry back to plain int6 form (drops .sel and .uv).
+	# Requires that we stored the plain int6 levels in result[name+'.q_p'].
+	q_p=result.pop(name+'.q_p',None)
+	if q_p is None:return False
+	# Use the plain int6 q and the original s_a (still in .scale).
+	result[name+'.q']=q_p
+	# Drop vernier-specific keys.
+	result.pop(name+'.sel',None);result.pop(name+'.uv',None)
+	meta[name]=f"gptq (int{bits})"
+	return True
 def gptq_mixed_quantize(state_dict,hessians,h):
 	result={};meta={}
-	target_layers=set(p for p in (h.vernier_target_layers or '').split('_') if p);use_vernier_global=bool(h.vernier_enabled)
+	target_layers=set(p for p in (h.vernier_target_layers or '').split('_') if p);use_vernier_global=bool(h.vernier_enabled);vernier_savings={}
 	for(name,tensor)in state_dict.items():
 		t=tensor.detach().cpu().contiguous()
 		if not t.is_floating_point()or t.numel()<=65536:result[name]=t.to(torch.float16)if t.is_floating_point()else t;meta[name]='passthrough (float16)';continue
@@ -307,15 +318,27 @@ def gptq_mixed_quantize(state_dict,hessians,h):
 		can_vernier=use_vernier_global and bits==6 and 'tok_emb'not in name and(not target_layers or cat in target_layers)
 		if can_vernier:
 			log(f"vernier-quantizing {name} (cat={cat})")
-			q,sel,s_a,use_vernier=gptq_vernier_quantize_weight(t,hessians[name],clip_sigmas=cs,clip_range=clip_range,delta=h.vernier_delta)
-			result[name+'.q']=q;result[name+'.sel']=sel;result[name+'.scale']=s_a;result[name+'.uv']=use_vernier;meta[name]=f"gptq_vernier (int{bits}+sel)"
+			q,sel,s_a,use_vernier,q_p,sse_v,sse_p=gptq_vernier_quantize_weight(t,hessians[name],clip_sigmas=cs,clip_range=clip_range,delta=h.vernier_delta)
+			# Tensor-level acceptance gate: if no rows benefit, demote immediately.
+			if not bool(use_vernier.any().item()):
+				log(f"  {name}: no rows benefit from vernier - demoting to plain int6")
+				result[name+'.q']=q_p;result[name+'.scale']=s_a;meta[name]=f"gptq (int{bits})"
+				continue
+			# Track savings ratio for budget-aware demotion later: bytes saved per unit MSE penalty.
+			sel_bytes=int(sel.numel());uv_bytes=int(use_vernier.numel())
+			# Approximate savings = sel_bytes (~1 bit/weight after compression) + uv_bytes (negligible).
+			# Penalty (MSE delta) = sum over kept rows of (sse_p[r] - sse_v[r]).
+			kept_mask=use_vernier.cpu()
+			mse_delta=float((sse_p[kept_mask]-sse_v[kept_mask]).sum().item())
+			vernier_savings[name]=(sel_bytes+uv_bytes,max(mse_delta,1e-12))
+			result[name+'.q']=q;result[name+'.sel']=sel;result[name+'.scale']=s_a;result[name+'.uv']=use_vernier;result[name+'.q_p']=q_p;meta[name]=f"gptq_vernier (int{bits}+sel)"
 		else:
 			q,s=gptq_quantize_weight(t,hessians[name],clip_sigmas=cs,clip_range=clip_range);result[name+'.q']=q;result[name+'.scale']=s;meta[name]=f"gptq (int{bits})"
 	categories=collections.defaultdict(set)
 	for(name,cat)in meta.items():short=re.sub('\\.\\d+$','',re.sub('blocks\\.\\d+','blocks',name));categories[cat].add(short)
 	log('Quantized weights:')
 	for cat in sorted(categories):log(f"  {cat}: {", ".join(sorted(categories[cat]))}")
-	return result,meta
+	return result,meta,vernier_savings
 def dequantize_mixed(result,meta,template_sd,delta=.5/31.):
 	out={}
 	for(name,orig)in template_sd.items():
@@ -359,10 +382,42 @@ def _decompress(data,compressor):
 	elif compressor=='brotli':import brotli;raw=brotli.decompress(data)
 	else:raise ValueError(f"Unknown compressor: {compressor!r}")
 	raw=_byte_unshuffle(raw);return raw
+def _strip_vernier_temp_keys(result):
+	# Remove temp .q_p keys (only used during budget-aware demotion).
+	for k in list(result.keys()):
+		if k.endswith('.q_p'):del result[k]
+def _measure_blob_bytes(result,meta,compressor):
+	buf=io.BytesIO();torch.save({'w':result,'m':meta},buf);return len(_compress(buf.getvalue(),compressor))
 def serialize(h,base_model,code):
 	code_bytes=len(code.encode('utf-8'))
 	if h.is_main_process:torch.save(base_model.state_dict(),h.model_path);model_bytes=os.path.getsize(h.model_path);log(f"Serialized model: {model_bytes} bytes");log(f"Code size: {code_bytes} bytes")
-	sd_cpu={k:v.detach().cpu()for(k,v)in base_model.state_dict().items()};device=torch.device('cuda',h.local_rank);log('GPTQ:collecting Hessians from calibration data...');t0=time.perf_counter();calib_loader=ShuffledSequenceLoader(h,device);hessians=collect_hessians(base_model,calib_loader,h,device,n_calibration_batches=h.gptq_calibration_batches);log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter()-t0:.1f}s");quant_result,quant_meta=gptq_mixed_quantize(sd_cpu,hessians,h);quant_buf=io.BytesIO();torch.save({'w':quant_result,'m':quant_meta},quant_buf);quant_raw=quant_buf.getvalue();quant_blob=_compress(quant_raw,h.compressor);quant_file_bytes=len(quant_blob);bytes_total=quant_file_bytes+code_bytes
+	sd_cpu={k:v.detach().cpu()for(k,v)in base_model.state_dict().items()};device=torch.device('cuda',h.local_rank);log('GPTQ:collecting Hessians from calibration data...');t0=time.perf_counter();calib_loader=ShuffledSequenceLoader(h,device);hessians=collect_hessians(base_model,calib_loader,h,device,n_calibration_batches=h.gptq_calibration_batches);log(f"GPTQ:collected {len(hessians)} Hessians in {time.perf_counter()-t0:.1f}s");quant_result,quant_meta,vernier_savings=gptq_mixed_quantize(sd_cpu,hessians,h)
+	# Budget-aware Vernier demotion: if total artifact > byte budget, progressively demote
+	# Vernier tensors back to plain int6 (greatest sel-bytes-saved per MSE-penalty first).
+	def _final_size(result_dict):
+		# Strip temp .q_p before measuring (they're not in final artifact).
+		measure_result={k:v for k,v in result_dict.items()if not k.endswith('.q_p')}
+		return _measure_blob_bytes(measure_result,quant_meta,h.compressor)+code_bytes
+	budget=int(h.vernier_byte_budget)
+	if vernier_savings:
+		cur_total=_final_size(quant_result)
+		log(f"vernier:initial bytes_total={cur_total} budget={budget}")
+		# Demote tensors greedily based on predicted savings (~1 bit per weight after brotli).
+		# Sort by (predicted_savings_bytes / mse_penalty) descending: cheapest tensors first.
+		demote_order=sorted(vernier_savings.items(),key=lambda kv:-kv[1][0]/kv[1][1])
+		predicted_total=cur_total;demoted_count=0
+		for(name,(sel_bytes,penalty))in demote_order:
+			if predicted_total<=budget:break
+			# Predicted savings: ~1 bit per weight after brotli compression of selectors.
+			approx_savings=sel_bytes//8
+			if not _vernier_demote_tensor(name,quant_result,quant_meta):continue
+			demoted_count+=1
+			log(f"vernier:demoting {name} approx_savings={approx_savings} penalty={penalty:.3e}")
+			predicted_total-=approx_savings
+		if demoted_count>0:log(f"vernier:demoted {demoted_count} tensors predicted_total={predicted_total}")
+	# Final cleanup: drop temp .q_p before serializing the artifact.
+	_strip_vernier_temp_keys(quant_result)
+	quant_buf=io.BytesIO();torch.save({'w':quant_result,'m':quant_meta},quant_buf);quant_raw=quant_buf.getvalue();quant_blob=_compress(quant_raw,h.compressor);quant_file_bytes=len(quant_blob);bytes_total=quant_file_bytes+code_bytes
 	if h.is_main_process:
 		with open(h.quantized_model_path,'wb')as f:f.write(quant_blob)
 		log(f"Serialized model quantized+{h.compressor}: {quant_file_bytes} bytes");log(f"Total submission size quantized+{h.compressor}: {bytes_total} bytes")
