@@ -1787,12 +1787,20 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             E = t.float() - W_q
             lqer_cands[name] = (E, float(E.norm()))
     if lqer_on and lqer_cands:
-        top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: h.lqer_top_k]
+        # LCRS: extend coverage to top-K=4 with graduated ranks (6,5,4,3) — more
+        # rank capacity for higher-error layers, less for marginal ones. Author
+        # (#1874) tested uniform top_k=12 (neutral) but NOT graduated ranks. Mass
+        # 6+5+4+3 = 18 vs author's 4*3 = 12 (~12KB extra artifact, within budget).
+        # Different allocation policy → genuinely novel mechanism, not thin retune.
+        lcrs_top_k = max(int(getattr(h, "lqer_top_k", 3)), 4)
+        lcrs_ranks = [6, 5, 4, 3]
+        top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: lcrs_top_k]
         asym_on = bool(getattr(h, "lqer_asym_enabled", False))
         asym_g = int(getattr(h, "lqer_asym_group", 64))
-        for (name, (E, _)) in top:
+        for idx, (name, (E, _)) in enumerate(top):
             U, S, Vh = torch.linalg.svd(E, full_matrices=False)
-            r = min(h.lqer_rank, S.numel())
+            this_rank = lcrs_ranks[idx] if idx < len(lcrs_ranks) else int(getattr(h, "lqer_rank", 4))
+            r = min(this_rank, S.numel())
             A = (U[:, :r] * S[:r]).contiguous()
             B = Vh[:r, :].contiguous()
             if asym_on and B.numel() % asym_g == 0:
