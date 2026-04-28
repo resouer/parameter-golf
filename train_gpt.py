@@ -927,6 +927,13 @@ class GPT(nn.Module):
         if self.smear_gate_enabled and x.dim() == 3 and x.size(1) > 1:
             sl = self.smear_lambda.to(dtype=x.dtype)
             g = sl * torch.sigmoid(self.smear_gate(x[:, 1:, :self.smear_width]))
+            # BMS: mask smear residual at BOS document boundaries to prevent
+            # cross-document carry from the previous doc's last token into the
+            # new doc's first content token. Documented bug fix from #1869 audit.
+            global BOS_ID
+            _bos = BOS_ID if BOS_ID is not None else 1
+            bos_mask = (input_ids[:, 1:] != _bos).to(dtype=g.dtype).unsqueeze(-1)
+            g = g * bos_mask
             x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1]], dim=1)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1005,6 +1012,13 @@ class GPT(nn.Module):
         if self.smear_gate_enabled and x.dim() == 3 and x.size(1) > 1:
             sl = self.smear_lambda.to(dtype=x.dtype)
             g = sl * torch.sigmoid(self.smear_gate(x[:, 1:, :self.smear_width]))
+            # BMS: mask smear residual at BOS document boundaries to prevent
+            # cross-document carry from the previous doc's last token into the
+            # new doc's first content token. Documented bug fix from #1869 audit.
+            global BOS_ID
+            _bos = BOS_ID if BOS_ID is not None else 1
+            bos_mask = (input_ids[:, 1:] != _bos).to(dtype=g.dtype).unsqueeze(-1)
+            g = g * bos_mask
             x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1]], dim=1)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
