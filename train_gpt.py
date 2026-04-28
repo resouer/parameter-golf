@@ -2585,14 +2585,13 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 )
             if needs_train:
                 activate_chunk_mask = (num_chunks_t - 1 > ci).float()
-                # TPCS: phase-conditional loss scaling. Linearly tapers from 0.5x at
-                # phase 0 (early prefix, less predictive) to 1.5x at last phase
-                # (late prefix, most predictive of eval boundary). Mean weight = 1.0
-                # so total optimization budget is preserved. Distinct from HTTL
-                # (per-token weighting, failed) — TPCS is per-phase, smoother signal,
-                # no AdamW-WD trap (no new learnable params).
+                # TPCS-V2: phase-conditional loss scaling, steeper taper (0.25x→1.75x)
+                # vs V1's (0.5x→1.5x). Amplifies the late-phase optimization focus.
+                # Mean weight = 1.0 so total optimization budget preserved. No new
+                # learnable params. V1 (0.5→1.5) gave -0.00012 single-seed signal;
+                # V2 tests if amplifying scales the effect proportionally.
                 if num_phases > 1:
-                    tpcs_weight = 0.5 + (current_phase / float(num_phases - 1)) * 1.0
+                    tpcs_weight = 0.25 + (current_phase / float(num_phases - 1)) * 1.5
                 else:
                     tpcs_weight = 1.0
                 for gi in range(h.ttt_grad_steps):
