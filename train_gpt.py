@@ -1825,22 +1825,24 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             cs = h.matrix_clip_sigmas
         bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
         clip_range = 2 ** (bits - 1) - 1
-        # Hadamard rotation pre-quant for QKV weights. Forward paths apply the
-        # matching x_rot = x @ H_norm so the rotation is canceled at inference,
-        # but the rotated weight is more uniform and quantizes with smaller error.
+        # For QKV weights, the forward path applies x_rot = x @ H_norm before
+        # F.linear with the trained weight. The trained weight already lives in
+        # the rotated input space (training learned q_w such that
+        # F.linear(x @ H_norm, q_w) approximates the optimal mapping), so we
+        # quantize the trained weight directly. The hessian, however, was
+        # collected with the un-rotated x as the hook input — we rotate it to
+        # match the actual F.linear input distribution at inference (x_rot).
         should_rotate = any(name.endswith(suf) for suf in HADAMARD_ROTATE_SUFFIXES)
         if should_rotate:
             in_dim = t.shape[1]
             H_norm_fp64 = _orthogonal_hadamard(in_dim)
-            t_in_for_quant = (t.to(torch.float64) @ H_norm_fp64).to(t.dtype)
             h_in = hessians[name]
             H_norm_in = H_norm_fp64.to(h_in.dtype)
             h_in_for_quant = H_norm_in.T @ h_in @ H_norm_in
         else:
-            t_in_for_quant = t
             h_in_for_quant = hessians[name]
         ret = gptq_quantize_weight(
-            t_in_for_quant, h_in_for_quant, clip_sigmas=cs, clip_range=clip_range
+            t, h_in_for_quant, clip_sigmas=cs, clip_range=clip_range
         )
         q, s = ret
         result[name + ".q"] = q
@@ -1848,12 +1850,7 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         meta[name] = f"gptq (int{bits})"
         if lqer_on:
             W_q = q.float() * s.float().view(-1, 1)
-            # For LQER residual: error in the (rotated) space if rotated, else
-            # in original space. The dequant path reconstructs the (rotated)
-            # weight which forward consumes directly with x_rot, so the LQER
-            # correction must also be in the rotated space.
-            t_for_resid = t_in_for_quant.float() if should_rotate else t.float()
-            E = t_for_resid - W_q
+            E = t.float() - W_q
             lqer_cands[name] = (E, float(E.norm()))
     if lqer_on and lqer_cands:
         top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: h.lqer_top_k]
