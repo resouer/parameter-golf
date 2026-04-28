@@ -12,6 +12,44 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 
+def _hadamard_matrix(n):
+    """Sylvester construction of Hadamard matrix (n must be power of 2)."""
+    assert (n & (n - 1)) == 0 and n > 0, f"hadamard size must be positive power of 2, got {n}"
+    H = torch.tensor([[1.0]], dtype=torch.float64)
+    while H.size(0) < n:
+        H = torch.cat([torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0)
+    return H
+
+
+def _orthogonal_hadamard(n):
+    """Normalized orthogonal Hadamard matrix: H_norm @ H_norm.T == I."""
+    return _hadamard_matrix(n) / (n ** 0.5)
+
+
+_GLOBAL_HADAMARD_NORM = {}
+
+
+def _get_hadamard_norm(n, device, dtype):
+    """Cached H_norm of size n on (device, dtype)."""
+    key = (n, str(device), dtype)
+    cached = _GLOBAL_HADAMARD_NORM.get(key)
+    if cached is None:
+        cached = _orthogonal_hadamard(n).to(device=device, dtype=dtype)
+        _GLOBAL_HADAMARD_NORM[key] = cached
+    return cached
+
+
+# Names of weights that get input-axis Hadamard rotation pre-quant. The
+# forward paths must apply x_rot = x @ H_norm before doing F.linear with these
+# weights, and gptq_mixed_quantize must rotate both the weight and the hessian
+# accordingly.
+HADAMARD_ROTATE_SUFFIXES = (
+    "attn.c_q.weight",
+    "attn.c_k.weight",
+    "attn.c_v.weight",
+)
+
+
 class Hyperparameters:
     data_dir = os.environ.get("DATA_DIR", "./data/")
     seed = int(os.environ.get("SEED", 1337))
@@ -665,9 +703,13 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, q_w, k_w, v_w, out_w, cu_seqlens=None, max_seqlen=0):
         bsz, seqlen, dim = x.shape
-        q = F.linear(x, q_w.to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        k = F.linear(x, k_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = F.linear(x, v_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        # Hadamard pre-rotation: cancels the rotation that pre-quant applied to
+        # q_w/k_w/v_w. F.linear(x_rot, q_w_rot) = F.linear(x, q_w) (modulo quant).
+        H_norm = _get_hadamard_norm(dim, x.device, x.dtype)
+        x_rot = x @ H_norm
+        q = F.linear(x_rot, q_w.to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = F.linear(x_rot, k_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = F.linear(x_rot, v_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -1093,14 +1135,19 @@ class GPT(nn.Module):
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
-        q = (F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)).reshape(
+        # Hadamard pre-rotation: matches the right-multiplied rotation applied
+        # to q_w/k_w/v_w during pre-quant. LoRA branches also see n_rot so
+        # gradient descent finds the LoRA solution in the rotated input space.
+        H_norm = _get_hadamard_norm(dim, n.device, n.dtype)
+        n_rot = n @ H_norm
+        q = (F.linear(n_rot, q_w.to(n.dtype)) + lora.q_loras[slot](n_rot)).reshape(
             bsz, seqlen, attn.num_heads, attn.head_dim
         )
-        k = F.linear(n, k_w.to(n.dtype))
+        k = F.linear(n_rot, k_w.to(n.dtype))
         if lora.k_loras is not None:
-            k = k + lora.k_loras[slot](n)
+            k = k + lora.k_loras[slot](n_rot)
         k = k.reshape(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
-        v = (F.linear(n, v_w.to(n.dtype)) + lora.v_loras[slot](n)).reshape(
+        v = (F.linear(n_rot, v_w.to(n.dtype)) + lora.v_loras[slot](n_rot)).reshape(
             bsz, seqlen, attn.num_kv_heads, attn.head_dim
         )
         q = F.rms_norm(q, (q.size(-1),))
@@ -1137,14 +1184,17 @@ class GPT(nn.Module):
         n = block.attn_norm(attn_read) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
-        q = (F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)).reshape(
+        # Hadamard pre-rotation matching the pre-quant rotation on q_w/k_w/v_w.
+        H_norm = _get_hadamard_norm(dim, n.device, n.dtype)
+        n_rot = n @ H_norm
+        q = (F.linear(n_rot, q_w.to(n.dtype)) + lora.q_loras[slot](n_rot)).reshape(
             bsz, seqlen, attn.num_heads, attn.head_dim
         )
-        k = F.linear(n, k_w.to(n.dtype))
+        k = F.linear(n_rot, k_w.to(n.dtype))
         if lora.k_loras is not None:
-            k = k + lora.k_loras[slot](n)
+            k = k + lora.k_loras[slot](n_rot)
         k = k.reshape(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
-        v = (F.linear(n, v_w.to(n.dtype)) + lora.v_loras[slot](n)).reshape(
+        v = (F.linear(n_rot, v_w.to(n.dtype)) + lora.v_loras[slot](n_rot)).reshape(
             bsz, seqlen, attn.num_kv_heads, attn.head_dim
         )
         q = F.rms_norm(q, (q.size(-1),))
@@ -1775,8 +1825,22 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             cs = h.matrix_clip_sigmas
         bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
         clip_range = 2 ** (bits - 1) - 1
+        # Hadamard rotation pre-quant for QKV weights. Forward paths apply the
+        # matching x_rot = x @ H_norm so the rotation is canceled at inference,
+        # but the rotated weight is more uniform and quantizes with smaller error.
+        should_rotate = any(name.endswith(suf) for suf in HADAMARD_ROTATE_SUFFIXES)
+        if should_rotate:
+            in_dim = t.shape[1]
+            H_norm_fp64 = _orthogonal_hadamard(in_dim)
+            t_in_for_quant = (t.to(torch.float64) @ H_norm_fp64).to(t.dtype)
+            h_in = hessians[name]
+            H_norm_in = H_norm_fp64.to(h_in.dtype)
+            h_in_for_quant = H_norm_in.T @ h_in @ H_norm_in
+        else:
+            t_in_for_quant = t
+            h_in_for_quant = hessians[name]
         ret = gptq_quantize_weight(
-            t, hessians[name], clip_sigmas=cs, clip_range=clip_range
+            t_in_for_quant, h_in_for_quant, clip_sigmas=cs, clip_range=clip_range
         )
         q, s = ret
         result[name + ".q"] = q
@@ -1784,7 +1848,12 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         meta[name] = f"gptq (int{bits})"
         if lqer_on:
             W_q = q.float() * s.float().view(-1, 1)
-            E = t.float() - W_q
+            # For LQER residual: error in the (rotated) space if rotated, else
+            # in original space. The dequant path reconstructs the (rotated)
+            # weight which forward consumes directly with x_rot, so the LQER
+            # correction must also be in the rotated space.
+            t_for_resid = t_in_for_quant.float() if should_rotate else t.float()
+            E = t_for_resid - W_q
             lqer_cands[name] = (E, float(E.norm()))
     if lqer_on and lqer_cands:
         top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: h.lqer_top_k]
