@@ -25,7 +25,7 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 0))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     sliding_window_enabled = bool(int(os.environ.get("SLIDING_WINDOW_ENABLED", "0")))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
@@ -42,7 +42,7 @@ class Hyperparameters:
     rope_train_seq_len = int(os.environ.get("ROPE_TRAIN_SEQ_LEN", 2048))
     rope_yarn = bool(int(os.environ.get("ROPE_YARN", "0")))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.0))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.25))
     num_loops = int(os.environ.get("NUM_LOOPS", 2))
     loop_start = int(os.environ.get("LOOP_START", 3))
     loop_end = int(os.environ.get("LOOP_END", 5))
@@ -89,14 +89,14 @@ class Hyperparameters:
     val_doc_fraction = float(os.environ.get("VAL_DOC_FRACTION", 1.0))
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 16))
-    gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 1.5))
+    gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 4.0))
     phased_ttt_enabled = bool(int(os.environ.get("PHASED_TTT_ENABLED", "1")))
     phased_ttt_prefix_docs = int(os.environ.get("PHASED_TTT_PREFIX_DOCS", 2000))
     phased_ttt_num_phases = int(os.environ.get("PHASED_TTT_NUM_PHASES", 3))
     smear_gate_enabled = bool(int(os.environ.get("SMEAR_GATE", "1")))
     smear_gate_width = int(os.environ.get("SMEAR_GATE_WIDTH", 12))
     gate_attn_out = bool(int(os.environ.get("GATE_ATTN_OUT", "1")))
-    gate_attn_width = int(os.environ.get("GATE_ATTN_WIDTH", 12))
+    gate_attn_width = int(os.environ.get("GATE_ATTN_WIDTH", 24))
     global_ttt_lr = float(os.environ.get("GLOBAL_TTT_LR", 0.001))
     global_ttt_momentum = float(os.environ.get("GLOBAL_TTT_MOMENTUM", 0.9))
     global_ttt_epochs = int(os.environ.get("GLOBAL_TTT_EPOCHS", 1))
@@ -112,6 +112,15 @@ class Hyperparameters:
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 15.0))
     mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 12.0))
     attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
+    # Polar Express per-iteration minimax NS coefficients (PR #1344). Default on.
+    polar_express_ns = bool(int(os.environ.get("POLAR_EXPRESS_NS", "1")))
+    # LQER asymmetric rank-k correction on top-K quant-error tensors (PR #1797).
+    lqer_enabled = bool(int(os.environ.get("LQER_ENABLED", "1")))
+    lqer_rank = int(os.environ.get("LQER_RANK", 4))
+    lqer_top_k = int(os.environ.get("LQER_TOP_K", 3))
+    lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
+    lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
+    lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1250,6 +1259,9 @@ class BatchedTTTLoRA(nn.Module):
                         lora.reset()
 
 
+# Polar Express per-iteration minimax Newton-Schulz coefficients (PR #1344).
+# Replaces the fixed (3.4445, -4.775, 2.0315) coefficients when
+# POLAR_EXPRESS_NS=1 (default). Applied at backend_steps=5.
 _PE_COEFFS = (
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
     (4.042929935166739, -2.808917465908714, 0.5000178451051316),
@@ -1257,6 +1269,7 @@ _PE_COEFFS = (
     (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 )
+_POLAR_EXPRESS_NS = bool(int(os.environ.get("POLAR_EXPRESS_NS", "1")))
 
 
 @torch.compile
@@ -1269,11 +1282,18 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-07):
     if transposed:
         X = X.mT
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
-    for i in range(steps):
-        a, b, c = _PE_COEFFS[min(i, len(_PE_COEFFS) - 1)]
-        A = X @ X.mT
-        B = b * A + c * (A @ A)
-        X = a * X + B @ X
+    if _POLAR_EXPRESS_NS:
+        coeffs = _PE_COEFFS[:steps] if steps <= len(_PE_COEFFS) else _PE_COEFFS
+        for a, b, c in coeffs:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    else:
+        a, b, c = 3.4445, -4.775, 2.0315
+        for _ in range(steps):
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
     if transposed:
         X = X.mT
     if was_2d:
@@ -1711,9 +1731,34 @@ def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
     return Q[:, invperm], s
 
 
+def _lqer_pack(A, B, bits):
+    rng = 2 ** (bits - 1) - 1
+    sA = (A.abs().amax(dim=1).clamp_min(1e-10) / rng).to(torch.float16)
+    sB = (B.abs().amax(dim=1).clamp_min(1e-10) / rng).to(torch.float16)
+    qA = torch.clamp(torch.round(A / sA.float().view(-1, 1)), -rng, rng).to(torch.int8)
+    qB = torch.clamp(torch.round(B / sB.float().view(-1, 1)), -rng, rng).to(torch.int8)
+    return qA, sA, qB, sB
+
+
+def _lqer_pack_asym(A, B, g=64):
+    # A: INT2 per-matrix scalar (signed [-2,1], scale = |A|max/1.5).
+    sA = (A.abs().amax().clamp_min(1e-10) / 1.5).to(torch.float16)
+    qA = torch.clamp(torch.round(A / sA.float()), -2, 1).to(torch.int8)
+    # B: INT4 groupwise g over flattened B (signed [-8,7], per-group scale).
+    Bf = B.reshape(-1, g)
+    Bmax = Bf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+    sB = (Bmax / 7.5).to(torch.float16).reshape(-1)
+    qB = torch.clamp(torch.round(Bf / sB.float().reshape(-1, 1)), -8, 7).to(
+        torch.int8
+    ).reshape(B.shape)
+    return qA, sA, qB, sB
+
+
 def gptq_mixed_quantize(state_dict, hessians, h):
     result = {}
     meta = {}
+    lqer_on = bool(getattr(h, "lqer_enabled", False))
+    lqer_cands = {}
     for (name, tensor) in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         if not t.is_floating_point() or t.numel() <= 65536:
@@ -1737,6 +1782,33 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         result[name + ".q"] = q
         result[name + ".scale"] = s
         meta[name] = f"gptq (int{bits})"
+        if lqer_on:
+            W_q = q.float() * s.float().view(-1, 1)
+            E = t.float() - W_q
+            lqer_cands[name] = (E, float(E.norm()))
+    if lqer_on and lqer_cands:
+        top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: h.lqer_top_k]
+        asym_on = bool(getattr(h, "lqer_asym_enabled", False))
+        asym_g = int(getattr(h, "lqer_asym_group", 64))
+        for (name, (E, _)) in top:
+            U, S, Vh = torch.linalg.svd(E, full_matrices=False)
+            r = min(h.lqer_rank, S.numel())
+            A = (U[:, :r] * S[:r]).contiguous()
+            B = Vh[:r, :].contiguous()
+            if asym_on and B.numel() % asym_g == 0:
+                qA, sA, qB, sB = _lqer_pack_asym(A, B, asym_g)
+                result[name + ".lqA_a"] = qA
+                result[name + ".lqAs_a"] = sA
+                result[name + ".lqB_a"] = qB
+                result[name + ".lqBs_a"] = sB
+                meta[name] = meta[name] + "+lqer_asym"
+            else:
+                qA, sA, qB, sB = _lqer_pack(A, B, h.lqer_factor_bits)
+                result[name + ".lqA"] = qA
+                result[name + ".lqAs"] = sA
+                result[name + ".lqB"] = qB
+                result[name + ".lqBs"] = sB
+                meta[name] = meta[name] + "+lqer"
     categories = collections.defaultdict(set)
     for (name, cat) in meta.items():
         short = re.sub("\\.\\d+$", "", re.sub("blocks\\.\\d+", "blocks", name))
@@ -1765,11 +1837,25 @@ def dequantize_mixed(result, meta, template_sd):
             continue
         q, s = result[name + ".q"], result[name + ".scale"]
         if s.ndim > 0:
-            out[name] = (
-                q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1))
-            ).to(orig_dtype)
+            W = q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1))
         else:
-            out[name] = (q.float() * float(s.item())).to(orig_dtype)
+            W = q.float() * float(s.item())
+        if "lqer_asym" in info:
+            qA_t = result[name + ".lqA_a"]
+            sA_t = result[name + ".lqAs_a"]
+            qB_t = result[name + ".lqB_a"]
+            sB_t = result[name + ".lqBs_a"]
+            qA = qA_t.float() * float(sA_t)
+            g_sz = qB_t.numel() // sB_t.numel()
+            qB = (qB_t.reshape(-1, g_sz).float() * sB_t.float().view(-1, 1)).reshape(
+                qB_t.shape
+            )
+            W = W + qA @ qB
+        elif "lqer" in info:
+            qA = result[name + ".lqA"].float() * result[name + ".lqAs"].float().view(-1, 1)
+            qB = result[name + ".lqB"].float() * result[name + ".lqBs"].float().view(-1, 1)
+            W = W + qA @ qB
+        out[name] = W.to(orig_dtype)
     return out
 
 
