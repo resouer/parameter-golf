@@ -2585,6 +2585,16 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 )
             if needs_train:
                 activate_chunk_mask = (num_chunks_t - 1 > ci).float()
+                # TPCS: phase-conditional loss scaling. Linearly tapers from 0.5x at
+                # phase 0 (early prefix, less predictive) to 1.5x at last phase
+                # (late prefix, most predictive of eval boundary). Mean weight = 1.0
+                # so total optimization budget is preserved. Distinct from HTTL
+                # (per-token weighting, failed) — TPCS is per-phase, smoother signal,
+                # no AdamW-WD trap (no new learnable params).
+                if num_phases > 1:
+                    tpcs_weight = 0.5 + (current_phase / float(num_phases - 1)) * 1.0
+                else:
+                    tpcs_weight = 1.0
                 for gi in range(h.ttt_grad_steps):
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -2593,7 +2603,7 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                         :, chunk_offset : chunk_offset + chunk_size
                     ].mean(dim=-1)
                     cur_opt.zero_grad(set_to_none=True)
-                    (per_doc * activate_chunk_mask).sum().backward()
+                    (per_doc * activate_chunk_mask * tpcs_weight).sum().backward()
                     cur_opt.step()
             else:
                 del per_tok_loss
