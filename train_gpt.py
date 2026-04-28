@@ -1793,7 +1793,7 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         # 6+5+4+3 = 18 vs author's 4*3 = 12 (~12KB extra artifact, within budget).
         # Different allocation policy → genuinely novel mechanism, not thin retune.
         lcrs_top_k = max(int(getattr(h, "lqer_top_k", 3)), 4)
-        lcrs_ranks = [6, 5, 4, 3]
+        lcrs_ranks = [8, 6, 4, 2]
         top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: lcrs_top_k]
         asym_on = bool(getattr(h, "lqer_asym_enabled", False))
         asym_g = int(getattr(h, "lqer_asym_group", 64))
