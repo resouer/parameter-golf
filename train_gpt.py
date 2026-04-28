@@ -1787,12 +1787,19 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             E = t.float() - W_q
             lqer_cands[name] = (E, float(E.norm()))
     if lqer_on and lqer_cands:
-        top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: h.lqer_top_k]
+        # LQER-narrow: top_k=2 with rank-6 each. Author tested top_k=12 (uniform
+        # rank-4, neutral) and our LCRS [6,5,4,3] / LCRS-Plus [8,6,4,2] regressed.
+        # Hypothesis: LQER capacity is bounded by per-layer rank, not coverage.
+        # Concentrate ALL budget on top-2 highest-error layers at rank-6 each.
+        # Total rank mass 12 = same as #1874's 4*3 but spread differently.
+        narrow_top_k = 2
+        narrow_rank = 6
+        top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: narrow_top_k]
         asym_on = bool(getattr(h, "lqer_asym_enabled", False))
         asym_g = int(getattr(h, "lqer_asym_group", 64))
         for (name, (E, _)) in top:
             U, S, Vh = torch.linalg.svd(E, full_matrices=False)
-            r = min(h.lqer_rank, S.numel())
+            r = min(narrow_rank, S.numel())
             A = (U[:, :r] * S[:r]).contiguous()
             B = Vh[:r, :].contiguous()
             if asym_on and B.numel() % asym_g == 0:
