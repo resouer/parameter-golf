@@ -738,6 +738,12 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(
             torch.stack((torch.ones(dim), torch.zeros(dim))).float()
         )
+        # OPB: per-layer attention output projection bias. Init at 0 preserves baseline.
+        # safetri/LQER's F.linear(y, out_w) has no bias term — this is genuinely new
+        # additive capacity. Compensates for mean-shift errors that LQER's low-rank
+        # residual misses (LQER fixes rank-r structure; OPB fixes rank-0 mean offset).
+        # Stored as fp16 via gptq_mixed_quantize numel<=65536 passthrough (~2KB total).
+        self.attn_out_bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0):
@@ -749,6 +755,8 @@ class Block(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
+        # OPB: add per-layer attention output bias.
+        attn_out = attn_out + self.attn_out_bias.to(dtype=attn_out.dtype)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
             None, None, :
@@ -1119,6 +1127,8 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
+        # OPB: per-layer attention output bias (matches Block.forward).
+        attn_out = attn_out + block.attn_out_bias.to(dtype=attn_out.dtype)
         x_out = x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
@@ -1163,6 +1173,8 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
+        # OPB: per-layer attention output bias (matches Block.forward).
+        attn_out = attn_out + block.attn_out_bias.to(dtype=attn_out.dtype)
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
         mlp_read = lane1
         mlp_n = block.mlp_norm(mlp_read) * block.ln_scale_factor
@@ -1443,7 +1455,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_out_bias,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj",
     ).split(",")
     if pattern
 )
