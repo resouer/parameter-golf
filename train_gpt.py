@@ -99,6 +99,14 @@ class Hyperparameters:
     gate_attn_width = int(os.environ.get("GATE_ATTN_WIDTH", 24))
     global_ttt_lr = float(os.environ.get("GLOBAL_TTT_LR", 0.001))
     global_ttt_momentum = float(os.environ.get("GLOBAL_TTT_MOMENTUM", 0.9))
+    # Choice of optimizer for the per-phase global SGD step. SGD with momentum
+    # (default) gives a stable trajectory; AdamW gives per-parameter adaptive
+    # step sizes via second-moment normalization, often converging faster on
+    # small-step regimes (1 epoch / chunk-batched updates here). Default LR
+    # tuned for SGD; AdamW typically wants smaller LR (~10-100x).
+    global_ttt_optimizer = os.environ.get("GLOBAL_TTT_OPTIMIZER", "adamw")
+    global_ttt_adamw_lr = float(os.environ.get("GLOBAL_TTT_ADAMW_LR", 0.0001))
+    global_ttt_adamw_beta2 = float(os.environ.get("GLOBAL_TTT_ADAMW_BETA2", 0.95))
     global_ttt_epochs = int(os.environ.get("GLOBAL_TTT_EPOCHS", 1))
     global_ttt_chunk_tokens = int(os.environ.get("GLOBAL_TTT_CHUNK_TOKENS", 32768))
     global_ttt_batch_seqs = int(os.environ.get("GLOBAL_TTT_BATCH_SEQS", 32))
@@ -2345,9 +2353,26 @@ def train_val_ttt_global_sgd_distributed(h, device, val_data, base_model, val_to
     ttt_params = [p for p in base_model.parameters()]
     for p in ttt_params:
         p.requires_grad_(True)
-    optimizer = torch.optim.SGD(
-        ttt_params, lr=h.global_ttt_lr, momentum=h.global_ttt_momentum
-    )
+    opt_choice = str(getattr(h, "global_ttt_optimizer", "sgd")).lower()
+    if opt_choice == "adamw":
+        adamw_lr = float(getattr(h, "global_ttt_adamw_lr", 0.0001))
+        beta2 = float(getattr(h, "global_ttt_adamw_beta2", 0.95))
+        optimizer = torch.optim.AdamW(
+            ttt_params, lr=adamw_lr,
+            betas=(h.global_ttt_momentum, beta2),
+            eps=1e-10, weight_decay=0.0, fused=True,
+        )
+        # When using AdamW, repurpose the LR-schedule references to the AdamW LR
+        # so the cosine/warmup logic computes the right curve. We do this by
+        # patching h.global_ttt_lr at the optimizer-builder scope (a local
+        # alias is enough since the schedule reads h.global_ttt_lr below).
+        # To avoid mutating h, just reference adamw_lr below via a closure.
+        _sched_base_lr = adamw_lr
+    else:
+        optimizer = torch.optim.SGD(
+            ttt_params, lr=h.global_ttt_lr, momentum=h.global_ttt_momentum
+        )
+        _sched_base_lr = h.global_ttt_lr
     t_start = time.perf_counter()
     for ci in range(num_chunks):
         chunk_start = ci * ttt_chunk
@@ -2365,12 +2390,12 @@ def train_val_ttt_global_sgd_distributed(h, device, val_data, base_model, val_to
             warmup_t = ci / warmup_denom
             lr_now = (
                 h.global_ttt_warmup_start_lr
-                + (h.global_ttt_lr - h.global_ttt_warmup_start_lr) * warmup_t
+                + (_sched_base_lr - h.global_ttt_warmup_start_lr) * warmup_t
             )
         else:
             decay_steps = max(num_chunks - 1 - warmup_chunks, 1)
             decay_ci = max(ci - warmup_chunks, 0)
-            lr_now = h.global_ttt_lr * 0.5 * (
+            lr_now = _sched_base_lr * 0.5 * (
                 1.0 + math.cos(math.pi * decay_ci / decay_steps)
             )
         for pg in optimizer.param_groups:
