@@ -729,6 +729,9 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(
             torch.stack((torch.ones(dim), torch.zeros(dim))).float()
         )
+        # OPB: per-layer attention output projection bias. F.linear(y, out_w) has no bias.
+        # Genuinely new additive capacity, not absorbable into out_w (quantized) or attn_scale (multiplicative).
+        self.attn_out_bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0):
@@ -740,6 +743,8 @@ class Block(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
+        # OPB: add per-layer attention output bias.
+        attn_out = attn_out + self.attn_out_bias.to(dtype=attn_out.dtype)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
             None, None, :
@@ -755,6 +760,10 @@ class GPT(nn.Module):
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
         self.tok_emb = nn.Embedding(h.vocab_size, h.model_dim)
+        # PCB: per-class learnable output bias added to logits before softcap.
+        # Tied embeddings have NO bias term in F.linear(x, tok_emb.weight).
+        # PCB is genuinely new degree of freedom for marginal token distribution.
+        self.lm_head_bias = nn.Parameter(torch.zeros(h.vocab_size, dtype=torch.float32))
         self.num_layers = h.num_layers
         head_dim = h.model_dim // h.num_heads
         kv_dim = h.num_kv_heads * head_dim
@@ -985,7 +994,7 @@ class GPT(nn.Module):
             x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x, self.tok_emb.weight) + self.lm_head_bias.to(dtype=x.dtype)
         else:
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
@@ -1068,7 +1077,7 @@ class GPT(nn.Module):
             x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
         if self.tie_embeddings:
-            logits = F.linear(x, self.tok_emb.weight)
+            logits = F.linear(x, self.tok_emb.weight) + self.lm_head_bias.to(dtype=x.dtype)
         else:
             logits = self.lm_head(x)
         logits = logits + lora.lm_head_lora(x)
@@ -1110,6 +1119,8 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
+        # OPB: per-layer attention output bias (matches Block.forward).
+        attn_out = attn_out + block.attn_out_bias.to(dtype=attn_out.dtype)
         x_out = x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
@@ -1154,6 +1165,8 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
+        # OPB: per-layer attention output bias (matches Block.forward).
+        attn_out = attn_out + block.attn_out_bias.to(dtype=attn_out.dtype)
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
         mlp_read = lane1
         mlp_n = block.mlp_norm(mlp_read) * block.ln_scale_factor
@@ -1423,7 +1436,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,lm_head_bias,attn_out_bias,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj",
     ).split(",")
     if pattern
 )
@@ -2499,6 +2512,13 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 )
             if needs_train:
                 activate_chunk_mask = (num_chunks_t - 1 > ci).float()
+                # TPCS-V1: phase-conditional TTT loss scaling, linear taper 0.5 → 1.5.
+                # No new learnable params, redistributes TTT optimization budget toward
+                # late phases (most predictive of eval boundary).
+                if num_phases > 1:
+                    tpcs_weight = 0.5 + (current_phase / float(num_phases - 1)) * 1.0
+                else:
+                    tpcs_weight = 1.0
                 for gi in range(h.ttt_grad_steps):
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -2507,7 +2527,7 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                         :, chunk_offset : chunk_offset + chunk_size
                     ].mean(dim=-1)
                     cur_opt.zero_grad(set_to_none=True)
-                    (per_doc * activate_chunk_mask).sum().backward()
+                    (per_doc * activate_chunk_mask * tpcs_weight).sum().backward()
                     cur_opt.step()
             else:
                 del per_tok_loss
