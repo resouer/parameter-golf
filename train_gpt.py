@@ -121,6 +121,13 @@ class Hyperparameters:
     lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
     lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
     lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
+    # STREAM_TTT_LORA: don't reset per-doc LoRA (and optimizer state) between
+    # batches within a phase. The LoRA accumulates adaptation across thematically
+    # adjacent prefix/suffix docs (FineWeb has clustering). At phase boundaries,
+    # LoRA is still recreated alongside global SGD on prefix tokens. Causal:
+    # batch N is scored before its training step, so previous adaptation
+    # informs scoring without leaking future-doc information.
+    stream_ttt_lora = bool(int(os.environ.get("STREAM_TTT_LORA", "1")))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -2512,13 +2519,17 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
         prev_bytes = byte_sum.item()
         prev_tokens = token_count.item()
         if bsz == reusable_lora.bsz:
-            reusable_lora.reset()
-            for s in reusable_opt.state.values():
-                for k, v in s.items():
-                    if isinstance(v, torch.Tensor):
-                        v.zero_()
-                    elif k == "step":
-                        s[k] = 0
+            # STREAM_TTT_LORA: skip per-batch reset to let LoRA + optimizer
+            # accumulate across the doc stream within the phase. Phase boundary
+            # still recreates reusable_lora/reusable_opt unconditionally.
+            if not bool(getattr(h, "stream_ttt_lora", False)):
+                reusable_lora.reset()
+                for s in reusable_opt.state.values():
+                    for k, v in s.items():
+                        if isinstance(v, torch.Tensor):
+                            v.zero_()
+                        elif k == "step":
+                            s[k] = 0
             cur_lora = reusable_lora
             cur_opt = reusable_opt
         else:
