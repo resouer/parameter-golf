@@ -121,6 +121,12 @@ class Hyperparameters:
     lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
     lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
     lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
+    # Per-doc TTT focal-loss reweighting: backward pass weights per-token loss
+    # by loss^alpha so high-loss positions drive larger updates (similar in
+    # spirit to focal loss for classification imbalance). Scoring (val_bpb)
+    # uses the unweighted per-token loss — focal only affects optimization,
+    # not measurement. alpha=0 disables (reverts to mean). Typical alpha=0.5.
+    ttt_focal_alpha = float(os.environ.get("TTT_FOCAL_ALPHA", "0.5"))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -2585,13 +2591,25 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 )
             if needs_train:
                 activate_chunk_mask = (num_chunks_t - 1 > ci).float()
+                focal_alpha = float(getattr(h, "ttt_focal_alpha", 0.0))
                 for gi in range(h.ttt_grad_steps):
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                             per_tok_loss = forward_ttt_train(x, y, lora=cur_lora)
-                    per_doc = per_tok_loss[
+                    chunk_slice = per_tok_loss[
                         :, chunk_offset : chunk_offset + chunk_size
-                    ].mean(dim=-1)
+                    ]
+                    if focal_alpha > 0.0:
+                        # Detach weights so the reweighting itself is not
+                        # differentiated; the gradient flows through the
+                        # weighted-but-still-valued per_tok_loss path.
+                        w = chunk_slice.detach().clamp(min=1e-8).pow(focal_alpha)
+                        # Per-doc normalize so scale matches the un-weighted
+                        # mean (avoid changing the effective LR).
+                        w = w / (w.mean(dim=-1, keepdim=True) + 1e-8)
+                        per_doc = (chunk_slice * w).mean(dim=-1)
+                    else:
+                        per_doc = chunk_slice.mean(dim=-1)
                     cur_opt.zero_grad(set_to_none=True)
                     (per_doc * activate_chunk_mask).sum().backward()
                     cur_opt.step()
