@@ -988,6 +988,8 @@ class GPT(nn.Module):
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             logits_proj = self.lm_head(x)
+        # Inference Temperature Scaling: T=1.05 logit softening.
+        logits_proj = logits_proj / 1.05
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids, target_ids, cu_seqlens=None, max_seqlen=0):
@@ -1072,6 +1074,8 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits + lora.lm_head_lora(x)
+        # Inference Temperature Scaling: T=1.05 logit softening.
+        logits = logits / 1.05
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         bsz, sl, V = logits.shape
         return F.cross_entropy(
@@ -2490,6 +2494,11 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 )
             if needs_train:
                 activate_chunk_mask = (num_chunks_t - 1 > ci).float()
+                # TPCS-V1: phase-conditional TTT loss scaling.
+                if num_phases > 1:
+                    tpcs_weight = 0.5 + (current_phase / float(num_phases - 1)) * 1.0
+                else:
+                    tpcs_weight = 1.0
                 for gi in range(h.ttt_grad_steps):
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -2498,7 +2507,7 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                         :, chunk_offset : chunk_offset + chunk_size
                     ].mean(dim=-1)
                     cur_opt.zero_grad(set_to_none=True)
-                    (per_doc * activate_chunk_mask).sum().backward()
+                    (per_doc * activate_chunk_mask * tpcs_weight).sum().backward()
                     cur_opt.step()
             else:
                 del per_tok_loss
