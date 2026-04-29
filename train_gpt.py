@@ -1217,7 +1217,7 @@ class BatchedLinearLoRA(nn.Module):
                 self.scale_mod.data.fill_(1.0)
 
     def forward(self, x):
-        return ((x @ self.A.transpose(1, 2)) @ self.B.transpose(1, 2)) * self._scale * self.scale_mod
+        return ((x @ self.A.transpose(1, 2)) @ self.B.transpose(1, 2)) * self._scale * self.scale_mod.to(dtype=x.dtype)
 
 
 class BatchedTTTLoRA(nn.Module):
