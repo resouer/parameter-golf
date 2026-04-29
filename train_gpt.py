@@ -121,6 +121,14 @@ class Hyperparameters:
     lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
     lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
     lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
+    # SWA across phased-TTT: average post-global-SGD base-model state at each
+    # phase boundary. Heavier weight on later phases (more adapted) but earlier
+    # phases included for trajectory regularization. Saves intermediate states
+    # on CPU to bound GPU memory; loads averaged state back to GPU before
+    # suffix eval. Standard SWA literature: ~0.5-1% perplexity on LMs; never
+    # tried in this codebase per pivot_log.
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    swa_phase_weights = os.environ.get("SWA_PHASE_WEIGHTS", "1,2,3")
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -2500,6 +2508,10 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
     reusable_opt = _build_opt(reusable_lora)
     local_scored_docs = []
     global_ttt_done = prefix_doc_limit == 0
+    # SWA: accumulate post-global-SGD base-model states across phase boundaries.
+    # Each entry is a CPU-resident state_dict deep copy. After the final phase,
+    # we compute a weighted average and load it back into base_model on GPU.
+    swa_phase_states = []
     try:
       while True:
         queue_idx = _claim_next_batch(counter_path, queue_len)
@@ -2673,6 +2685,11 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 )
                 for p in base_model.parameters():
                     p.requires_grad_(False)
+                # SWA: snapshot post-SGD base-model state to CPU.
+                if bool(getattr(h, "swa_enabled", False)):
+                    snap = {k: v.detach().to("cpu", copy=True)
+                            for k, v in base_model.state_dict().items()}
+                    swa_phase_states.append(snap)
                 reusable_lora = BatchedTTTLoRA(
                     h.ttt_batch_size, base_model, h.ttt_lora_rank,
                     k_lora=h.ttt_k_lora, mlp_lora=h.ttt_mlp_lora, o_lora=h.ttt_o_lora,
@@ -2681,6 +2698,39 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 current_phase += 1
                 if current_phase >= num_phases:
                     global_ttt_done = True
+                    # SWA: weighted-average phase snapshots and reload into base_model.
+                    # The weighted sum is computed in fp32 on CPU then cast to each
+                    # tensor's original dtype before transfer, preserving precision.
+                    if bool(getattr(h, "swa_enabled", False)) and len(swa_phase_states) >= 2:
+                        try:
+                            raw_w = [float(x) for x in str(getattr(h, "swa_phase_weights", "1,2,3")).split(",") if x.strip()]
+                        except ValueError:
+                            raw_w = [1.0]
+                        if not raw_w:
+                            raw_w = [1.0]
+                        # Pad/truncate weights to number of snapshots
+                        if len(raw_w) < len(swa_phase_states):
+                            raw_w = raw_w + [raw_w[-1]] * (len(swa_phase_states) - len(raw_w))
+                        weights = raw_w[: len(swa_phase_states)]
+                        total_w = sum(weights)
+                        if total_w <= 0:
+                            weights = [1.0] * len(swa_phase_states)
+                            total_w = float(len(weights))
+                        avg_state = {}
+                        for k in swa_phase_states[0]:
+                            t0 = swa_phase_states[0][k]
+                            if t0.is_floating_point():
+                                acc = torch.zeros_like(t0, dtype=torch.float32)
+                                for w, s in zip(weights, swa_phase_states):
+                                    acc.add_(s[k].to(torch.float32), alpha=w / total_w)
+                                avg_state[k] = acc.to(dtype=t0.dtype, device=device)
+                            else:
+                                avg_state[k] = swa_phase_states[-1][k].to(device=device)
+                        base_model.load_state_dict(avg_state)
+                        if h.rank == 0:
+                            log(f"swa: averaged {len(swa_phase_states)} phase states with weights {weights}")
+                        # Free CPU snapshots
+                        del swa_phase_states[:]
                 else:
                     current_phase_boundary = phase_boundaries[current_phase]
                     if h.rank == 0:
