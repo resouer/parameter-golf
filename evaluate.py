@@ -321,6 +321,10 @@ PIP_NO_CACHE_DIR=1 "$PYBIN" -m pip install -q --no-cache-dir sentencepiece huggi
 if ! command -v git >/dev/null 2>&1; then
   apt-get update && apt-get install -y git
 fi
+# lrzip needed for per-group compressor (PR #1855 stack)
+if ! command -v lrzip >/dev/null 2>&1; then
+  apt-get update && apt-get install -y lrzip 2>/dev/null || true
+fi
 
 {clone_setup}
 cd /workspace/pgolf
