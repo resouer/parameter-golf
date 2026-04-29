@@ -936,7 +936,15 @@ class GPT(nn.Module):
         if self.smear_gate_enabled and x.dim() == 3 and x.size(1) > 1:
             sl = self.smear_lambda.to(dtype=x.dtype)
             g = sl * torch.sigmoid(self.smear_gate(x[:, 1:, :self.smear_width]))
-            x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1]], dim=1)
+            # BOS leak fix: when input_ids[i] == BOS_ID (start of new doc in
+            # packed eval stream), the previous-token embedding x[:, :-1][i-1]
+            # belongs to a DIFFERENT document. Mask the smear contribution on
+            # BOS rows to prevent cross-doc info leakage.
+            global BOS_ID
+            if BOS_ID is None:
+                BOS_ID = 1
+            not_bos = (input_ids[:, 1:] != BOS_ID).to(dtype=x.dtype).unsqueeze(-1)
+            x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1] * not_bos], dim=1)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips = []
@@ -1014,7 +1022,13 @@ class GPT(nn.Module):
         if self.smear_gate_enabled and x.dim() == 3 and x.size(1) > 1:
             sl = self.smear_lambda.to(dtype=x.dtype)
             g = sl * torch.sigmoid(self.smear_gate(x[:, 1:, :self.smear_width]))
-            x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1]], dim=1)
+            # BOS leak fix (matching forward_logits) — prevents cross-document
+            # smear at packed-eval BOS positions.
+            global BOS_ID
+            if BOS_ID is None:
+                BOS_ID = 1
+            not_bos = (input_ids[:, 1:] != BOS_ID).to(dtype=x.dtype).unsqueeze(-1)
+            x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1] * not_bos], dim=1)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips = []
