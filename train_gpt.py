@@ -988,6 +988,9 @@ class GPT(nn.Module):
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             logits_proj = self.lm_head(x)
+        # Inference Temperature Scaling: soften logits by T=1.05 before softcap.
+        # No learnable params. If model is overconfident, T>1 reduces NLL on hard tokens.
+        logits_proj = logits_proj / 1.05
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids, target_ids, cu_seqlens=None, max_seqlen=0):
@@ -1072,6 +1075,8 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits + lora.lm_head_lora(x)
+        # Inference Temperature Scaling: soften logits by T=1.05 before softcap.
+        logits = logits / 1.05
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         bsz, sl, V = logits.shape
         return F.cross_entropy(
