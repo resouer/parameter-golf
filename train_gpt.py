@@ -2490,6 +2490,12 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                 )
             if needs_train:
                 activate_chunk_mask = (num_chunks_t - 1 > ci).float()
+                # TPCS-V1: phase-conditional TTT loss scaling, linear taper 0.5 → 1.5.
+                # No new learnable params. Genuinely novel for parameter-golf.
+                if num_phases > 1:
+                    tpcs_weight = 0.5 + (current_phase / float(num_phases - 1)) * 1.0
+                else:
+                    tpcs_weight = 1.0
                 for gi in range(h.ttt_grad_steps):
                     if gi > 0:
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -2498,7 +2504,7 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
                         :, chunk_offset : chunk_offset + chunk_size
                     ].mean(dim=-1)
                     cur_opt.zero_grad(set_to_none=True)
-                    (per_doc * activate_chunk_mask).sum().backward()
+                    (per_doc * activate_chunk_mask * tpcs_weight).sum().backward()
                     cur_opt.step()
             else:
                 del per_tok_loss
