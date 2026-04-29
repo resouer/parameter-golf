@@ -1197,6 +1197,12 @@ class BatchedLinearLoRA(nn.Module):
     # Novel: rank-scaled output (alpha/rank), like standard LoRA. Decouples
     # effective magnitude from rank so changing rank does not change LR scale.
     _ALPHA = float(os.environ.get("TTT_LORA_ALPHA", "144"))
+    # Scalar learnable LoRA scale: a SINGLE shared scalar parameter per LoRA
+    # layer (NOT per-batch-slot, to avoid the bsz-broadcast-fused-Triton SHM
+    # blowup we hit at TTT_LORA_LEARNABLE_SCALE=1 with (bsz,1,1)). Shared
+    # across all batch slots, this is a per-layer "how much LoRA correction
+    # to apply" knob trained alongside A,B in the TTT optimizer.
+    _LEARNABLE_SCALAR = bool(int(os.environ.get("TTT_LORA_LEARNABLE_SCALAR", "1")))
 
     def __init__(self, bsz, in_features, out_features, rank):
         super().__init__()
@@ -1206,6 +1212,12 @@ class BatchedLinearLoRA(nn.Module):
             torch.empty(bsz, rank, in_features).uniform_(-self._bound, self._bound)
         )
         self.B = nn.Parameter(torch.zeros(bsz, out_features, rank))
+        # Single scalar parameter (no batch dim) — broadcasts across all
+        # outputs without entering the Triton-fused matmul kernel's tile.
+        if self._LEARNABLE_SCALAR:
+            self.scale_mod = nn.Parameter(torch.ones(()))
+        else:
+            self.register_buffer("scale_mod", torch.ones(()), persistent=False)
 
     _WARM_START_A = bool(int(os.environ.get("TTT_WARM_START_A", "1")))
 
@@ -1215,9 +1227,15 @@ class BatchedLinearLoRA(nn.Module):
             if not self._WARM_START_A:
                 self.A.uniform_(-self._bound, self._bound)
             self.B.zero_()
+            # Reset scalar to 1.0 (identity) at each batch.
+            if self._LEARNABLE_SCALAR:
+                self.scale_mod.data.fill_(1.0)
 
     def forward(self, x):
-        return ((x @ self.A.transpose(1, 2)) @ self.B.transpose(1, 2)) * self._scale
+        # Apply scalar AFTER the fused matmul to keep it out of the Triton
+        # kernel's per-block working set.
+        out = ((x @ self.A.transpose(1, 2)) @ self.B.transpose(1, 2)) * self._scale
+        return out * self.scale_mod.to(dtype=out.dtype)
 
 
 class BatchedTTTLoRA(nn.Module):
