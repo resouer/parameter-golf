@@ -1184,6 +1184,8 @@ class BatchedLinearLoRA(nn.Module):
     # effective magnitude from rank so changing rank does not change LR scale.
     _ALPHA = float(os.environ.get("TTT_LORA_ALPHA", "144"))
 
+    _LEARNABLE_SCALE = bool(int(os.environ.get("TTT_LORA_LEARNABLE_SCALE", "1")))
+
     def __init__(self, bsz, in_features, out_features, rank):
         super().__init__()
         self._bound = 1.0 / math.sqrt(in_features)
@@ -1192,6 +1194,14 @@ class BatchedLinearLoRA(nn.Module):
             torch.empty(bsz, rank, in_features).uniform_(-self._bound, self._bound)
         )
         self.B = nn.Parameter(torch.zeros(bsz, out_features, rank))
+        # Novel: learnable per-LoRA scale multiplier. Initialized to 1.0 so
+        # initial behaviour is identical; TTT optimizer can shrink/grow per-layer
+        # contribution. Adds bsz scalars per LoRA layer (~11 layers × 5 types
+        # × bsz scalars total — negligible vs A/B parameter count).
+        if self._LEARNABLE_SCALE:
+            self.scale_mod = nn.Parameter(torch.ones(bsz, 1, 1))
+        else:
+            self.register_buffer("scale_mod", torch.ones(1, 1, 1), persistent=False)
 
     _WARM_START_A = bool(int(os.environ.get("TTT_WARM_START_A", "1")))
 
@@ -1201,9 +1211,13 @@ class BatchedLinearLoRA(nn.Module):
             if not self._WARM_START_A:
                 self.A.uniform_(-self._bound, self._bound)
             self.B.zero_()
+            # Reset scale_mod to 1.0 each batch (a learnable Parameter keeps
+            # gradient state unless we zero it). Buffer path is constant 1.0.
+            if self._LEARNABLE_SCALE:
+                self.scale_mod.data.fill_(1.0)
 
     def forward(self, x):
-        return ((x @ self.A.transpose(1, 2)) @ self.B.transpose(1, 2)) * self._scale
+        return ((x @ self.A.transpose(1, 2)) @ self.B.transpose(1, 2)) * self._scale * self.scale_mod
 
 
 class BatchedTTTLoRA(nn.Module):
