@@ -121,6 +121,12 @@ class Hyperparameters:
     lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
     lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
     lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
+    # HW-LQER: Hessian-weighted SVD for LQER residual decomposition. The plain
+    # SVD minimizes Frobenius distance, treating all input columns equally. The
+    # weighted variant minimizes column-Hessian-weighted distance, prioritizing
+    # high-activation input dimensions which dominate the model's output error.
+    lqer_hessian_weighted = bool(int(os.environ.get("LQER_HESSIAN_WEIGHTED", "1")))
+    lqer_hw_clip_ratio = float(os.environ.get("LQER_HW_CLIP_RATIO", "100"))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1785,16 +1791,40 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         if lqer_on:
             W_q = q.float() * s.float().view(-1, 1)
             E = t.float() - W_q
-            lqer_cands[name] = (E, float(E.norm()))
+            if bool(getattr(h, "lqer_hessian_weighted", False)):
+                H_diag = torch.diag(hessians[name]).float().clamp_min(1e-6).sqrt()
+                # Cap weighting to prevent extreme un-weighting amplification of B
+                # (which would saturate int4 packing). Median-relative clip in both directions.
+                med = H_diag.median()
+                clip_r = float(getattr(h, "lqer_hw_clip_ratio", 100.0))
+                H_diag = H_diag.clamp(min=med / clip_r, max=med * clip_r)
+                # Selection norm: prioritize layers with largest weighted residual.
+                # The unweighted norm sorts by Frobenius distance which weights all
+                # input columns equally, but loss-relevant error is concentrated in
+                # high-Hessian columns — match selection to the loss objective.
+                sel_norm = float((E * H_diag.unsqueeze(0)).norm())
+                lqer_cands[name] = (E, sel_norm, H_diag)
+            else:
+                lqer_cands[name] = (E, float(E.norm()), None)
     if lqer_on and lqer_cands:
         top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: h.lqer_top_k]
         asym_on = bool(getattr(h, "lqer_asym_enabled", False))
         asym_g = int(getattr(h, "lqer_asym_group", 64))
-        for (name, (E, _)) in top:
-            U, S, Vh = torch.linalg.svd(E, full_matrices=False)
-            r = min(h.lqer_rank, S.numel())
-            A = (U[:, :r] * S[:r]).contiguous()
-            B = Vh[:r, :].contiguous()
+        for (name, (E, _, H_diag)) in top:
+            if H_diag is not None:
+                # Column-weighted SVD: minimize ||(E - AB) * diag(H_diag)||_F^2
+                # = || E_w - A B' ||_F^2  where E_w = E * H_diag, B' = B * H_diag.
+                # SVD truncation gives A = U_r S_r, B' = V_r^T; recover B = V_r^T / H_diag.
+                E_w = E * H_diag.unsqueeze(0)
+                U, S, Vh = torch.linalg.svd(E_w, full_matrices=False)
+                r = min(h.lqer_rank, S.numel())
+                A = (U[:, :r] * S[:r]).contiguous()
+                B = (Vh[:r, :] / H_diag.unsqueeze(0)).contiguous()
+            else:
+                U, S, Vh = torch.linalg.svd(E, full_matrices=False)
+                r = min(h.lqer_rank, S.numel())
+                A = (U[:, :r] * S[:r]).contiguous()
+                B = Vh[:r, :].contiguous()
             if asym_on and B.numel() % asym_g == 0:
                 qA, sA, qB, sB = _lqer_pack_asym(A, B, asym_g)
                 result[name + ".lqA_a"] = qA
