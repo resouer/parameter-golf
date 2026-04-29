@@ -1074,8 +1074,23 @@ class GPT(nn.Module):
         logits = logits + lora.lm_head_lora(x)
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         bsz, sl, V = logits.shape
+        # PUBS: Prefix Unigram Backoff Smoothing. Causal cumulative unigram
+        # from input_ids; mix into log-prob at α=0.95 model + 0.05 unigram.
+        # No new learnable params. Genuinely novel mechanism for parameter-golf.
+        one_hot = F.one_hot(input_ids, V).to(dtype=torch.float32)  # (B, S, V)
+        cumcount = one_hot.cumsum(dim=1)  # (B, S, V) cumulative count incl. position i
+        positions = torch.arange(1, sl + 1, device=logits.device, dtype=torch.float32)
+        unigram_p = cumcount / positions[None, :, None]  # (B, S, V)
+        log_alpha = math.log(0.95)
+        log_one_minus_alpha = math.log(0.05)
+        unigram_log_p = torch.log(unigram_p.clamp(min=1e-9))
+        log_p_model = F.log_softmax(logits.float(), dim=-1)
+        log_p_mix = torch.logaddexp(log_p_model + log_alpha, unigram_log_p + log_one_minus_alpha)
+        # log_p_mix is valid log-prob; pass to cross_entropy as effective logits
+        # (CE applies log_softmax internally, but log_softmax(log_p) == log_p
+        # when log_p is already a valid log-prob, so the loss is correct.)
         return F.cross_entropy(
-            logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
+            log_p_mix.reshape(-1, V), target_ids.reshape(-1), reduction="none"
         ).reshape(bsz, sl)
 
     def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
