@@ -91,6 +91,26 @@ FORWARDED_JOB_ENV_KEYS = (
     "LQER_FACTOR_BITS",
     "LQER_ASYM_ENABLED",
     "LQER_ASYM_GROUP",
+    # Additional #1855 feature flags + training hyperparams that must reach
+    # the worker for full reproduction:
+    "SPARSE_ATTN_GATE_ENABLED",
+    "SMEAR_GATE_ENABLED",
+    "GATED_ATTN_QUANT_GATE",
+    "FUSED_CE_ENABLED",
+    "ATTN_CLIP_SIGMAS",
+    "MATRIX_LR",
+    "MATRIX_BITS",
+    "MIN_LR",
+    "GPTQ_RESERVE_SECONDS",
+    "GPTQ_CALIBRATION_BATCHES",
+    "GRAD_CLIP_NORM",
+    "TTT_CHUNK_SIZE",
+    "WARMUP_STEPS",
+    "MUON_BACKEND_STEPS",
+    "GLOBAL_TTT_MOMENTUM",
+    "PHASED_TTT_ENABLED",
+    "PHASED_TTT_NUM_PHASES",
+    "GATE_WINDOW",
 )
 
 
