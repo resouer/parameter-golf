@@ -18,6 +18,8 @@ def dataset_dir_for_variant(name: str) -> str:
         return "fineweb10B_byte260"
     if name.startswith("sp") and name[2:].isdigit():
         return f"fineweb10B_{name}"
+    if name.startswith("sp"):
+        return f"fineweb10B_{name}"
     raise ValueError(f"unsupported variant {name!r}; expected byte260 or sp<VOCAB_SIZE>")
 
 
@@ -146,6 +148,10 @@ def main() -> None:
     dataset_prefix = f"{REMOTE_ROOT_PREFIX}/datasets/{dataset_dir}"
     for i in range(val_shards):
         get(f"{dataset_prefix}/fineweb_val_{i:06d}.bin")
+    val_bytes_glob = dataset_entry.get("val_bytes_glob")
+    if val_bytes_glob:
+        for i in range(val_shards):
+            get(f"{dataset_prefix}/fineweb_val_bytes_{i:06d}.bin")
     for i in range(train_shards):
         get(f"{dataset_prefix}/fineweb_train_{i:06d}.bin")
 
