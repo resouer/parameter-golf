@@ -75,6 +75,22 @@ FORWARDED_JOB_ENV_KEYS = (
     "EMBED_CLIP_SIGMAS",
     "COMPRESSOR",
     "QK_GAIN_INIT",
+    # CaseOps + #1855's 9-hp greedy stack overrides + LQER flags:
+    "CASEOPS_ENABLED",
+    "MLP_CLIP_SIGMAS",
+    "WARMDOWN_FRAC",
+    "BETA2",
+    "TTT_BETA2",
+    "TTT_WEIGHT_DECAY",
+    "TTT_LORA_RANK",
+    "SPARSE_ATTN_GATE_SCALE",
+    "PHASED_TTT_PREFIX_DOCS",
+    "LQER_ENABLED",
+    "LQER_RANK",
+    "LQER_TOP_K",
+    "LQER_FACTOR_BITS",
+    "LQER_ASYM_ENABLED",
+    "LQER_ASYM_GROUP",
 )
 
 
