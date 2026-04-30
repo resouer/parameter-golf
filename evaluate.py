@@ -91,6 +91,7 @@ FORWARDED_JOB_ENV_KEYS = (
     "LQER_FACTOR_BITS",
     "LQER_ASYM_ENABLED",
     "LQER_ASYM_GROUP",
+    "LQER_ITER_RANK",
     # Additional #1855 feature flags + training hyperparams that must reach
     # the worker for full reproduction:
     "SPARSE_ATTN_GATE_ENABLED",

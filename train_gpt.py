@@ -366,6 +366,13 @@ class Hyperparameters:
     lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
     lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
     lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
+    # Iterative LQER (NEW NOVELTY): apply LQER twice on the SAME top-K layers.
+    # Level-2 SVD targets the residual AFTER level-1's QUANTIZED reconstruction,
+    # so it captures both (a) truncation residual (singular values beyond rank-r1)
+    # AND (b) quantization error of level-1 (which stored A,B at int2/int4).
+    # Substantively different from single-level higher-rank because (b) does NOT
+    # appear in plain higher-rank SVD. Default 0 = disabled (matches current).
+    lqer_iter_rank = int(os.environ.get("LQER_ITER_RANK", 0))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -2273,18 +2280,24 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: h.lqer_top_k]
         asym_on = bool(getattr(h, "lqer_asym_enabled", False))
         asym_g = int(getattr(h, "lqer_asym_group", 64))
+        iter_rank = int(getattr(h, "lqer_iter_rank", 0))
         for (name, (E, _)) in top:
             U, S, Vh = torch.linalg.svd(E, full_matrices=False)
             r = min(h.lqer_rank, S.numel())
             A = (U[:, :r] * S[:r]).contiguous()
             B = Vh[:r, :].contiguous()
-            if asym_on and B.numel() % asym_g == 0:
+            asym_packed = asym_on and B.numel() % asym_g == 0
+            if asym_packed:
                 qA, sA, qB, sB = _lqer_pack_asym(A, B, asym_g)
                 result[name + ".lqA_a"] = qA
                 result[name + ".lqAs_a"] = sA
                 result[name + ".lqB_a"] = qB
                 result[name + ".lqBs_a"] = sB
                 meta[name] = meta[name] + "+lqer_asym"
+                # Recover quantized level-1 reconstruction for level-2 residual
+                A1_dq = qA.float() * float(sA)
+                g_sz = qB.numel() // sB.numel()
+                B1_dq = (qB.reshape(-1, g_sz).float() * sB.float().view(-1, 1)).reshape(qB.shape)
             else:
                 qA, sA, qB, sB = _lqer_pack(A, B, h.lqer_factor_bits)
                 result[name + ".lqA"] = qA
@@ -2292,6 +2305,31 @@ def gptq_mixed_quantize(state_dict, hessians, h):
                 result[name + ".lqB"] = qB
                 result[name + ".lqBs"] = sB
                 meta[name] = meta[name] + "+lqer"
+                A1_dq = qA.float() * sA.float().view(-1, 1)
+                B1_dq = qB.float() * sB.float().view(-1, 1)
+            # NOVELTY: Iterative LQER level-2. Captures truncation residual AND
+            # quantization error of level-1 (which plain higher-rank SVD wouldn't).
+            if iter_rank > 0:
+                E2 = E - (A1_dq @ B1_dq).to(E.dtype)
+                U2, S2, V2h = torch.linalg.svd(E2, full_matrices=False)
+                r2 = min(iter_rank, S2.numel())
+                A2 = (U2[:, :r2] * S2[:r2]).contiguous()
+                B2 = V2h[:r2, :].contiguous()
+                asym2_ok = asym_on and B2.numel() % asym_g == 0
+                if asym2_ok:
+                    qA2, sA2, qB2, sB2 = _lqer_pack_asym(A2, B2, asym_g)
+                    result[name + ".lqA_a2"] = qA2
+                    result[name + ".lqAs_a2"] = sA2
+                    result[name + ".lqB_a2"] = qB2
+                    result[name + ".lqBs_a2"] = sB2
+                    meta[name] = meta[name] + "+lqer_iter_asym"
+                else:
+                    qA2, sA2, qB2, sB2 = _lqer_pack(A2, B2, h.lqer_factor_bits)
+                    result[name + ".lqA2"] = qA2
+                    result[name + ".lqAs2"] = sA2
+                    result[name + ".lqB2"] = qB2
+                    result[name + ".lqBs2"] = sB2
+                    meta[name] = meta[name] + "+lqer_iter"
     categories = collections.defaultdict(set)
     for (name, cat) in meta.items():
         short = re.sub("\\.\\d+$", "", re.sub("blocks\\.\\d+", "blocks", name))
@@ -2342,6 +2380,23 @@ def dequantize_mixed(result, meta, template_sd):
             qA = result[name + ".lqA"].float() * result[name + ".lqAs"].float().view(-1, 1)
             qB = result[name + ".lqB"].float() * result[name + ".lqBs"].float().view(-1, 1)
             W = W + qA @ qB
+        # NOVELTY: Iterative LQER level-2 reconstruction (captures truncation +
+        # level-1 quant error). Additive on top of level-1.
+        if "lqer_iter_asym" in info:
+            qA2_t = result[name + ".lqA_a2"]
+            sA2_t = result[name + ".lqAs_a2"]
+            qB2_t = result[name + ".lqB_a2"]
+            sB2_t = result[name + ".lqBs_a2"]
+            qA2 = qA2_t.float() * float(sA2_t)
+            g2 = qB2_t.numel() // sB2_t.numel()
+            qB2 = (qB2_t.reshape(-1, g2).float() * sB2_t.float().view(-1, 1)).reshape(
+                qB2_t.shape
+            )
+            W = W + qA2 @ qB2
+        elif "lqer_iter" in info:
+            qA2 = result[name + ".lqA2"].float() * result[name + ".lqAs2"].float().view(-1, 1)
+            qB2 = result[name + ".lqB2"].float() * result[name + ".lqBs2"].float().view(-1, 1)
+            W = W + qA2 @ qB2
         out[name] = W.to(orig_dtype)
     return out
 
