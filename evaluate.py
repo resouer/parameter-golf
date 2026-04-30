@@ -115,6 +115,8 @@ FORWARDED_JOB_ENV_KEYS = (
     "TTT_BETA1",
     "GLOBAL_TTT_LR",
     "GLOBAL_TTT_EPOCHS",
+    # PHLG: per-head learnable post-attention output gain (R-final novel mechanism).
+    "PHLG_ENABLED",
 )
 
 

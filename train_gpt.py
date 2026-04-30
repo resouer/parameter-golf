@@ -358,6 +358,18 @@ class Hyperparameters:
     sparse_attn_gate_enabled = bool(int(os.environ.get("SPARSE_ATTN_GATE_ENABLED", "0")))
     sparse_attn_gate_init_std = float(os.environ.get("SPARSE_ATTN_GATE_INIT_STD", 0.0))
     sparse_attn_gate_scale = float(os.environ.get("SPARSE_ATTN_GATE_SCALE", 1.0))
+    # PHLG: Per-Head Learnable post-attention output Gain. Adds an unquantized
+    # nn.Parameter shape (num_heads,) per attention block, applied as
+    # `y = y * head_out_gain[None, None, :, None]` AFTER existing gates and BEFORE
+    # the (B,T,H,D)->(B,T,dim) reshape that feeds out_proj. Init=1.0 so step-0
+    # behavior is identical to baseline. Why non-redundant in the quantized regime:
+    # out_proj is GPTQ-quantized, so a per-head fp16 scalar that bypasses GPTQ
+    # gives the model an unquantized degree of freedom over per-head output
+    # magnitude that no other parameter provides. Tiny: num_heads * num_layers
+    # = 8 * 12 = 96 floats, fp16 passthrough (numel<<65536). Routed to scalar
+    # AdamW group via ndim<2 (1D tensor). Default ON for the lane; set
+    # PHLG_ENABLED=0 to A/B against the unmodified #1855 stack on this branch.
+    phlg_enabled = bool(int(os.environ.get("PHLG_ENABLED", "1")))
     # LQER asymmetric rank-k correction on top-K quant-error tensors (PR #1530 v2 port).
     # Computes SVD of E = W_fp - W_quant, packs top-r A,B as INT2/INT4 (asym) or INTk (sym).
     lqer_enabled = bool(int(os.environ.get("LQER_ENABLED", "1")))
@@ -944,6 +956,7 @@ class CausalSelfAttention(nn.Module):
         attn_out_gate=False, attn_out_gate_src="proj", gate_window=12,
         gated_attn=False, gated_attn_init_std=0.01,
         sparse_attn_gate=False, sparse_attn_gate_init_std=0.0, sparse_attn_gate_scale=1.0,
+        phlg=False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -999,6 +1012,17 @@ class CausalSelfAttention(nn.Module):
             else:
                 nn.init.zeros_(W)
             self.attn_gate_w = nn.Parameter(W)
+        # PHLG: per-head learnable post-attention output gain. fp32 storage so
+        # restore_fp32_params keeps it in fp32 for GPTQ. Init=1.0 is transparent
+        # at step 0 (model behavior identical to phlg=False). 1D shape -> ndim<2
+        # routes to scalar AdamW group automatically; numel<<65536 routes to fp16
+        # passthrough during gptq_mixed_quantize so the parameter is preserved
+        # in the artifact unquantized.
+        self.phlg = phlg
+        if phlg:
+            self.head_out_gain = nn.Parameter(
+                torch.ones(num_heads, dtype=torch.float32)
+            )
 
     def _xsa_efficient(self, y, v):
         B, T, H, D = y.shape
@@ -1064,6 +1088,13 @@ class CausalSelfAttention(nn.Module):
                 * F.linear(gate_in, self.attn_gate_w.to(x.dtype))
             )
             y = y * g[..., None]
+        # PHLG: per-head learnable post-attention output gain. Applied AFTER all
+        # input-conditioned gates so it stacks multiplicatively as a position- and
+        # input-invariant per-head magnitude that is unquantized (out_proj is
+        # GPTQ-quantized, so this gives the model an unquantized fp16 DoF over
+        # per-head output magnitude). Init=1.0 -> transparent at step 0.
+        if self.phlg:
+            y = y * self.head_out_gain.to(dtype=y.dtype)[None, None, :, None]
         y = y.reshape(bsz, seqlen, dim)
         self._last_proj_input = y.detach() if getattr(self, "_calib", False) else None
         return F.linear(y, out_w.to(x.dtype))
@@ -1103,6 +1134,7 @@ class Block(nn.Module):
         sparse_attn_gate=False,
         sparse_attn_gate_init_std=0.0,
         sparse_attn_gate_scale=1.0,
+        phlg=False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1114,6 +1146,7 @@ class Block(nn.Module):
             sparse_attn_gate=sparse_attn_gate,
             sparse_attn_gate_init_std=sparse_attn_gate_init_std,
             sparse_attn_gate_scale=sparse_attn_gate_scale,
+            phlg=phlg,
         )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1179,6 +1212,7 @@ class GPT(nn.Module):
                     sparse_attn_gate=h.sparse_attn_gate_enabled,
                     sparse_attn_gate_init_std=h.sparse_attn_gate_init_std,
                     sparse_attn_gate_scale=h.sparse_attn_gate_scale,
+                    phlg=h.phlg_enabled,
                 )
                 for i in range(h.num_layers)
             ]
@@ -1553,6 +1587,10 @@ class GPT(nn.Module):
                 * F.linear(gate_in, attn.attn_gate_w.to(n.dtype))
             )
             y = y * g[..., None]
+        # PHLG (TTT path) — must match forward() exactly so train-time and TTT-eval
+        # representations stay aligned (else BPB regression).
+        if attn.phlg:
+            y = y * attn.head_out_gain.to(dtype=y.dtype)[None, None, :, None]
         y = y.reshape(bsz, seqlen, dim)
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
@@ -1613,6 +1651,9 @@ class GPT(nn.Module):
                 * F.linear(gate_in, attn.attn_gate_w.to(n.dtype))
             )
             y = y * g[..., None]
+        # PHLG (TTT parallel path) — same per-head output gain as forward().
+        if attn.phlg:
+            y = y * attn.head_out_gain.to(dtype=y.dtype)[None, None, :, None]
         y = y.reshape(bsz, seqlen, dim)
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
@@ -1888,7 +1929,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,attn_gate_w,smear_gate,smear_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,head_out_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,attn_gate_w,smear_gate,smear_lambda",
     ).split(",")
     if pattern
 )
