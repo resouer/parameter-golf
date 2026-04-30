@@ -229,7 +229,9 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.75))
+    # PR #1855 9-hp greedy tune: WARMDOWN_FRAC 0.75 -> 0.85 (longer warmdown phase
+    # with gentler decay slope, validated by codemath3000 across 3 seeds)
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.85))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786432))
     # Fused softcapped CE (Triton). Training-only — forward_logits eval path still uses
@@ -277,7 +279,9 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     muon_row_normalize = bool(int(os.environ.get("MUON_ROW_NORMALIZE", "1")))
     beta1 = float(os.environ.get("BETA1", 0.9))
-    beta2 = float(os.environ.get("BETA2", 0.95))
+    # PR #1855 9-hp greedy tune: BETA2 0.95 -> 0.99 (more stable Adam grad EMA;
+    # already used by #1953 actual run via Lepton env override)
+    beta2 = float(os.environ.get("BETA2", 0.99))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-08))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
@@ -286,7 +290,9 @@ class Hyperparameters:
     embed_wd = float(os.environ.get("EMBED_WD", 0.085))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
-    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 96))
+    # PR #1855 9-hp greedy tune: TTT_LORA_RANK 96 -> 80 (counter-intuitive but
+    # consistent across 3 seeds in #1855 base; #1953 actual run uses 80 too)
+    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 80))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
     ttt_local_lr_mult = float(os.environ.get("TTT_LOCAL_LR_MULT", 1.0))
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 48))
@@ -297,9 +303,17 @@ class Hyperparameters:
     # the Triton fused-CE kernel's fp32-accumulation interacts with warm-start LoRA-A
     # to destabilize seeds 314/1337 at TTT_WEIGHT_DECAY=1.0. Raising the default to
     # 2.0 prevents seed collapse without measurably moving stable seeds.
-    ttt_weight_decay = float(os.environ.get("TTT_WEIGHT_DECAY", 2.0))
+    # c-20260430-1953-perglrzip cross-stack: PR #1855 9-hp tune sets
+    # TTT_WEIGHT_DECAY=0.5 (weaker decay during phased eval); validated on three
+    # seeds by codemath3000 in #1855 base + #1953 actual production run (seeds
+    # 0/42/1234 all at 1.05824/1.05846/1.05895). The seed-stability concern from
+    # V19 was for TTT_WEIGHT_DECAY=1.0 specifically; 0.5 is even further from
+    # the unstable 1.0 anchor and has been measured stable in #1953.
+    ttt_weight_decay = float(os.environ.get("TTT_WEIGHT_DECAY", 0.5))
     ttt_beta1 = float(os.environ.get("TTT_BETA1", 0))
-    ttt_beta2 = float(os.environ.get("TTT_BETA2", 0.999))
+    # PR #1855 9-hp greedy tune: TTT_BETA2 0.999 -> 0.99 (faster TTT-Adam adaptation;
+    # measured beneficial in #1855 BOSSmearFix + #1953 actual run)
+    ttt_beta2 = float(os.environ.get("TTT_BETA2", 0.99))
     ttt_mask = os.environ.get("TTT_MASK", "").strip().lower()
     _ttt_q_default = "1"
     _ttt_v_default = "1"
@@ -325,7 +339,9 @@ class Hyperparameters:
     compressor = os.environ.get("COMPRESSOR", "brotli")
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 16))
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 4.0))
-    phased_ttt_prefix_docs = int(os.environ.get("PHASED_TTT_PREFIX_DOCS", 2000))
+    # PR #1855 9-hp greedy tune: PHASED_TTT_PREFIX_DOCS 2000 -> 2500 (longer
+    # per-phase TTT prefix; uses 455-509s of 600s eval budget per #1855 README)
+    phased_ttt_prefix_docs = int(os.environ.get("PHASED_TTT_PREFIX_DOCS", 2500))
     phased_ttt_num_phases = int(os.environ.get("PHASED_TTT_NUM_PHASES", 1))
     global_ttt_lr = float(os.environ.get("GLOBAL_TTT_LR", 0.001))
     global_ttt_momentum = float(os.environ.get("GLOBAL_TTT_MOMENTUM", 0.9))
@@ -339,8 +355,12 @@ class Hyperparameters:
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
     embed_bits = int(os.environ.get("EMBED_BITS", 8))
     matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))
-    embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 2e1))
-    mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 10.0))
+    # PR #1855 9-hp greedy tune: EMBED_CLIP_SIGMAS 20.0 -> 14.0 (tighter embed
+    # clip → finer int7 granularity in bulk of embedding distribution)
+    embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 14.0))
+    # PR #1855 9-hp greedy tune: MLP_CLIP_SIGMAS 10.0 -> 11.5 (looser MLP clip,
+    # preserves more outliers vs. coarser bulk during GPTQ quantization)
+    mlp_clip_sigmas = float(os.environ.get("MLP_CLIP_SIGMAS", 11.5))
     attn_clip_sigmas = float(os.environ.get("ATTN_CLIP_SIGMAS", 13.0))
     # AttnOutGate (per-head multiplicative output gate, PR #1667 MarioPaerle).
     # Zero-init weight: 2*sigmoid(0)=1 -> transparent at start. Source defaults to
@@ -378,7 +398,9 @@ class Hyperparameters:
     # Mutually exclusive with ATTN_OUT_GATE_ENABLED and GATED_ATTN_ENABLED.
     sparse_attn_gate_enabled = bool(int(os.environ.get("SPARSE_ATTN_GATE_ENABLED", "0")))
     sparse_attn_gate_init_std = float(os.environ.get("SPARSE_ATTN_GATE_INIT_STD", 0.0))
-    sparse_attn_gate_scale = float(os.environ.get("SPARSE_ATTN_GATE_SCALE", 1.0))
+    # PR #1855 9-hp greedy tune: SPARSE_ATTN_GATE_SCALE 1.0 -> 0.5 (softer
+    # head-output gate; gate amplitude halved post-sigmoid)
+    sparse_attn_gate_scale = float(os.environ.get("SPARSE_ATTN_GATE_SCALE", 0.5))
     # LQER asymmetric rank-k correction on top-K quant-error tensors (PR #1530 v2 port).
     # Computes SVD of E = W_fp - W_quant, packs top-r A,B as INT2/INT4 (asym) or INTk (sym).
     lqer_enabled = bool(int(os.environ.get("LQER_ENABLED", "1")))
