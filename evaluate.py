@@ -115,6 +115,17 @@ FORWARDED_JOB_ENV_KEYS = (
     "TTT_BETA1",
     "GLOBAL_TTT_LR",
     "GLOBAL_TTT_EPOCHS",
+    # PR #1953 4-lever port: long-ctx 2560, no_qv TTT mask, TTT LR mult 0.75,
+    # QK_GAIN 5.25 (QK_GAIN_INIT already in list above).
+    "EVAL_SEQ_LEN",
+    "TTT_EVAL_SEQ_LEN",
+    "TTT_MASK",
+    "TTT_Q_LORA",
+    "TTT_V_LORA",
+    "TTT_K_LORA",
+    "TTT_MLP_LORA",
+    "TTT_O_LORA",
+    "TTT_LOCAL_LR_MULT",
 )
 
 
