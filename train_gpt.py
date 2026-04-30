@@ -366,6 +366,12 @@ class Hyperparameters:
     lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
     lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
     lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
+    # NOVELTY: Activation-aware bit boost. Top-K weight matrices ranked by
+    # Hessian-trace get matrix_bits + bit_boost_amount (default +1 → int7
+    # for top-K, int6 for the rest). Spends extra precision where activation
+    # magnitude / output sensitivity is highest. Default 0 = disabled.
+    hw_bit_boost_top_k = int(os.environ.get("HW_BIT_BOOST_TOP_K", 0))
+    hw_bit_boost_amount = int(os.environ.get("HW_BIT_BOOST_AMOUNT", 1))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -2223,6 +2229,24 @@ def gptq_mixed_quantize(state_dict, hessians, h):
     quant_gate = bool(getattr(h, "gated_attn_quant_gate", False))
     lqer_on = bool(getattr(h, "lqer_enabled", False))
     lqer_cands = {}
+    # NOVELTY pre-pass: identify top-K matrix layers by Hessian trace for bit boost.
+    hw_bb_top_k = int(getattr(h, "hw_bit_boost_top_k", 0))
+    hw_bb_amount = int(getattr(h, "hw_bit_boost_amount", 1))
+    hw_boost_set = set()
+    if hw_bb_top_k > 0:
+        layer_traces = []
+        for nm, tt in state_dict.items():
+            if "tok_emb" in nm:
+                continue
+            if not tt.is_floating_point() or tt.numel() <= 65536:
+                continue
+            if nm not in hessians:
+                continue
+            trace = float(torch.diag(hessians[nm]).abs().mean().item())
+            layer_traces.append((nm, trace))
+        layer_traces.sort(key=lambda x: -x[1])
+        hw_boost_set = {n for n, _ in layer_traces[:hw_bb_top_k]}
+        log(f"hw_bit_boost: top-{hw_bb_top_k} layers (+{hw_bb_amount} bits): {sorted(hw_boost_set)}")
     for (name, tensor) in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         # Dedicated int8-per-row path for attn_gate_w (bypasses both GPTQ and
@@ -2257,6 +2281,8 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         else:
             cs = h.matrix_clip_sigmas
         bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
+        if name in hw_boost_set:
+            bits = bits + hw_bb_amount
         clip_range = 2 ** (bits - 1) - 1
         ret = gptq_quantize_weight(
             t, hessians[name], clip_sigmas=cs, clip_range=clip_range
